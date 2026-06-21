@@ -408,12 +408,49 @@ struct MenuBarQuotaDisplayItem: Identifiable {
     let percentage: Double
     let provider: AIProvider
     var isForbidden: Bool = false
+    var groupLabel: String? = nil
+    var accountCount: Int = 1
     
     var statusColor: Color {
         if isForbidden { return .orange }
         if percentage > 50 { return .green }
         if percentage > 20 { return .orange }
         return .red
+    }
+}
+
+private struct MenuBarQuotaPlanGroup {
+    let key: String
+    let label: String
+}
+
+private struct AggregatedMenuBarQuotaItem {
+    let provider: AIProvider
+    let planGroup: MenuBarQuotaPlanGroup
+    var percentages: [Double] = []
+    var isForbidden = false
+    var accountCount = 0
+
+    mutating func add(percentage: Double, isForbidden: Bool) {
+        percentages.append(percentage)
+        self.isForbidden = self.isForbidden || isForbidden
+        accountCount += 1
+    }
+
+    var displayItem: MenuBarQuotaDisplayItem {
+        let validPercentages = percentages.filter { $0 >= 0 }
+        let percentage = validPercentages.min() ?? -1
+
+        return MenuBarQuotaDisplayItem(
+            id: "\(provider.rawValue)_plan_\(planGroup.key)",
+            providerSymbol: provider.menuBarSymbol,
+            accountShort: planGroup.label,
+            percentage: percentage,
+            provider: provider,
+            isForbidden: isForbidden,
+            groupLabel: planGroup.label,
+            accountCount: accountCount
+        )
     }
 }
 
@@ -628,5 +665,141 @@ final class MenuBarSettingsManager {
 
     private static func clampedMenuBarMax(_ value: Int) -> Int {
         min(max(value, minMenuBarItems), maxMenuBarItems)
+    }
+}
+
+// MARK: - Menu Bar Display Item Builder
+
+extension MenuBarSettingsManager {
+    func makeQuotaDisplayItems(providerQuotas: [AIProvider: [String: ProviderQuotaData]]) -> [MenuBarQuotaDisplayItem] {
+        guard showQuotaInMenuBar else { return [] }
+
+        var orderedKeys: [String] = []
+        var individualItems: [String: MenuBarQuotaDisplayItem] = [:]
+        var aggregatedItems: [String: AggregatedMenuBarQuotaItem] = [:]
+
+        for selectedItem in selectedItems {
+            guard let provider = selectedItem.aiProvider else { continue }
+
+            var displayPercent: Double = -1
+            var isForbidden = false
+            var planGroup: MenuBarQuotaPlanGroup?
+
+            if let accountQuotas = providerQuotas[provider],
+               let quotaData = resolveQuotaData(
+                   for: selectedItem,
+                   provider: provider,
+                   accountQuotas: accountQuotas
+               ) {
+                isForbidden = quotaData.isForbidden
+                planGroup = menuBarPlanGroup(for: provider, quotaData: quotaData)
+
+                if !quotaData.models.isEmpty {
+                    let models = quotaData.models.map { (name: $0.name, percentage: $0.percentage) }
+                    displayPercent = totalUsagePercent(models: models)
+                }
+            }
+
+            if let planGroup {
+                let key = "group:\(provider.rawValue):\(planGroup.key)"
+                if aggregatedItems[key] == nil {
+                    aggregatedItems[key] = AggregatedMenuBarQuotaItem(
+                        provider: provider,
+                        planGroup: planGroup
+                    )
+                    orderedKeys.append(key)
+                }
+                aggregatedItems[key]?.add(percentage: displayPercent, isForbidden: isForbidden)
+                continue
+            }
+
+            let key = "item:\(selectedItem.id)"
+            individualItems[key] = MenuBarQuotaDisplayItem(
+                id: selectedItem.id,
+                providerSymbol: provider.menuBarSymbol,
+                accountShort: selectedItem.accountKey,
+                percentage: displayPercent,
+                provider: provider,
+                isForbidden: isForbidden
+            )
+            orderedKeys.append(key)
+        }
+
+        return orderedKeys.compactMap { key in
+            if let item = individualItems[key] {
+                return item
+            }
+            return aggregatedItems[key]?.displayItem
+        }
+    }
+
+    private func menuBarPlanGroup(
+        for provider: AIProvider,
+        quotaData: ProviderQuotaData
+    ) -> MenuBarQuotaPlanGroup? {
+        guard provider == .codex else { return nil }
+        guard let rawPlan = quotaData.planDisplayName ?? quotaData.planType,
+              !rawPlan.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+
+        let lowercased = rawPlan.lowercased()
+        if lowercased.contains("team") {
+            return MenuBarQuotaPlanGroup(key: "team", label: "Team")
+        }
+        if lowercased.contains("plus") {
+            return MenuBarQuotaPlanGroup(key: "plus", label: "Plus")
+        }
+        if lowercased.contains("pro") {
+            return MenuBarQuotaPlanGroup(key: "pro", label: "Pro")
+        }
+        if lowercased.contains("enterprise") {
+            return MenuBarQuotaPlanGroup(key: "enterprise", label: "Enterprise")
+        }
+
+        let normalizedKey = lowercased
+            .replacingOccurrences(of: "_", with: "-")
+            .replacingOccurrences(of: " ", with: "-")
+        let displayName = rawPlan
+            .replacingOccurrences(of: "_", with: " ")
+            .split(separator: " ")
+            .map { $0.prefix(1).uppercased() + $0.dropFirst().lowercased() }
+            .joined(separator: " ")
+
+        return MenuBarQuotaPlanGroup(key: normalizedKey, label: displayName)
+    }
+
+    private func resolveQuotaData(
+        for selectedItem: MenuBarQuotaItem,
+        provider: AIProvider,
+        accountQuotas: [String: ProviderQuotaData]
+    ) -> ProviderQuotaData? {
+        if let quotaData = accountQuotas[selectedItem.accountKey] {
+            return quotaData
+        }
+
+        let cleanKey = selectedItem.accountKey.replacingOccurrences(of: ".json", with: "")
+        if let quotaData = accountQuotas[cleanKey] {
+            return quotaData
+        }
+
+        guard provider == .codex else { return nil }
+        let normalizedSelected = normalizedCodexKey(cleanKey)
+        return accountQuotas.first { normalizedCodexKey($0.key) == normalizedSelected }?.value
+    }
+
+    private func normalizedCodexKey(_ key: String) -> String {
+        let cleanKey = key.replacingOccurrences(of: ".json", with: "")
+        if let email = extractEmail(from: cleanKey) {
+            return email.lowercased()
+        }
+        return cleanKey.lowercased()
+    }
+
+    private func extractEmail(from text: String) -> String? {
+        let pattern = #"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}"#
+        let options: String.CompareOptions = [.regularExpression, .caseInsensitive]
+        guard let range = text.range(of: pattern, options: options) else { return nil }
+        return String(text[range])
     }
 }

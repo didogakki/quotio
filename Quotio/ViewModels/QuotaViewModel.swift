@@ -1921,51 +1921,7 @@ final class QuotaViewModel {
     }
     
     var menuBarQuotaItems: [MenuBarQuotaDisplayItem] {
-        let settings = menuBarSettings
-        guard settings.showQuotaInMenuBar else { return [] }
-        
-        var items: [MenuBarQuotaDisplayItem] = []
-        
-        for selectedItem in settings.selectedItems {
-            guard let provider = selectedItem.aiProvider else { continue }
-            
-            let shortAccount = shortenAccountKey(selectedItem.accountKey)
-            
-            if let accountQuotas = providerQuotas[provider],
-               let quotaData = accountQuotas[selectedItem.accountKey],
-               !quotaData.models.isEmpty {
-                // Filter out -1 (unknown) percentages when calculating lowest
-                let validPercentages = quotaData.models.map(\.percentage).filter { $0 >= 0 }
-                let lowestPercent = validPercentages.min() ?? (quotaData.models.first?.percentage ?? -1)
-                items.append(MenuBarQuotaDisplayItem(
-                    id: selectedItem.id,
-                    providerSymbol: provider.menuBarSymbol,
-                    accountShort: shortAccount,
-                    percentage: lowestPercent,
-                    provider: provider
-                ))
-            } else {
-                items.append(MenuBarQuotaDisplayItem(
-                    id: selectedItem.id,
-                    providerSymbol: provider.menuBarSymbol,
-                    accountShort: shortAccount,
-                    percentage: -1,
-                    provider: provider
-                ))
-            }
-        }
-        
-        return items
-    }
-    
-    private func shortenAccountKey(_ key: String) -> String {
-        if let atIndex = key.firstIndex(of: "@") {
-            let user = String(key[..<atIndex].prefix(4))
-            let domainStart = key.index(after: atIndex)
-            let domain = String(key[domainStart...].prefix(1))
-            return "\(user)@\(domain)"
-        }
-        return String(key.prefix(6))
+        menuBarSettings.makeQuotaDisplayItems(providerQuotas: providerQuotas)
     }
 }
 

@@ -98,74 +98,7 @@ final class AppBootstrap {
     }
 
     private var quotaItems: [MenuBarQuotaDisplayItem] {
-        guard menuBarSettings.showQuotaInMenuBar else { return [] }
-
-        var items: [MenuBarQuotaDisplayItem] = []
-
-        for selectedItem in menuBarSettings.selectedItems {
-            guard let provider = selectedItem.aiProvider else { continue }
-
-            var displayPercent: Double = -1
-            var isForbidden = false
-
-            if let accountQuotas = viewModel.providerQuotas[provider],
-               let quotaData = resolveQuotaData(
-                   for: selectedItem,
-                   provider: provider,
-                   accountQuotas: accountQuotas
-               ) {
-                isForbidden = quotaData.isForbidden
-                if !quotaData.models.isEmpty {
-                    let models = quotaData.models.map { (name: $0.name, percentage: $0.percentage) }
-                    displayPercent = menuBarSettings.totalUsagePercent(models: models)
-                }
-            }
-
-            items.append(MenuBarQuotaDisplayItem(
-                id: selectedItem.id,
-                providerSymbol: provider.menuBarSymbol,
-                accountShort: selectedItem.accountKey,
-                percentage: displayPercent,
-                provider: provider,
-                isForbidden: isForbidden
-            ))
-        }
-
-        return items
-    }
-
-    private func resolveQuotaData(
-        for selectedItem: MenuBarQuotaItem,
-        provider: AIProvider,
-        accountQuotas: [String: ProviderQuotaData]
-    ) -> ProviderQuotaData? {
-        if let quotaData = accountQuotas[selectedItem.accountKey] {
-            return quotaData
-        }
-
-        let cleanKey = selectedItem.accountKey.replacingOccurrences(of: ".json", with: "")
-        if let quotaData = accountQuotas[cleanKey] {
-            return quotaData
-        }
-
-        guard provider == .codex else { return nil }
-        let normalizedSelected = normalizedCodexKey(cleanKey)
-        return accountQuotas.first { normalizedCodexKey($0.key) == normalizedSelected }?.value
-    }
-
-    private func normalizedCodexKey(_ key: String) -> String {
-        let cleanKey = key.replacingOccurrences(of: ".json", with: "")
-        if let email = extractEmail(from: cleanKey) {
-            return email.lowercased()
-        }
-        return cleanKey.lowercased()
-    }
-
-    private func extractEmail(from text: String) -> String? {
-        let pattern = #"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}"#
-        let options: String.CompareOptions = [.regularExpression, .caseInsensitive]
-        guard let range = text.range(of: pattern, options: options) else { return nil }
-        return String(text[range])
+        menuBarSettings.makeQuotaDisplayItems(providerQuotas: viewModel.providerQuotas)
     }
 }
 
