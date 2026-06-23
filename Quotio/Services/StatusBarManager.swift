@@ -255,7 +255,7 @@ struct StatusBarQuotaItemView: View {
                     .foregroundStyle(groupLabelColor)
                     .fixedSize()
             }
-            
+
             if item.isForbidden {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.system(size: 10))
@@ -268,6 +268,8 @@ struct StatusBarQuotaItemView: View {
             }
         }
         .fixedSize()
+        .padding(.horizontal, 5)
+        .padding(.vertical, 1)
     }
     
     private func formatPercentage(_ value: Double) -> String {

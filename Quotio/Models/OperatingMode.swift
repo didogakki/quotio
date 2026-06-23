@@ -177,6 +177,13 @@ final class OperatingModeManager {
     
     /// Last connection error
     private(set) var lastError: String?
+
+    /// Saved read-only remote monitor sources. These are independent from the
+    /// single Remote Proxy configuration and do not affect routing or agents.
+    private(set) var remoteMonitorSources: [RemoteConnectionConfig] = []
+
+    /// Per-monitor connection status keyed by RemoteConnectionConfig.id.
+    private(set) var remoteMonitorStatuses: [String: ConnectionStatus] = [:]
     
     // MARK: - Computed Properties
     
@@ -228,6 +235,7 @@ final class OperatingModeManager {
         // Keep the saved remote config available even outside Remote Proxy mode.
         // Monitor mode can use it for management-only quota lookups.
         loadRemoteConfig()
+        loadRemoteMonitorSources()
     }
     
     // MARK: - Mode Management
@@ -305,6 +313,111 @@ final class OperatingModeManager {
         if isRemoteProxyMode {
             setMode(.monitor)
         }
+    }
+
+    // MARK: - Remote Monitor Sources
+
+    private static let remoteMonitorSourcesDefaultsKey = "remoteMonitorSources"
+
+    func remoteMonitorManagementKey(for config: RemoteConnectionConfig) -> String? {
+        KeychainHelper.getManagementKey(for: config.id)
+    }
+
+    func remoteMonitorStatus(for configId: String) -> ConnectionStatus {
+        remoteMonitorStatuses[configId] ?? .disconnected
+    }
+
+    func hasRemoteMonitorSource(matching config: RemoteConnectionConfig) -> Bool {
+        remoteMonitorSources.contains { source in
+            source.id == config.id || source.managementBaseURL == config.managementBaseURL
+        }
+    }
+
+    func addRemoteMonitorSource(_ config: RemoteConnectionConfig, managementKey: String) {
+        upsertRemoteMonitorSource(config, managementKey: managementKey)
+    }
+
+    func updateRemoteMonitorSource(_ config: RemoteConnectionConfig, managementKey: String) {
+        upsertRemoteMonitorSource(config, managementKey: managementKey)
+    }
+
+    func deleteRemoteMonitorSource(_ config: RemoteConnectionConfig) {
+        remoteMonitorSources.removeAll { $0.id == config.id }
+        remoteMonitorStatuses.removeValue(forKey: config.id)
+        KeychainHelper.deleteManagementKey(for: config.id)
+        persistRemoteMonitorSources()
+    }
+
+    func setRemoteMonitorStatus(configId: String, _ status: ConnectionStatus) {
+        remoteMonitorStatuses[configId] = status
+    }
+
+    func markRemoteMonitorConnected(configId: String) {
+        remoteMonitorStatuses[configId] = .connected
+        updateRemoteMonitorSourceTimestamp(configId: configId, lastConnected: Date())
+    }
+
+    func addCurrentRemoteConfigToMonitors() {
+        guard let config = remoteConfig,
+              let key = KeychainHelper.getManagementKey(for: config.id),
+              !hasRemoteMonitorSource(matching: config) else {
+            return
+        }
+
+        // Clone with a monitor-owned id so deleting the monitor source cannot
+        // delete the single Remote Proxy config's management key.
+        let monitorConfig = RemoteConnectionConfig(
+            endpointURL: config.endpointURL,
+            displayName: config.displayName,
+            verifySSL: config.verifySSL,
+            timeoutSeconds: config.timeoutSeconds,
+            lastConnected: config.lastConnected,
+            id: UUID().uuidString
+        )
+        addRemoteMonitorSource(monitorConfig, managementKey: key)
+    }
+
+    private func upsertRemoteMonitorSource(_ config: RemoteConnectionConfig, managementKey: String) {
+        if let index = remoteMonitorSources.firstIndex(where: { $0.id == config.id }) {
+            remoteMonitorSources[index] = config
+        } else {
+            remoteMonitorSources.append(config)
+        }
+        KeychainHelper.saveManagementKey(managementKey, for: config.id)
+        remoteMonitorStatuses[config.id] = remoteMonitorStatuses[config.id] ?? .disconnected
+        persistRemoteMonitorSources()
+    }
+
+    private func loadRemoteMonitorSources() {
+        guard let data = UserDefaults.standard.data(forKey: Self.remoteMonitorSourcesDefaultsKey),
+              let sources = try? JSONDecoder().decode([RemoteConnectionConfig].self, from: data) else {
+            remoteMonitorSources = []
+            remoteMonitorStatuses = [:]
+            return
+        }
+
+        remoteMonitorSources = sources
+        remoteMonitorStatuses = Dictionary(uniqueKeysWithValues: sources.map { ($0.id, ConnectionStatus.disconnected) })
+    }
+
+    private func persistRemoteMonitorSources() {
+        if let data = try? JSONEncoder().encode(remoteMonitorSources) {
+            UserDefaults.standard.set(data, forKey: Self.remoteMonitorSourcesDefaultsKey)
+        }
+    }
+
+    private func updateRemoteMonitorSourceTimestamp(configId: String, lastConnected: Date) {
+        guard let index = remoteMonitorSources.firstIndex(where: { $0.id == configId }) else { return }
+        let config = remoteMonitorSources[index]
+        remoteMonitorSources[index] = RemoteConnectionConfig(
+            endpointURL: config.endpointURL,
+            displayName: config.displayName,
+            verifySSL: config.verifySSL,
+            timeoutSeconds: config.timeoutSeconds,
+            lastConnected: lastConnected,
+            id: config.id
+        )
+        persistRemoteMonitorSources()
     }
     
     /// Update connection status

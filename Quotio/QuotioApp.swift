@@ -84,9 +84,7 @@ final class AppBootstrap {
     }
 
     func updateStatusBar() {
-        // Menu bar should show quota data regardless of proxy status
-        // The quota is fetched directly and doesn't need proxy
-        let hasQuotaData = !viewModel.providerQuotas.isEmpty
+        let hasQuotaData = !viewModel.providerQuotas.isEmpty || !viewModel.remoteMonitorSnapshots.isEmpty
 
         statusBarManager.updateStatusBar(
             items: quotaItems,
@@ -98,7 +96,7 @@ final class AppBootstrap {
     }
 
     private var quotaItems: [MenuBarQuotaDisplayItem] {
-        menuBarSettings.makeQuotaDisplayItems(providerQuotas: viewModel.providerQuotas)
+        viewModel.menuBarQuotaItems
     }
 }
 
@@ -175,6 +173,10 @@ struct QuotioApp: App {
                     bootstrap.updateStatusBar()
                 }
                 .onChange(of: viewModel.providerQuotas.count) {
+                    bootstrap.updateStatusBar()
+                    statusBarManager.rebuildMenuInPlace()
+                }
+                .onChange(of: viewModel.remoteMonitorSnapshots.count) {
                     bootstrap.updateStatusBar()
                     statusBarManager.rebuildMenuInPlace()
                 }

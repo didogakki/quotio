@@ -24,6 +24,8 @@ struct SettingsScreen: View {
                 UnifiedProxySettingsSection()
             }
 
+            RemoteMonitorsSection()
+
             // General Settings
             Section {
                 LaunchAtLoginToggle()
@@ -342,6 +344,176 @@ struct RemoteServerSection: View {
         Task {
             await viewModel.reconnectRemote()
             isReconnecting = false
+        }
+    }
+}
+
+// MARK: - Remote Monitors Section
+
+struct RemoteMonitorsSection: View {
+    @Environment(QuotaViewModel.self) private var viewModel
+    @State private var modeManager = OperatingModeManager.shared
+    @State private var showRemoteMonitorSheet = false
+    @State private var editingConfig: RemoteConnectionConfig?
+    @State private var sourceToDelete: RemoteConnectionConfig?
+    @State private var testingSourceIds: Set<String> = []
+
+    var body: some View {
+        Section {
+            if modeManager.remoteMonitorSources.isEmpty {
+                Text("settings.remoteMonitors.empty".localized())
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(modeManager.remoteMonitorSources) { config in
+                    remoteMonitorRow(config)
+                }
+            }
+
+            HStack {
+                Button {
+                    editingConfig = nil
+                    showRemoteMonitorSheet = true
+                } label: {
+                    Label("settings.remoteMonitors.add".localized(), systemImage: "plus.circle")
+                }
+
+                if canAddCurrentRemoteConfig {
+                    Button {
+                        modeManager.addCurrentRemoteConfigToMonitors()
+                        Task { await viewModel.refreshRemoteMonitors() }
+                    } label: {
+                        Label("settings.remoteMonitors.addCurrentRemote".localized(), systemImage: "arrow.down.circle")
+                    }
+                }
+            }
+        } header: {
+            Label("settings.remoteMonitors.title".localized(), systemImage: "binoculars.fill")
+        } footer: {
+            Text("settings.remoteMonitors.help".localized())
+                .font(.caption)
+        }
+        .sheet(isPresented: $showRemoteMonitorSheet, onDismiss: { editingConfig = nil }) {
+            RemoteConnectionSheet(existingConfig: editingConfig) { config, managementKey in
+                if editingConfig == nil {
+                    modeManager.addRemoteMonitorSource(config, managementKey: managementKey)
+                } else {
+                    modeManager.updateRemoteMonitorSource(config, managementKey: managementKey)
+                }
+                Task { await viewModel.refreshRemoteMonitors() }
+            }
+            .environment(viewModel)
+        }
+        .confirmationDialog(
+            "settings.remoteMonitors.deleteConfirm".localized(),
+            isPresented: Binding(
+                get: { sourceToDelete != nil },
+                set: { if !$0 { sourceToDelete = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("action.delete".localized(), role: .destructive) {
+                if let sourceToDelete {
+                    viewModel.removeRemoteMonitorSource(sourceToDelete)
+                }
+                sourceToDelete = nil
+            }
+            Button("action.cancel".localized(), role: .cancel) {
+                sourceToDelete = nil
+            }
+        } message: {
+            Text("settings.remoteMonitors.deleteMessage".localized())
+        }
+    }
+
+    private var canAddCurrentRemoteConfig: Bool {
+        guard let config = modeManager.remoteConfig,
+              modeManager.remoteManagementKey != nil else {
+            return false
+        }
+        return !modeManager.hasRemoteMonitorSource(matching: config)
+    }
+
+    private func remoteMonitorRow(_ config: RemoteConnectionConfig) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Circle()
+                .fill(statusColor(for: modeManager.remoteMonitorStatus(for: config.id)))
+                .frame(width: 9, height: 9)
+                .padding(.top, 7)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(config.displayName)
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+                Text(config.endpointURL)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Text(statusText(for: modeManager.remoteMonitorStatus(for: config.id)))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+
+            Spacer()
+
+            HStack(spacing: 6) {
+                Button {
+                    Task { await test(config) }
+                } label: {
+                    if testingSourceIds.contains(config.id) {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Image(systemName: "network")
+                    }
+                }
+                .help("remote.test".localized())
+                .buttonStyle(.borderless)
+                .disabled(testingSourceIds.contains(config.id))
+
+                Button {
+                    editingConfig = config
+                    showRemoteMonitorSheet = true
+                } label: {
+                    Image(systemName: "pencil")
+                }
+                .help("action.edit".localized())
+                .buttonStyle(.borderless)
+
+                Button(role: .destructive) {
+                    sourceToDelete = config
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .help("action.delete".localized())
+                .buttonStyle(.borderless)
+            }
+            .controlSize(.small)
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func test(_ config: RemoteConnectionConfig) async {
+        testingSourceIds.insert(config.id)
+        await viewModel.testRemoteMonitorSource(config)
+        testingSourceIds.remove(config.id)
+    }
+
+    private func statusColor(for status: ConnectionStatus) -> Color {
+        switch status {
+        case .connected: return .green
+        case .connecting: return .orange
+        case .disconnected: return .gray
+        case .error: return .red
+        }
+    }
+
+    private func statusText(for status: ConnectionStatus) -> String {
+        switch status {
+        case .connected: return "status.connected".localized()
+        case .connecting: return "status.connecting".localized()
+        case .disconnected: return "status.disconnected".localized()
+        case .error(let message): return message
         }
     }
 }

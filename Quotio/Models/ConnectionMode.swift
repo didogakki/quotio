@@ -87,7 +87,7 @@ enum ConnectionMode: String, Codable, CaseIterable, Identifiable, Sendable {
 // MARK: - Remote Connection Config
 
 /// Configuration for connecting to a remote CLIProxyAPI instance
-struct RemoteConnectionConfig: Codable, Equatable, Sendable {
+struct RemoteConnectionConfig: Codable, Equatable, Identifiable, Sendable {
     /// The base URL of the remote CLIProxyAPI management endpoint
     /// Example: "https://proxy.example.com:8317/v0/management"
     var endpointURL: String

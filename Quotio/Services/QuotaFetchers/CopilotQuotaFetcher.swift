@@ -258,6 +258,37 @@ actor CopilotQuotaFetcher {
         
         return results
     }
+
+    func fetchAllCopilotQuotas(authFiles: [AuthFile], apiClient: ManagementAPIClient?) async -> [String: ProviderQuotaData] {
+        guard let apiClient else { return [:] }
+
+        let files = authFiles.filter {
+            $0.providerType == .copilot &&
+            !$0.disabled &&
+            !$0.unavailable
+        }
+
+        guard !files.isEmpty else { return [:] }
+
+        var results: [String: ProviderQuotaData] = [:]
+
+        for file in files {
+            guard let authIndex = file.authIndex?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !authIndex.isEmpty else {
+                continue
+            }
+
+            do {
+                let entitlement = try await fetchEntitlement(authIndex: authIndex, apiClient: apiClient)
+                let accountKey = file.quotaLookupKey.isEmpty ? file.name : file.quotaLookupKey
+                results[accountKey] = convertToQuotaData(entitlement: entitlement)
+            } catch {
+                Log.quota("Failed to fetch Copilot quota via CLIProxyAPI for \(file.name): \(error)")
+            }
+        }
+
+        return results
+    }
     
     private func loadAuthFile(from path: String) -> CopilotAuthFile? {
         guard let data = FileManager.default.contents(atPath: path) else {
@@ -291,6 +322,34 @@ actor CopilotQuotaFetcher {
             throw QuotaFetchError.httpError(httpResponse.statusCode)
         }
         
+        return try JSONDecoder().decode(CopilotEntitlement.self, from: data)
+    }
+
+    private func fetchEntitlement(authIndex: String, apiClient: ManagementAPIClient) async throws -> CopilotEntitlement {
+        let response = try await apiClient.apiCall(APICallRequest(
+            authIndex: authIndex,
+            method: "GET",
+            url: entitlementURL,
+            header: [
+                "Authorization": "Bearer $TOKEN$",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28"
+            ],
+            data: nil
+        ))
+
+        if response.statusCode == 401 || response.statusCode == 403 {
+            throw QuotaFetchError.forbidden
+        }
+
+        guard 200..<300 ~= response.statusCode else {
+            throw QuotaFetchError.httpError(response.statusCode)
+        }
+        guard let body = response.body,
+              let data = body.data(using: .utf8) else {
+            throw QuotaFetchError.invalidResponse
+        }
+
         return try JSONDecoder().decode(CopilotEntitlement.self, from: data)
     }
     

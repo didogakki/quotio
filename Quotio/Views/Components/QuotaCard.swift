@@ -360,6 +360,7 @@ private struct QuotaAccountRow: View {
             accountType: nil,
             account: nil,
             authIndex: nil,
+            idToken: nil,
             createdAt: nil,
             updatedAt: nil,
             lastRefresh: nil

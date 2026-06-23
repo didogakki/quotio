@@ -8,7 +8,7 @@ import SwiftUI
 
 // MARK: - Provider Types
 
-nonisolated enum AIProvider: String, CaseIterable, Codable, Identifiable {
+nonisolated enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendable {
     case gemini = "gemini-cli"
     case claude = "claude"
     case codex = "codex"
@@ -270,6 +270,7 @@ nonisolated struct AuthFile: Codable, Identifiable, Hashable, Sendable {
     let accountType: String?
     let account: String?
     let authIndex: String?
+    let idToken: CodexIDTokenClaims?
     let createdAt: String?
     let updatedAt: String?
     let lastRefresh: String?
@@ -277,6 +278,7 @@ nonisolated struct AuthFile: Codable, Identifiable, Hashable, Sendable {
     enum CodingKeys: String, CodingKey {
         case id, name, provider, label, status, disabled, unavailable, source, path, email, account
         case authIndex = "auth_index"
+        case idToken = "id_token"
         case statusMessage = "status_message"
         case runtimeOnly = "runtime_only"
         case accountType = "account_type"
@@ -362,6 +364,16 @@ nonisolated struct AuthFile: Codable, Identifiable, Hashable, Sendable {
         lhs.id == rhs.id &&
         lhs.disabled == rhs.disabled &&
         lhs.status == rhs.status
+    }
+}
+
+nonisolated struct CodexIDTokenClaims: Codable, Sendable {
+    let chatgptAccountID: String?
+    let planType: String?
+
+    enum CodingKeys: String, CodingKey {
+        case chatgptAccountID = "chatgpt_account_id"
+        case planType = "plan_type"
     }
 }
 

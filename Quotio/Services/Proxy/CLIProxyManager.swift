@@ -180,7 +180,11 @@ final class CLIProxyManager {
     let binaryPath: String
     let configPath: String
     let authDir: String
-    private(set) var managementKey: String
+    private var cachedManagementKey: String?
+
+    var managementKey: String {
+        ensureManagementKey()
+    }
     
     var port: UInt16 {
         get { proxyStatus.port }
@@ -212,10 +216,7 @@ final class CLIProxyManager {
     }
     
     init() {
-        guard let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
-            fatalError("Application Support directory not found")
-        }
-        let quotioDir = appSupport.appendingPathComponent("Quotio")
+        let quotioDir = AppIdentity.applicationSupportDirectoryURL()
         let homeDir = FileManager.default.homeDirectoryForCurrentUser
         
         try? FileManager.default.createDirectory(at: quotioDir, withIntermediateDirectories: true)
@@ -223,18 +224,6 @@ final class CLIProxyManager {
         self.binaryPath = quotioDir.appendingPathComponent("CLIProxyAPI").path
         self.configPath = quotioDir.appendingPathComponent("config.yaml").path
         self.authDir = homeDir.appendingPathComponent(".cli-proxy-api").path
-        
-        // Always use key from Keychain, generate new if not exists
-        // Never read from config because CLIProxyAPI hashes the key on startup
-        if let savedKey = KeychainHelper.getLocalManagementKey(), !savedKey.hasPrefix("$2a$") {
-            self.managementKey = savedKey
-        } else {
-            let newKey = UUID().uuidString
-            self.managementKey = newKey
-            if !KeychainHelper.saveLocalManagementKey(newKey) {
-                Log.keychain("Failed to persist local management key, using in-memory value")
-            }
-        }
         
         let savedPort = UserDefaults.standard.integer(forKey: "proxyPort")
         if savedPort > 0 && savedPort < 65536 {
@@ -249,6 +238,32 @@ final class CLIProxyManager {
         migrateLegacyVersionedStorageIfNeeded()
         initializeSelectedBinarySourceIfNeeded()
         ensureConfigExists()
+    }
+
+    /// Lazily load the local management key so remote/monitor launches do not
+    /// touch the local-management keychain item and trigger an unnecessary prompt.
+    private func ensureManagementKey() -> String {
+        if let cachedManagementKey {
+            return cachedManagementKey
+        }
+
+        // Always use key from Keychain, generate new if not exists.
+        // Never read from config because CLIProxyAPI hashes the key on startup.
+        if let savedKey = KeychainHelper.getLocalManagementKey(), !savedKey.hasPrefix("$2a$") {
+            cachedManagementKey = savedKey
+            return savedKey
+        }
+
+        let newKey = UUID().uuidString
+        cachedManagementKey = newKey
+        if !KeychainHelper.saveLocalManagementKey(newKey) {
+            Log.keychain("Failed to persist local management key, using in-memory value")
+        }
+        return newKey
+    }
+
+    private func setManagementKey(_ key: String) {
+        cachedManagementKey = key
     }
 
     /// Restart the proxy if it is currently running.
@@ -524,7 +539,7 @@ final class CLIProxyManager {
         
         let previousKey = managementKey
         let newKey = UUID().uuidString
-        managementKey = newKey
+        setManagementKey(newKey)
         syncSecretKeyInConfig()
         
         guard proxyStatus.running else {
@@ -542,7 +557,7 @@ final class CLIProxyManager {
                 Log.keychain("Failed to persist regenerated management key after restart")
             }
         } catch {
-            managementKey = previousKey
+            setManagementKey(previousKey)
             syncSecretKeyInConfig()
             try? await Task.sleep(for: .milliseconds(300))
             try? await start()

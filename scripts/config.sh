@@ -13,7 +13,13 @@ export BUNDLE_ID="dev.quotio.desktop"
 
 # Paths
 export PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export BUILD_DIR="${PROJECT_DIR}/build"
+DEFAULT_BUILD_DIR="${PROJECT_DIR}/build"
+case "${PROJECT_DIR}" in
+    *"/Mobile Documents/"*|*"iCloud~"*)
+        DEFAULT_BUILD_DIR="${HOME}/Library/Caches/${PROJECT_NAME}/build"
+        ;;
+esac
+export BUILD_DIR="${QUOTIO_BUILD_DIR:-$DEFAULT_BUILD_DIR}"
 export ARCHIVE_PATH="${BUILD_DIR}/${PROJECT_NAME}.xcarchive"
 export APP_PATH="${BUILD_DIR}/${PROJECT_NAME}.app"
 export DMG_PATH="${BUILD_DIR}/${PROJECT_NAME}.dmg"

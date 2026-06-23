@@ -11,27 +11,36 @@ import Security
 // MARK: - Keychain Helper
 
 enum KeychainHelper {
-    private static let remoteService = "dev.quotio.desktop.remote-management"
-    private static let localService = "dev.quotio.desktop.local-management"
-    private static let warpService = "dev.quotio.desktop.warp"
+    private static var remoteService: String { AppIdentity.remoteManagementKeychainService }
+    private static var localService: String { AppIdentity.localManagementKeychainService }
+    private static var warpService: String { AppIdentity.warpKeychainService }
     private static let localManagementAccount = "local-management-key"
     private static let warpTokensAccount = "warp-tokens"
     private static let localManagementDefaultsKey = "managementKey"
     private static let warpTokensDefaultsKey = "warpTokens"
 
     // Legacy service names for keychain migration (newest first)
-    private static let legacyRemoteServices = [
-        "proseek.io.vn.Quotio.remote-management",
-        "com.quotio.remote-management",
-    ]
-    private static let legacyLocalServices = [
-        "proseek.io.vn.Quotio.local-management",
-        "com.quotio.local-management",
-    ]
-    private static let legacyWarpServices = [
-        "proseek.io.vn.Quotio.warp",
-        "com.quotio.warp",
-    ]
+    private static var legacyRemoteServices: [String] {
+        guard AppIdentity.isReleaseBundle else { return [] }
+        return [
+            "proseek.io.vn.Quotio.remote-management",
+            "com.quotio.remote-management",
+        ]
+    }
+    private static var legacyLocalServices: [String] {
+        guard AppIdentity.isReleaseBundle else { return [] }
+        return [
+            "proseek.io.vn.Quotio.local-management",
+            "com.quotio.local-management",
+        ]
+    }
+    private static var legacyWarpServices: [String] {
+        guard AppIdentity.isReleaseBundle else { return [] }
+        return [
+            "proseek.io.vn.Quotio.warp",
+            "com.quotio.warp",
+        ]
+    }
 
     static func saveManagementKey(_ key: String, for configId: String) {
         let account = "management-key-\(configId)"

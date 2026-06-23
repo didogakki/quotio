@@ -51,46 +51,63 @@ final class StatusBarMenuBuilder {
             menu.addItem(NSMenuItem.separator())
         }
 
-        // 3. All provider accounts shown together, grouped by provider header
+        // 3. Local provider sections
         let providers = providersWithData
+        let visibleRemoteSnapshots = viewModel.remoteMonitorSnapshots.filter {
+            viewModel.isRemoteMonitorVisibleInMenu(configId: $0.id) &&
+            !$0.providerQuotas.isEmpty
+        }
+
         if !providers.isEmpty {
             for (index, provider) in providers.enumerated() {
                 let accounts = accountsForProvider(provider)
 
-                // Provider section header
-                let headerView = MenuProviderSectionHeader(provider: provider)
-                menu.addItem(viewItem(for: headerView))
+                menu.addItem(viewItem(for: MenuProviderSectionHeader(provider: provider)))
 
                 if accounts.isEmpty {
                     menu.addItem(buildEmptyStateItem())
                 } else {
                     for account in accounts {
-                        let cardItem = buildAccountCardItem(
+                        menu.addItem(buildAccountCardItem(
                             email: account.email,
                             data: account.data,
                             provider: provider
-                        )
-                        menu.addItem(cardItem)
+                        ))
                     }
                 }
 
-                // Separator between provider groups (not after the last one)
                 if index < providers.count - 1 {
                     menu.addItem(NSMenuItem.separator())
                 }
             }
-
             menu.addItem(NSMenuItem.separator())
-        } else {
+        } else if visibleRemoteSnapshots.isEmpty {
             menu.addItem(buildEmptyStateItem())
             menu.addItem(NSMenuItem.separator())
         }
-        
+
+        // 3.5. Remote monitor sections (each grouped by source, then provider)
+        for snapshot in visibleRemoteSnapshots {
+            menu.addItem(buildRemoteSourceHeaderItem(snapshot: snapshot))
+            let snapshotProviders = snapshot.providerQuotas.keys.sorted { $0.displayName < $1.displayName }
+            for (providerIndex, provider) in snapshotProviders.enumerated() {
+                guard let accounts = snapshot.providerQuotas[provider], !accounts.isEmpty else { continue }
+                menu.addItem(viewItem(for: MenuProviderSectionHeader(provider: provider)))
+                for (email, data) in accounts.sorted(by: { $0.key < $1.key }) {
+                    menu.addItem(buildAccountCardItem(email: email, data: data, provider: provider))
+                }
+                if providerIndex < snapshotProviders.count - 1 {
+                    menu.addItem(NSMenuItem.separator())
+                }
+            }
+            menu.addItem(NSMenuItem.separator())
+        }
+
         // 4. Action items
         for item in buildActionItems() {
             menu.addItem(item)
         }
-        
+
         return menu
     }
     
@@ -295,8 +312,18 @@ final class StatusBarMenuBuilder {
         }
     }
     
+    // MARK: - Remote Source Header
+
+    private func buildRemoteSourceHeaderItem(snapshot: QuotaViewModel.RemoteMonitorSnapshot) -> NSMenuItem {
+        let headerView = MenuRemoteSourceHeader(
+            sourceName: snapshot.config.displayName,
+            isStale: snapshot.errorMessage != nil
+        )
+        return viewItem(for: headerView)
+    }
+
     // MARK: - Empty State
-    
+
     private func buildEmptyStateItem() -> NSMenuItem {
         let emptyView = MenuEmptyStateView()
         return viewItem(for: emptyView)
@@ -1368,6 +1395,33 @@ private struct MenuViewMoreAccountsView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 4)
         .onHover { isHovered = $0 }
+    }
+}
+
+// MARK: - Remote Source Header View
+
+private struct MenuRemoteSourceHeader: View {
+    let sourceName: String
+    let isStale: Bool
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "network")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            Text(sourceName)
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .foregroundStyle(.secondary)
+            Spacer()
+            if isStale {
+                Image(systemName: "exclamationmark.circle")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.orange)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 3)
+        .background(Color.secondary.opacity(0.05))
     }
 }
 

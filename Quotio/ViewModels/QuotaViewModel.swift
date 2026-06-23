@@ -91,9 +91,27 @@ final class QuotaViewModel {
     
     /// Quota data per provider per account (email -> QuotaData)
     var providerQuotas: [AIProvider: [String: ProviderQuotaData]] = [:]
+
+    /// Read-only quota snapshots fetched from saved remote monitor sources.
+    var remoteMonitorSnapshots: [RemoteMonitorSnapshot] = []
+    var isLoadingRemoteMonitors = false
+
+    /// Consecutive automatic refresh failure counts per remote monitor config ID.
+    @ObservationIgnored private var remoteMonitorFailureCounts: [String: Int] = [:]
     
     /// Subscription info per provider per account (provider -> email -> SubscriptionInfo)
     var subscriptionInfos: [AIProvider: [String: SubscriptionInfo]] = [:]
+
+    struct RemoteMonitorSnapshot: Identifiable, Sendable {
+        let config: RemoteConnectionConfig
+        let authFiles: [AuthFile]
+        let providerQuotas: [AIProvider: [String: ProviderQuotaData]]
+        let subscriptionInfos: [AIProvider: [String: SubscriptionInfo]]
+        let lastUpdated: Date
+        let errorMessage: String?
+
+        var id: String { config.id }
+    }
     
     /// Antigravity account switcher (for IDE token injection)
     let antigravitySwitcher = AntigravityAccountSwitcher.shared
@@ -267,6 +285,7 @@ final class QuotaViewModel {
         } else {
             await initializeFullMode()
         }
+        await refreshRemoteMonitors()
     }
 
     private func initializeFullMode() async {
@@ -341,6 +360,171 @@ final class QuotaViewModel {
         await initializeRemoteMode()
     }
     
+    // MARK: - Remote Monitor Sources
+
+    /// Returns true when a remote monitor source should appear in the menu bar / popup.
+    /// Hides sources after 3 consecutive automatic refresh failures; resets on success.
+    func isRemoteMonitorVisibleInMenu(configId: String) -> Bool {
+        (remoteMonitorFailureCounts[configId] ?? 0) < 3
+    }
+
+    func refreshRemoteMonitors(isAutomatic: Bool = false) async {
+        guard !isLoadingRemoteMonitors else { return }
+
+        let sources = modeManager.remoteMonitorSources
+        guard !sources.isEmpty else {
+            remoteMonitorSnapshots = []
+            return
+        }
+
+        isLoadingRemoteMonitors = true
+        defer {
+            isLoadingRemoteMonitors = false
+            notifyQuotaDataChanged()
+        }
+
+        var snapshots: [RemoteMonitorSnapshot] = []
+        for source in sources {
+            let previous = remoteMonitorSnapshots.first { $0.id == source.id }
+            let snapshot = await fetchRemoteMonitorSnapshot(for: source, previous: previous)
+            if isAutomatic {
+                if snapshot.errorMessage != nil {
+                    remoteMonitorFailureCounts[source.id] = (remoteMonitorFailureCounts[source.id] ?? 0) + 1
+                } else {
+                    remoteMonitorFailureCounts[source.id] = 0
+                }
+            } else if snapshot.errorMessage == nil {
+                remoteMonitorFailureCounts[source.id] = 0
+            }
+            snapshots.append(snapshot)
+        }
+        remoteMonitorSnapshots = snapshots
+    }
+
+    func testRemoteMonitorSource(_ config: RemoteConnectionConfig) async {
+        modeManager.setRemoteMonitorStatus(configId: config.id, .connecting)
+
+        guard let managementKey = modeManager.remoteMonitorManagementKey(for: config) else {
+            modeManager.setRemoteMonitorStatus(
+                configId: config.id,
+                .error("settings.remoteMonitors.error.missingKey".localized())
+            )
+            return
+        }
+
+        let client = ManagementAPIClient(config: config, managementKey: managementKey)
+        defer { Task { await client.invalidate() } }
+
+        if await client.checkProxyResponding() {
+            modeManager.markRemoteMonitorConnected(configId: config.id)
+        } else {
+            modeManager.setRemoteMonitorStatus(
+                configId: config.id,
+                .error("remote.test.cannotConnect".localized())
+            )
+        }
+    }
+
+    func removeRemoteMonitorSource(_ config: RemoteConnectionConfig) {
+        modeManager.deleteRemoteMonitorSource(config)
+        remoteMonitorSnapshots.removeAll { $0.id == config.id }
+        notifyQuotaDataChanged()
+    }
+
+    private func fetchRemoteMonitorSnapshot(
+        for config: RemoteConnectionConfig,
+        previous: RemoteMonitorSnapshot?
+    ) async -> RemoteMonitorSnapshot {
+        guard let managementKey = modeManager.remoteMonitorManagementKey(for: config) else {
+            let message = "settings.remoteMonitors.error.missingKey".localized()
+            modeManager.setRemoteMonitorStatus(configId: config.id, .error(message))
+            return preservingSnapshot(previous, config: config, errorMessage: message)
+        }
+
+        modeManager.setRemoteMonitorStatus(configId: config.id, .connecting)
+        let client = ManagementAPIClient(config: config, managementKey: managementKey)
+        defer { Task { await client.invalidate() } }
+
+        do {
+            guard await client.checkProxyResponding() else {
+                let message = "remote.test.cannotConnect".localized()
+                modeManager.setRemoteMonitorStatus(configId: config.id, .error(message))
+                return preservingSnapshot(previous, config: config, errorMessage: message)
+            }
+
+            let authFiles = try await client.fetchAuthFiles()
+            let quotas = await fetchRemoteMonitorQuotas(authFiles: authFiles, apiClient: client)
+            modeManager.markRemoteMonitorConnected(configId: config.id)
+            return RemoteMonitorSnapshot(
+                config: config,
+                authFiles: authFiles,
+                providerQuotas: quotas,
+                subscriptionInfos: [:],
+                lastUpdated: Date(),
+                errorMessage: nil
+            )
+        } catch {
+            let message = error.localizedDescription
+            modeManager.setRemoteMonitorStatus(configId: config.id, .error(message))
+            return preservingSnapshot(previous, config: config, errorMessage: message)
+        }
+    }
+
+    /// Returns the previous snapshot with an updated errorMessage if it contains data;
+    /// otherwise returns an empty snapshot.
+    private func preservingSnapshot(
+        _ previous: RemoteMonitorSnapshot?,
+        config: RemoteConnectionConfig,
+        errorMessage: String
+    ) -> RemoteMonitorSnapshot {
+        if let prev = previous, !prev.authFiles.isEmpty || !prev.providerQuotas.isEmpty {
+            return RemoteMonitorSnapshot(
+                config: config,
+                authFiles: prev.authFiles,
+                providerQuotas: prev.providerQuotas,
+                subscriptionInfos: prev.subscriptionInfos,
+                lastUpdated: prev.lastUpdated,
+                errorMessage: errorMessage
+            )
+        }
+        return emptyRemoteMonitorSnapshot(config: config, errorMessage: errorMessage)
+    }
+
+    private func emptyRemoteMonitorSnapshot(config: RemoteConnectionConfig, errorMessage: String?) -> RemoteMonitorSnapshot {
+        RemoteMonitorSnapshot(
+            config: config,
+            authFiles: [],
+            providerQuotas: [:],
+            subscriptionInfos: [:],
+            lastUpdated: Date(),
+            errorMessage: errorMessage
+        )
+    }
+
+    private func fetchRemoteMonitorQuotas(
+        authFiles: [AuthFile],
+        apiClient: ManagementAPIClient
+    ) async -> [AIProvider: [String: ProviderQuotaData]] {
+        let openAIFetcher = OpenAIQuotaFetcher()
+        let copilotFetcher = CopilotQuotaFetcher()
+        let claudeCodeFetcher = ClaudeCodeQuotaFetcher()
+        let geminiCLIFetcher = GeminiCLIQuotaFetcher()
+
+        async let codexQuotas = openAIFetcher.fetchAllCodexQuotas(authFiles: authFiles, apiClient: apiClient)
+        async let copilotQuotas = copilotFetcher.fetchAllCopilotQuotas(authFiles: authFiles, apiClient: apiClient)
+        async let claudeQuotas = claudeCodeFetcher.fetchAsProviderQuota(authFiles: authFiles, apiClient: apiClient)
+        async let geminiQuotas = geminiCLIFetcher.fetchAsProviderQuota(authFiles: authFiles, apiClient: apiClient)
+
+        let (codex, copilot, claude, gemini) = await (codexQuotas, copilotQuotas, claudeQuotas, geminiQuotas)
+
+        var quotas: [AIProvider: [String: ProviderQuotaData]] = [:]
+        if !codex.isEmpty { quotas[.codex] = codex }
+        if !copilot.isEmpty { quotas[.copilot] = copilot }
+        if !claude.isEmpty { quotas[.claude] = claude }
+        if !gemini.isEmpty { quotas[.gemini] = gemini }
+        return quotas
+    }
+
     // MARK: - Direct Auth File Management (Quota-Only Mode)
     
     /// Load auth files directly from filesystem
@@ -420,22 +604,29 @@ final class QuotaViewModel {
     
     /// Refresh Claude Code quota using CLI
     private func refreshClaudeCodeQuotasInternal() async {
-        let quotas = await claudeCodeFetcher.fetchAsProviderQuota()
-        if quotas.isEmpty {
-            // Only remove if no other source has Claude data
-            if providerQuotas[.claude]?.isEmpty ?? true {
+        let managementQuotas = await claudeCodeFetcher.fetchAsProviderQuota(
+            authFiles: authFiles,
+            apiClient: apiClient
+        )
+
+        if modeManager.isRemoteProxyMode {
+            if managementQuotas.isEmpty {
                 providerQuotas.removeValue(forKey: .claude)
-            }
-        } else {
-            // Merge with existing data (don't overwrite proxy data)
-            if var existing = providerQuotas[.claude] {
-                for (email, quota) in quotas {
-                    existing[email] = quota
-                }
-                providerQuotas[.claude] = existing
             } else {
-                providerQuotas[.claude] = quotas
+                providerQuotas[.claude] = managementQuotas
             }
+            return
+        }
+
+        var quotas = await claudeCodeFetcher.fetchAsProviderQuota()
+        for (email, quota) in managementQuotas {
+            quotas[email] = quota
+        }
+
+        if quotas.isEmpty {
+            providerQuotas.removeValue(forKey: .claude)
+        } else {
+            providerQuotas[.claude] = quotas
         }
     }
     
@@ -497,11 +688,23 @@ final class QuotaViewModel {
         }
 
         let quotas: [String: ProviderQuotaData]
-        if managementQuotas.isEmpty {
+        if modeManager.isRemoteProxyMode {
+            quotas = managementQuotas
+        } else if managementQuotas.isEmpty {
             quotas = await geminiCLIFetcher.fetchAsProviderQuota()
         } else {
             quotas = managementQuotas
         }
+
+        if modeManager.isRemoteProxyMode {
+            if quotas.isEmpty {
+                providerQuotas.removeValue(forKey: .gemini)
+            } else {
+                providerQuotas[.gemini] = quotas
+            }
+            return
+        }
+
         if !quotas.isEmpty {
             if var existing = providerQuotas[.gemini] {
                 for (email, quota) in quotas {
@@ -626,24 +829,26 @@ final class QuotaViewModel {
                 try? await Task.sleep(nanoseconds: intervalNs)
                 _ = await kiroFetcher.refreshAllTokensIfNeeded()
                 await refreshQuotasDirectly()
+                await refreshRemoteMonitors(isAutomatic: true)
             }
         }
     }
-    
+
     /// Start auto-refresh for quota when proxy is not running (Full Mode)
     private func startQuotaAutoRefreshWithoutProxy() {
         refreshTask?.cancel()
-        
+
         guard let intervalNs = refreshSettings.refreshCadence.intervalNanoseconds else {
             return
         }
-        
+
         refreshTask = Task {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: intervalNs)
                 if !proxyManager.proxyStatus.running {
                     _ = await kiroFetcher.refreshAllTokensIfNeeded()
                     await refreshQuotasUnified()
+                    await refreshRemoteMonitors(isAutomatic: true)
                 }
             }
         }
@@ -1103,7 +1308,8 @@ final class QuotaViewModel {
                 try? await Task.sleep(nanoseconds: intervalNs)
                 
                 await refreshData()
-                
+                await refreshRemoteMonitors(isAutomatic: true)
+
                 if errorMessage != nil {
                     consecutiveFailures += 1
                     Log.quota("Refresh failed, consecutive failures: \(consecutiveFailures)")
@@ -1201,13 +1407,17 @@ final class QuotaViewModel {
     }
     
     func manualRefresh() async {
-        if modeManager.isMonitorMode {
+        if modeManager.isRemoteProxyMode {
+            await refreshData()
+            await refreshAllQuotas()
+        } else if modeManager.isMonitorMode {
             await refreshQuotasDirectly()
         } else if proxyManager.proxyStatus.running {
             await refreshData()
         } else {
             await refreshQuotasUnified()
         }
+        await refreshRemoteMonitors()
         lastQuotaRefreshTime = Date()
     }
     
@@ -1217,24 +1427,23 @@ final class QuotaViewModel {
         isLoadingQuotas = true
         lastQuotaRefresh = Date()
 
-        // In remote mode, skip local filesystem fetchers — only show data from the remote proxy
-        // (auth files, usage stats, API keys are already fetched by refreshData())
+        // Proxy-backed fetchers work for local and remote CLIProxyAPI accounts via /api-call.
+        async let claudeCode: () = refreshClaudeCodeQuotasInternal()
+        async let openai: () = refreshOpenAIQuotasInternal()
+        async let copilot: () = refreshCopilotQuotasInternal()
         async let geminiCLI: () = refreshGeminiCLIQuotasInternal()
 
         if !modeManager.isRemoteProxyMode {
             // Note: Cursor and Trae removed from auto-refresh (issue #29)
             // User must use "Scan for IDEs" to detect these
             async let antigravity: () = refreshAntigravityQuotasInternal()
-            async let openai: () = refreshOpenAIQuotasInternal()
-            async let copilot: () = refreshCopilotQuotasInternal()
-            async let claudeCode: () = refreshClaudeCodeQuotasInternal()
             async let glm: () = refreshGlmQuotasInternal()
             async let warp: () = refreshWarpQuotasInternal()
             async let kiro: () = refreshKiroQuotasInternal()
 
             _ = await (antigravity, openai, copilot, claudeCode, glm, warp, kiro, geminiCLI)
         } else {
-            _ = await geminiCLI
+            _ = await (openai, copilot, claudeCode, geminiCLI)
         }
 
         checkQuotaNotifications()
@@ -1351,13 +1560,57 @@ final class QuotaViewModel {
     }
     
     private func refreshOpenAIQuotasInternal() async {
-        let quotas = await openAIFetcher.fetchAllCodexQuotas()
-        providerQuotas[.codex] = quotas
+        let managementQuotas = await openAIFetcher.fetchAllCodexQuotas(
+            authFiles: authFiles,
+            apiClient: apiClient
+        )
+
+        if modeManager.isRemoteProxyMode {
+            if managementQuotas.isEmpty {
+                providerQuotas.removeValue(forKey: .codex)
+            } else {
+                providerQuotas[.codex] = managementQuotas
+            }
+            return
+        }
+
+        var quotas = await openAIFetcher.fetchAllCodexQuotas()
+        for (account, quota) in managementQuotas {
+            quotas[account] = quota
+        }
+
+        if quotas.isEmpty {
+            providerQuotas.removeValue(forKey: .codex)
+        } else {
+            providerQuotas[.codex] = quotas
+        }
     }
     
     private func refreshCopilotQuotasInternal() async {
-        let quotas = await copilotFetcher.fetchAllCopilotQuotas()
-        providerQuotas[.copilot] = quotas
+        let managementQuotas = await copilotFetcher.fetchAllCopilotQuotas(
+            authFiles: authFiles,
+            apiClient: apiClient
+        )
+
+        if modeManager.isRemoteProxyMode {
+            if managementQuotas.isEmpty {
+                providerQuotas.removeValue(forKey: .copilot)
+            } else {
+                providerQuotas[.copilot] = managementQuotas
+            }
+            return
+        }
+
+        var quotas = await copilotFetcher.fetchAllCopilotQuotas()
+        for (account, quota) in managementQuotas {
+            quotas[account] = quota
+        }
+
+        if quotas.isEmpty {
+            providerQuotas.removeValue(forKey: .copilot)
+        } else {
+            providerQuotas[.copilot] = quotas
+        }
     }
     
     func refreshQuotaForProvider(_ provider: AIProvider) async {
@@ -1915,13 +2168,73 @@ final class QuotaViewModel {
     }
     
     // MARK: - Menu Bar Quota Items
-    
+
     var menuBarSettings: MenuBarSettingsManager {
         MenuBarSettingsManager.shared
     }
-    
+
     var menuBarQuotaItems: [MenuBarQuotaDisplayItem] {
-        menuBarSettings.makeQuotaDisplayItems(providerQuotas: providerQuotas)
+        var items = menuBarSettings.makeQuotaDisplayItems(providerQuotas: providerQuotas)
+        guard menuBarSettings.showQuotaInMenuBar else { return items }
+        let remoteItems = remoteMonitorDisplayItems
+        let remaining = menuBarSettings.menuBarMaxItems - items.count
+        if remaining > 0 {
+            items.append(contentsOf: remoteItems.prefix(remaining))
+        }
+        return items
+    }
+
+    private var remoteMonitorDisplayItems: [MenuBarQuotaDisplayItem] {
+        var result: [MenuBarQuotaDisplayItem] = []
+        var seenIds = Set<String>()
+
+        for snapshot in remoteMonitorSnapshots {
+            guard isRemoteMonitorVisibleInMenu(configId: snapshot.id),
+                  let codexQuotas = snapshot.providerQuotas[.codex],
+                  !codexQuotas.isEmpty else { continue }
+
+            // Aggregate accounts by plan group
+            var planGroups: [String: (label: String, percentages: [Double])] = [:]
+            for (_, quotaData) in codexQuotas {
+                let (planKey, planLabel) = remotePlanKeyLabel(from: quotaData, sourceName: snapshot.config.displayName)
+                var pct: Double = -1
+                if !quotaData.models.isEmpty {
+                    let models = quotaData.models.map { (name: $0.name, percentage: $0.percentage) }
+                    pct = menuBarSettings.totalUsagePercent(models: models)
+                }
+                if planGroups[planKey] == nil {
+                    planGroups[planKey] = (label: planLabel, percentages: [])
+                }
+                planGroups[planKey]?.percentages.append(pct)
+            }
+
+            for (planKey, groupInfo) in planGroups.sorted(by: { $0.key < $1.key }) {
+                let itemId = "remote:\(snapshot.config.id):\(planKey)"
+                guard !seenIds.contains(itemId) else { continue }
+                seenIds.insert(itemId)
+                let validPcts = groupInfo.percentages.filter { $0 >= 0 }
+                let pct = validPcts.min() ?? -1
+                result.append(MenuBarQuotaDisplayItem(
+                    id: itemId,
+                    providerSymbol: AIProvider.codex.menuBarSymbol,
+                    accountShort: groupInfo.label,
+                    percentage: pct,
+                    provider: .codex,
+                    groupLabel: groupInfo.label
+                ))
+            }
+        }
+        return result
+    }
+
+    private func remotePlanKeyLabel(from quotaData: ProviderQuotaData, sourceName: String) -> (key: String, label: String) {
+        if let rawPlan = quotaData.planDisplayName ?? quotaData.planType,
+           !rawPlan.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return menuBarSettings.resolveRemotePlanLabel(rawPlan: rawPlan)
+        }
+        // Fallback: extract last word from source name, e.g. "CLIProxyAPI Plus" → "Plus"
+        let label = sourceName.split(separator: " ").last.map(String.init) ?? sourceName
+        return (key: label.lowercased(), label: label)
     }
 }
 

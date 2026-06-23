@@ -29,6 +29,18 @@ struct QuotaScreen: View {
         for provider in viewModel.providerQuotas.keys {
             providers.insert(provider)
         }
+
+        // From read-only remote monitor sources
+        for snapshot in viewModel.remoteMonitorSnapshots {
+            for file in snapshot.authFiles {
+                if let provider = file.providerType {
+                    providers.insert(provider)
+                }
+            }
+            for provider in snapshot.providerQuotas.keys {
+                providers.insert(provider)
+            }
+        }
         
         return providers.sorted { $0.displayName < $1.displayName }
     }
@@ -48,19 +60,44 @@ struct QuotaScreen: View {
                 accounts.insert(key)
             }
         }
+
+        // From remote monitor sources; prefix by source id so the same account
+        // on different remotes counts independently.
+        for snapshot in viewModel.remoteMonitorSnapshots {
+            for file in snapshot.authFiles where file.providerType == provider {
+                accounts.insert(snapshot.id + ":" + file.quotaLookupKey)
+            }
+            if let quotaAccounts = snapshot.providerQuotas[provider] {
+                for key in quotaAccounts.keys {
+                    accounts.insert(snapshot.id + ":" + key)
+                }
+            }
+        }
         
         return accounts.count
     }
     
     private func lowestQuotaPercent(for provider: AIProvider) -> Double? {
-        guard let accounts = viewModel.providerQuotas[provider] else { return nil }
-        
         var allTotals: [Double] = []
-        for (_, quotaData) in accounts {
-            let models = quotaData.models.map { (name: $0.name, percentage: $0.percentage) }
-            let total = settings.totalUsagePercent(models: models)
-            if total >= 0 {
-                allTotals.append(total)
+
+        if let accounts = viewModel.providerQuotas[provider] {
+            for (_, quotaData) in accounts {
+                let models = quotaData.models.map { (name: $0.name, percentage: $0.percentage) }
+                let total = settings.totalUsagePercent(models: models)
+                if total >= 0 {
+                    allTotals.append(total)
+                }
+            }
+        }
+
+        for snapshot in viewModel.remoteMonitorSnapshots {
+            guard let accounts = snapshot.providerQuotas[provider] else { continue }
+            for (_, quotaData) in accounts {
+                let models = quotaData.models.map { (name: $0.name, percentage: $0.percentage) }
+                let total = settings.totalUsagePercent(models: models)
+                if total >= 0 {
+                    allTotals.append(total)
+                }
             }
         }
         
@@ -69,10 +106,11 @@ struct QuotaScreen: View {
     
     /// Check if we have any data to show
     private var hasAnyData: Bool {
+        let hasRemoteMonitorData = !modeManager.remoteMonitorSources.isEmpty || !viewModel.remoteMonitorSnapshots.isEmpty
         if modeManager.isMonitorMode {
-            return !viewModel.providerQuotas.isEmpty || !viewModel.directAuthFiles.isEmpty
+            return !viewModel.providerQuotas.isEmpty || !viewModel.directAuthFiles.isEmpty || hasRemoteMonitorData
         }
-        return !viewModel.authFiles.isEmpty || !viewModel.providerQuotas.isEmpty
+        return !viewModel.authFiles.isEmpty || !viewModel.providerQuotas.isEmpty || hasRemoteMonitorData
     }
     
     var body: some View {
@@ -128,12 +166,12 @@ struct QuotaScreen: View {
                 ToolbarItem(placement: .primaryAction) {
                 Button {
                     Task {
-                        await viewModel.refreshQuotasUnified()
+                        await viewModel.manualRefresh()
                     }
                 } label: {
                     Image(systemName: "arrow.clockwise")
                 }
-                .disabled(viewModel.isLoadingQuotas)
+                .disabled(viewModel.isLoadingQuotas || viewModel.isLoadingRemoteMonitors)
             }
         }
         .onAppear {
@@ -162,24 +200,32 @@ struct QuotaScreen: View {
             
             // Selected Provider Content
             ScrollView {
-                if let provider = selectedProvider ?? availableProviders.first {
-                    ProviderQuotaView(
-                        provider: provider,
-                        authFiles: viewModel.authFiles.filter { $0.providerType == provider },
-                        quotaData: viewModel.providerQuotas[provider] ?? [:],
-                        subscriptionInfos: viewModel.subscriptionInfos[provider] ?? [:],
-                        isLoading: viewModel.isLoadingQuotas
-                    )
-                    .padding(.horizontal, 24)
-                    .padding(.vertical, 16)
-                } else {
-                    ContentUnavailableView(
-                        "empty.noQuotaData".localized(),
-                        systemImage: "chart.bar.xaxis",
-                        description: Text("empty.refreshToLoad".localized())
-                    )
-                    .padding(24)
+                VStack(spacing: 18) {
+                    if let provider = selectedProvider ?? availableProviders.first {
+                        let localAuthFiles = viewModel.authFiles.filter { $0.providerType == provider }
+                        let localQuotaData = viewModel.providerQuotas[provider] ?? [:]
+                        if !localAuthFiles.isEmpty || !localQuotaData.isEmpty {
+                            ProviderQuotaView(
+                                provider: provider,
+                                authFiles: localAuthFiles,
+                                quotaData: localQuotaData,
+                                subscriptionInfos: viewModel.subscriptionInfos[provider] ?? [:],
+                                isLoading: viewModel.isLoadingQuotas
+                            )
+                        }
+                    } else if modeManager.remoteMonitorSources.isEmpty {
+                        ContentUnavailableView(
+                            "empty.noQuotaData".localized(),
+                            systemImage: "chart.bar.xaxis",
+                            description: Text("empty.refreshToLoad".localized())
+                        )
+                        .padding(24)
+                    }
+
+                    remoteMonitorQuotaSections
                 }
+                .padding(.horizontal, 24)
+                .padding(.vertical, 16)
             }
             .scrollContentBackground(.hidden)
         }
@@ -207,6 +253,234 @@ struct QuotaScreen: View {
             .padding(.vertical, 2)
         }
         .scrollClipDisabled()
+    }
+
+    private var remoteMonitorDisplayItems: [RemoteMonitorDisplayItem] {
+        let snapshotsById = Dictionary(
+            uniqueKeysWithValues: viewModel.remoteMonitorSnapshots.map { ($0.id, $0) }
+        )
+        return modeManager.remoteMonitorSources.map { source in
+            RemoteMonitorDisplayItem(config: source, snapshot: snapshotsById[source.id])
+        }
+    }
+
+    @ViewBuilder
+    private var remoteMonitorQuotaSections: some View {
+        if !modeManager.remoteMonitorSources.isEmpty {
+            ForEach(remoteMonitorDisplayItems) { item in
+                RemoteMonitorQuotaGroup(
+                    config: item.config,
+                    snapshot: item.snapshot,
+                    status: modeManager.remoteMonitorStatus(for: item.config.id),
+                    selectedProvider: selectedProvider,
+                    isLoading: viewModel.isLoadingRemoteMonitors,
+                    onRefresh: { await viewModel.refreshRemoteMonitors() }
+                )
+            }
+        }
+    }
+}
+
+private struct RemoteMonitorDisplayItem: Identifiable {
+    let config: RemoteConnectionConfig
+    let snapshot: QuotaViewModel.RemoteMonitorSnapshot?
+
+    var id: String { config.id }
+}
+
+private struct RemoteMonitorQuotaGroup: View {
+    let config: RemoteConnectionConfig
+    let snapshot: QuotaViewModel.RemoteMonitorSnapshot?
+    let status: ConnectionStatus
+    let selectedProvider: AIProvider?
+    let isLoading: Bool
+    let onRefresh: () async -> Void
+
+    @State private var isRefreshing = false
+
+    private var providers: [AIProvider] {
+        guard let snapshot else { return [] }
+
+        var providers = Set<AIProvider>()
+        for file in snapshot.authFiles {
+            if let provider = file.providerType {
+                providers.insert(provider)
+            }
+        }
+        for provider in snapshot.providerQuotas.keys {
+            providers.insert(provider)
+        }
+
+        let sorted = providers.sorted { $0.displayName < $1.displayName }
+        if let selectedProvider {
+            return providers.contains(selectedProvider) ? [selectedProvider] : []
+        }
+        return sorted
+    }
+
+    private var errorMessage: String? {
+        if let message = snapshot?.errorMessage { return message }
+        if case .error(let message) = status { return message }
+        return nil
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            header
+
+            if !providers.isEmpty {
+                if let errorMessage {
+                    staleWarningView(errorMessage)
+                }
+                ForEach(providers) { provider in
+                    providerSection(provider)
+                }
+            } else if let errorMessage {
+                errorView(errorMessage)
+            } else if snapshot == nil && isLoading {
+                QuotaLoadingView()
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+            } else {
+                emptyView
+            }
+        }
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color.primary.opacity(0.035))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.primary.opacity(0.06), lineWidth: 0.5)
+        )
+    }
+
+    private var header: some View {
+        HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(config.displayName)
+                    .font(.headline)
+                Text(config.endpointURL)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer()
+
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(statusColor)
+                    .frame(width: 8, height: 8)
+                Text(statusText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.top, 3)
+
+            Button {
+                Task {
+                    isRefreshing = true
+                    await onRefresh()
+                    isRefreshing = false
+                }
+            } label: {
+                if isRefreshing || isLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Image(systemName: "arrow.clockwise")
+                }
+            }
+            .buttonStyle(.borderless)
+            .disabled(isRefreshing || isLoading)
+            .help("action.refresh".localized())
+        }
+    }
+
+    private var emptyView: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "chart.bar.xaxis")
+                .foregroundStyle(.tertiary)
+            Text("quota.noDataYet".localized())
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 14)
+    }
+
+    private func errorView(_ message: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            Text(message)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .lineLimit(3)
+            Spacer()
+        }
+        .padding(.vertical, 8)
+    }
+
+    private func staleWarningView(_ message: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.caption2)
+                .foregroundStyle(.orange)
+            Text(message)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+            Spacer()
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(Color.orange.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+    }
+
+    private func providerSection(_ provider: AIProvider) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                ProviderIcon(provider: provider, size: 20)
+                Text(provider.displayName)
+                    .font(.subheadline)
+                    .fontWeight(.semibold)
+                Spacer()
+            }
+
+            ProviderQuotaView(
+                provider: provider,
+                authFiles: snapshot?.authFiles.filter { $0.providerType == provider } ?? [],
+                quotaData: snapshot?.providerQuotas[provider] ?? [:],
+                subscriptionInfos: snapshot?.subscriptionInfos[provider] ?? [:],
+                isLoading: isLoading && snapshot == nil,
+                showsEmptyState: false,
+                allowsAccountActions: false,
+                onRefresh: onRefresh
+            )
+        }
+        .padding(.top, 4)
+    }
+
+    private var statusColor: Color {
+        switch status {
+        case .connected: return .green
+        case .connecting: return .orange
+        case .disconnected: return .gray
+        case .error: return .red
+        }
+    }
+
+    private var statusText: String {
+        switch status {
+        case .connected: return "status.connected".localized()
+        case .connecting: return "status.connecting".localized()
+        case .disconnected: return "status.disconnected".localized()
+        case .error: return "status.error".localized()
+        }
     }
 }
 
@@ -341,6 +615,9 @@ private struct ProviderQuotaView: View {
     let quotaData: [String: ProviderQuotaData]
     let subscriptionInfos: [String: SubscriptionInfo]
     let isLoading: Bool
+    var showsEmptyState = true
+    var allowsAccountActions = true
+    var onRefresh: (() async -> Void)? = nil
     
     /// Get all accounts (from auth files or quota data keys)
     private var allAccounts: [AccountInfo] {
@@ -400,13 +677,17 @@ private struct ProviderQuotaView: View {
             if allAccounts.isEmpty && isLoading {
                 QuotaLoadingView()
             } else if allAccounts.isEmpty {
-                emptyState
+                if showsEmptyState {
+                    emptyState
+                }
             } else {
                 ForEach(allAccounts, id: \.key) { account in
                     AccountQuotaCardV2(
                         provider: provider,
                         account: account,
-                        isLoading: isLoading && account.quotaData == nil
+                        isLoading: isLoading && account.quotaData == nil,
+                        allowsAccountActions: allowsAccountActions,
+                        onRefresh: onRefresh
                     )
                 }
             }
@@ -452,13 +733,24 @@ private struct AccountQuotaCardV2: View {
     let provider: AIProvider
     let account: AccountInfo
     let isLoading: Bool
+    var allowsAccountActions = true
+    var onRefresh: (() async -> Void)? = nil
     
     @State private var isRefreshing = false
     @State private var showSwitchSheet = false
     @State private var showModelsDetailSheet = false
 
+    private var canShowAntigravityActions: Bool {
+        allowsAccountActions && provider == .antigravity
+    }
+
+    private var canShowClaudeReauthAction: Bool {
+        allowsAccountActions && provider == .claude
+    }
+
     /// Check if OAuth is in progress for this provider
     private var isReauthenticating: Bool {
+        guard canShowClaudeReauthAction else { return false }
         guard let oauthState = viewModel.oauthState else { return false }
         return oauthState.provider == provider &&
                (oauthState.status == .waiting || oauthState.status == .polling)
@@ -466,6 +758,7 @@ private struct AccountQuotaCardV2: View {
     
     /// Get auth URL if available during reauthentication
     private var reauthURL: URL? {
+        guard canShowClaudeReauthAction else { return nil }
         guard let oauthState = viewModel.oauthState,
               oauthState.provider == provider,
               let urlString = oauthState.authURL else { return nil }
@@ -488,7 +781,7 @@ private struct AccountQuotaCardV2: View {
     
     /// Check if this Antigravity account is active in IDE
     private var isActiveInIDE: Bool {
-        provider == .antigravity && viewModel.isAntigravityAccountActive(email: account.email)
+        canShowAntigravityActions && viewModel.isAntigravityAccountActive(email: account.email)
     }
     
     /// Build 4-group display for Antigravity: Gemini 3 Pro, Gemini 3 Flash, Gemini 3 Image, Claude 4.5
@@ -599,7 +892,7 @@ private struct AccountQuotaCardV2: View {
             Spacer()
             
             HStack(spacing: 6) {
-                if provider == .antigravity {
+                if canShowAntigravityActions {
                     Button {
                         showWarmupSheet = true
                     } label: {
@@ -620,7 +913,7 @@ private struct AccountQuotaCardV2: View {
                     .help("action.warmup".localized())
                 }
                 
-                if isActiveInIDE {
+                if allowsAccountActions && isActiveInIDE {
                     Text("antigravity.active".localized())
                         .font(.caption2)
                         .fontWeight(.medium)
@@ -631,7 +924,7 @@ private struct AccountQuotaCardV2: View {
                         .clipShape(Capsule())
                 }
                 
-                if provider == .antigravity && !isActiveInIDE {
+                if canShowAntigravityActions && !isActiveInIDE {
                     Button {
                         showSwitchSheet = true
                     } label: {
@@ -655,7 +948,11 @@ private struct AccountQuotaCardV2: View {
                 Button {
                     Task {
                         isRefreshing = true
-                        await viewModel.refreshQuotaForProvider(provider)
+                        if let onRefresh {
+                            await onRefresh()
+                        } else {
+                            await viewModel.refreshQuotaForProvider(provider)
+                        }
                         isRefreshing = false
                     }
                 } label: {
@@ -683,7 +980,7 @@ private struct AccountQuotaCardV2: View {
                 .disabled(isRefreshing || isLoading)
                 
                 if let data = account.quotaData, data.isForbidden {
-                    if provider == .claude {
+                    if canShowClaudeReauthAction {
                         // When reauthenticating with authURL available, show "Open Link" button
                         if isReauthenticating, let url = reauthURL {
                             Button {

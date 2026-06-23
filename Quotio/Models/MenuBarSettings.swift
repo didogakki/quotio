@@ -474,6 +474,7 @@ final class MenuBarSettingsManager {
     private let totalUsageModeKey = "totalUsageMode"
     private let modelAggregationModeKey = "modelAggregationMode"
     private let hasUserModifiedMenuBarKey = "hasUserModifiedMenuBar"
+    private let hasUserModifiedShowQuotaKey = "hasUserModifiedShowQuotaInMenuBar"
 
     static let minMenuBarItems = 1
     static let maxMenuBarItems = 10
@@ -486,7 +487,10 @@ final class MenuBarSettingsManager {
 
     /// Whether to show quota in menu bar (only effective when showMenuBarIcon is true)
     var showQuotaInMenuBar: Bool {
-        didSet { defaults.set(showQuotaInMenuBar, forKey: showQuotaKey) }
+        didSet {
+            defaults.set(showQuotaInMenuBar, forKey: showQuotaKey)
+            defaults.set(true, forKey: hasUserModifiedShowQuotaKey)
+        }
     }
 
     /// Maximum number of items to display in menu bar
@@ -557,8 +561,10 @@ final class MenuBarSettingsManager {
         }
         self.showMenuBarIcon = defaults.bool(forKey: showMenuBarIconKey)
         
-        // Show quota in menu bar - default true if not set
-        if defaults.object(forKey: showQuotaKey) == nil {
+        // Show quota in menu bar by default. Older builds may have persisted
+        // `false` as the implicit default, so migrate until the user explicitly
+        // changes this toggle in this build.
+        if defaults.object(forKey: showQuotaKey) == nil || !defaults.bool(forKey: hasUserModifiedShowQuotaKey) {
             defaults.set(true, forKey: showQuotaKey)
         }
         self.showQuotaInMenuBar = defaults.bool(forKey: showQuotaKey)
@@ -801,5 +807,25 @@ extension MenuBarSettingsManager {
         let options: String.CompareOptions = [.regularExpression, .caseInsensitive]
         guard let range = text.range(of: pattern, options: options) else { return nil }
         return String(text[range])
+    }
+
+    /// Resolve a stable (key, label) pair from a raw plan string using the same
+    /// keyword matching as makeQuotaDisplayItems plan grouping.
+    func resolveRemotePlanLabel(rawPlan: String) -> (key: String, label: String) {
+        let lowercased = rawPlan.lowercased()
+        if lowercased.contains("team") { return (key: "team", label: "Team") }
+        if lowercased.contains("enterprise") { return (key: "enterprise", label: "Enterprise") }
+        if lowercased.contains("business") { return (key: "business", label: "Business") }
+        if lowercased.contains("plus") { return (key: "plus", label: "Plus") }
+        if lowercased.contains("pro") { return (key: "pro", label: "Pro") }
+        let key = lowercased
+            .replacingOccurrences(of: "_", with: "-")
+            .replacingOccurrences(of: " ", with: "-")
+        let label = rawPlan
+            .replacingOccurrences(of: "_", with: " ")
+            .split(separator: " ")
+            .map { $0.prefix(1).uppercased() + $0.dropFirst().lowercased() }
+            .joined(separator: " ")
+        return (key: key, label: label)
     }
 }

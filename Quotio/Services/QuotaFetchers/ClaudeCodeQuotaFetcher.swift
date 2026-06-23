@@ -245,40 +245,73 @@ actor ClaudeCodeQuotaFetcher {
                 return .otherError
             }
 
-            // Check for API error response
-            if json["type"] as? String == "error" {
-                // Check if it's an authentication error
-                if let errorObj = json["error"] as? [String: Any],
-                   let errorType = errorObj["type"] as? String,
-                   errorType == "authentication_error" {
-                    // Token expired or invalid
-                    NSLog("[ClaudeQuota] Authentication error for \(email ?? "unknown")")
-                    return .authenticationError
-                }
-                NSLog("[ClaudeQuota] API error: \(json)")
-                return .otherError
-            }
-
-            // API returns data directly (no wrapper)
-            let fiveHour = parseQuotaUsage(from: json["five_hour"] as? [String: Any])
-            let sevenDay = parseQuotaUsage(from: json["seven_day"] as? [String: Any])
-            let sevenDaySonnet = parseQuotaUsage(from: json["seven_day_sonnet"] as? [String: Any])
-            let sevenDayOpus = parseQuotaUsage(from: json["seven_day_opus"] as? [String: Any])
-            let extraUsage = parseExtraUsage(from: json["extra_usage"] as? [String: Any])
-
-            return .success(ClaudeCodeQuotaInfo(
-                accessToken: accessToken,
-                email: email,
-                fiveHour: fiveHour,
-                sevenDay: sevenDay,
-                sevenDaySonnet: sevenDaySonnet,
-                sevenDayOpus: sevenDayOpus,
-                extraUsage: extraUsage
-            ))
+            return parseUsagePayload(json, accessToken: accessToken, email: email)
         } catch {
             NSLog("[ClaudeQuota] Network error: \(error.localizedDescription)")
             return .otherError
         }
+    }
+
+    private func fetchUsageViaManagement(authIndex: String, email: String?, apiClient: ManagementAPIClient) async -> ClaudeAPIResult {
+        do {
+            let response = try await apiClient.apiCall(APICallRequest(
+                authIndex: authIndex,
+                method: "GET",
+                url: usageURL,
+                header: [
+                    "Accept": "application/json",
+                    "Authorization": "Bearer $TOKEN$",
+                    "anthropic-beta": "oauth-2025-04-20"
+                ],
+                data: nil
+            ))
+
+            if response.statusCode == 401 {
+                return .authenticationError
+            }
+            guard 200..<300 ~= response.statusCode,
+                  let body = response.body,
+                  let data = body.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return .otherError
+            }
+
+            return parseUsagePayload(json, accessToken: nil, email: email)
+        } catch {
+            Log.quota("Failed to fetch Claude quota via CLIProxyAPI for \(email ?? authIndex): \(error.localizedDescription)")
+            return .otherError
+        }
+    }
+
+    private func parseUsagePayload(_ json: [String: Any], accessToken: String?, email: String?) -> ClaudeAPIResult {
+        // Check for API error response
+        if json["type"] as? String == "error" {
+            if let errorObj = json["error"] as? [String: Any],
+               let errorType = errorObj["type"] as? String,
+               errorType == "authentication_error" {
+                NSLog("[ClaudeQuota] Authentication error for \(email ?? "unknown")")
+                return .authenticationError
+            }
+            NSLog("[ClaudeQuota] API error: \(json)")
+            return .otherError
+        }
+
+        // API returns data directly (no wrapper)
+        let fiveHour = parseQuotaUsage(from: json["five_hour"] as? [String: Any])
+        let sevenDay = parseQuotaUsage(from: json["seven_day"] as? [String: Any])
+        let sevenDaySonnet = parseQuotaUsage(from: json["seven_day_sonnet"] as? [String: Any])
+        let sevenDayOpus = parseQuotaUsage(from: json["seven_day_opus"] as? [String: Any])
+        let extraUsage = parseExtraUsage(from: json["extra_usage"] as? [String: Any])
+
+        return .success(ClaudeCodeQuotaInfo(
+            accessToken: accessToken,
+            email: email,
+            fiveHour: fiveHour,
+            sevenDay: sevenDay,
+            sevenDaySonnet: sevenDaySonnet,
+            sevenDayOpus: sevenDayOpus,
+            extraUsage: extraUsage
+        ))
     }
 
     /// Fetch quota for all Claude accounts from auth files in ~/.cli-proxy-api/
@@ -318,6 +351,47 @@ actor ClaudeCodeQuotaFetcher {
             }
         }
         
+        return results
+    }
+
+    /// Fetch Claude quota for CLIProxyAPI-managed accounts via the management API.
+    func fetchAsProviderQuota(authFiles: [AuthFile], apiClient: ManagementAPIClient?) async -> [String: ProviderQuotaData] {
+        guard let apiClient else { return [:] }
+
+        let files = authFiles.filter {
+            $0.providerType == .claude &&
+            !$0.disabled &&
+            !$0.unavailable
+        }
+
+        guard !files.isEmpty else { return [:] }
+
+        var results: [String: ProviderQuotaData] = [:]
+
+        await withTaskGroup(of: (String, ProviderQuotaData?).self) { group in
+            for file in files {
+                guard let authIndex = file.authIndex?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !authIndex.isEmpty else {
+                    continue
+                }
+
+                group.addTask {
+                    let accountKey = file.quotaLookupKey.isEmpty ? file.name : file.quotaLookupKey
+                    let result = await self.fetchUsageViaManagement(
+                        authIndex: authIndex,
+                        email: file.email,
+                        apiClient: apiClient
+                    )
+                    return (accountKey, self.providerQuotaData(from: result))
+                }
+            }
+
+            for await (accountKey, data) in group {
+                guard !accountKey.isEmpty, let data else { continue }
+                results[accountKey] = data
+            }
+        }
+
         return results
     }
     
@@ -361,7 +435,36 @@ actor ClaudeCodeQuotaFetcher {
 
         switch result {
         case .success(let info):
-            // Convert to ProviderQuotaData
+            guard let quotaData = providerQuotaData(from: .success(info)) else { return nil }
+
+            // Update cache
+            quotaCache[email] = CachedQuota(data: quotaData, timestamp: Date())
+
+            return (email, quotaData)
+
+        case .authenticationError:
+            // Token expired and refresh failed - return isForbidden to trigger re-authentication UI
+            let quotaData = ProviderQuotaData(
+                models: [],
+                lastUpdated: Date(),
+                isForbidden: true,  // Indicates re-authentication needed
+                planType: nil
+            )
+            // Don't cache auth errors - allow retry
+            return (email, quotaData)
+
+        case .otherError:
+            // Return cached data if API fails with non-auth error
+            if let cached = quotaCache[email] {
+                return (email, cached.data)
+            }
+            return nil
+        }
+    }
+
+    private nonisolated func providerQuotaData(from result: ClaudeAPIResult) -> ProviderQuotaData? {
+        switch result {
+        case .success(let info):
             var models: [ModelQuota] = []
 
             if let fiveHour = info.fiveHour {
@@ -402,7 +505,6 @@ actor ClaudeCodeQuotaFetcher {
                     percentage: remaining,
                     resetTime: ""
                 )
-                // Add usage details if available
                 if let used = extra.usedCredits, let limit = extra.monthlyLimit {
                     extraModel.used = Int(used)
                     extraModel.limit = Int(limit)
@@ -412,34 +514,22 @@ actor ClaudeCodeQuotaFetcher {
 
             guard !models.isEmpty else { return nil }
 
-            let quotaData = ProviderQuotaData(
+            return ProviderQuotaData(
                 models: models,
                 lastUpdated: Date(),
                 isForbidden: false,
                 planType: nil
             )
 
-            // Update cache
-            quotaCache[email] = CachedQuota(data: quotaData, timestamp: Date())
-
-            return (email, quotaData)
-
         case .authenticationError:
-            // Token expired and refresh failed - return isForbidden to trigger re-authentication UI
-            let quotaData = ProviderQuotaData(
+            return ProviderQuotaData(
                 models: [],
                 lastUpdated: Date(),
-                isForbidden: true,  // Indicates re-authentication needed
+                isForbidden: true,
                 planType: nil
             )
-            // Don't cache auth errors - allow retry
-            return (email, quotaData)
 
         case .otherError:
-            // Return cached data if API fails with non-auth error
-            if let cached = quotaCache[email] {
-                return (email, cached.data)
-            }
             return nil
         }
     }

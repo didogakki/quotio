@@ -31,6 +31,10 @@ struct ProvidersScreen: View {
     private let warpService = WarpService.shared
     
     // MARK: - Computed Properties
+
+    private var shouldUseProxyAuthFiles: Bool {
+        modeManager.isRemoteProxyMode || (modeManager.isLocalProxyMode && viewModel.proxyManager.proxyStatus.running)
+    }
     
     /// Providers that can be added manually
     private var addableProviders: [AIProvider] {
@@ -45,8 +49,8 @@ struct ProvidersScreen: View {
     private var groupedAccounts: [AIProvider: [AccountRowData]] {
         var groups: [AIProvider: [AccountRowData]] = [:]
 
-        if modeManager.isLocalProxyMode && viewModel.proxyManager.proxyStatus.running {
-            // From proxy auth files (proxy running)
+        if shouldUseProxyAuthFiles {
+            // From proxy auth files (local proxy running or remote CLIProxyAPI)
             for file in viewModel.authFiles {
                 guard let provider = file.providerType else { continue }
                 let data = AccountRowData.from(authFile: file)
@@ -130,6 +134,10 @@ struct ProvidersScreen: View {
         List {
             // Section 1: Your Accounts (grouped by provider)
             accountsSection
+
+            if !modeManager.remoteMonitorSources.isEmpty {
+                RemoteMonitorAccountsSection()
+            }
             
             // Section 2: Custom Providers (Local Proxy Mode only)
             if modeManager.isLocalProxyMode {
@@ -159,7 +167,12 @@ struct ProvidersScreen: View {
             // Failure case is silently ignored - user can retry via UI
         }
         .task {
-            await viewModel.loadDirectAuthFiles()
+            if shouldUseProxyAuthFiles {
+                await viewModel.refreshData()
+            } else {
+                await viewModel.loadDirectAuthFiles()
+            }
+            await viewModel.refreshRemoteMonitors()
         }
         .alert("providers.proxyRequired.title".localized(), isPresented: $showProxyRequiredAlert) {
             Button("action.startProxy".localized()) {
@@ -243,21 +256,22 @@ struct ProvidersScreen: View {
         ToolbarItem(placement: .automatic) {
             Button {
                 Task {
-        if modeManager.isLocalProxyMode && viewModel.proxyManager.proxyStatus.running {
+                    if shouldUseProxyAuthFiles {
                         await viewModel.refreshData()
                     } else {
                         await viewModel.loadDirectAuthFiles()
                     }
                     await viewModel.refreshAutoDetectedProviders()
+                    await viewModel.refreshRemoteMonitors()
                 }
             } label: {
-                if viewModel.isLoadingQuotas {
+                if viewModel.isLoadingQuotas || viewModel.isLoadingRemoteMonitors {
                     SmallProgressView()
                 } else {
                     Image(systemName: "arrow.clockwise")
                 }
             }
-            .disabled(viewModel.isLoadingQuotas)
+            .disabled(viewModel.isLoadingQuotas || viewModel.isLoadingRemoteMonitors)
             .help("action.refresh".localized())
         }
     }
@@ -451,6 +465,269 @@ struct ProvidersScreen: View {
         // Silent failure - custom provider sync is non-critical
         // Config will be synced on next proxy start
         try? customProviderService.syncToConfigFile(configPath: viewModel.proxyManager.configPath)
+    }
+}
+
+// MARK: - Remote Monitor Accounts Section
+
+private struct RemoteMonitorAccountsSection: View {
+    @Environment(QuotaViewModel.self) private var viewModel
+    @State private var modeManager = OperatingModeManager.shared
+
+    private var snapshotsById: [String: QuotaViewModel.RemoteMonitorSnapshot] {
+        Dictionary(uniqueKeysWithValues: viewModel.remoteMonitorSnapshots.map { ($0.id, $0) })
+    }
+
+    private var totalAccountCount: Int {
+        viewModel.remoteMonitorSnapshots.reduce(0) { total, snapshot in
+            total + snapshot.authFiles.filter { $0.providerType != nil }.count
+        }
+    }
+
+    var body: some View {
+        Section {
+            ForEach(modeManager.remoteMonitorSources) { config in
+                RemoteMonitorSourceAccountGroup(
+                    config: config,
+                    snapshot: snapshotsById[config.id],
+                    status: modeManager.remoteMonitorStatus(for: config.id),
+                    isLoading: viewModel.isLoadingRemoteMonitors
+                )
+            }
+        } header: {
+            HStack {
+                Label("settings.remoteMonitors.title".localized(), systemImage: "binoculars.fill")
+                if totalAccountCount > 0 {
+                    Spacer()
+                    Text("\(totalAccountCount)")
+                        .font(.caption2.bold())
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.secondary.opacity(0.2))
+                        .clipShape(Capsule())
+                }
+            }
+        } footer: {
+            Text("settings.remoteMonitors.help".localized())
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+    }
+}
+
+private struct RemoteMonitorSourceAccountGroup: View {
+    let config: RemoteConnectionConfig
+    let snapshot: QuotaViewModel.RemoteMonitorSnapshot?
+    let status: ConnectionStatus
+    let isLoading: Bool
+
+    @State private var isExpanded = true
+
+    private var groupedAccounts: [AIProvider: [RemoteMonitorAccountRowData]] {
+        guard let snapshot else { return [:] }
+        var groups: [AIProvider: [RemoteMonitorAccountRowData]] = [:]
+        for file in snapshot.authFiles {
+            guard let provider = file.providerType else { continue }
+            let name = file.email ?? file.account ?? file.name
+            let quotaKey = file.quotaLookupKey
+            let hasQuotaData = snapshot.providerQuotas[provider]?[quotaKey] != nil
+            let data = RemoteMonitorAccountRowData(
+                id: config.id + ":" + file.id,
+                provider: provider,
+                displayName: name,
+                status: hasQuotaData ? "ready" : file.status,
+                statusMessage: hasQuotaData ? nil : file.humanReadableStatus,
+                isDisabled: hasQuotaData ? file.disabled : (file.disabled || file.unavailable)
+            )
+            groups[provider, default: []].append(data)
+        }
+        return groups.mapValues { accounts in
+            accounts.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+        }
+    }
+
+    private var sortedProviders: [AIProvider] {
+        groupedAccounts.keys.sorted { $0.displayName < $1.displayName }
+    }
+
+    private var totalCount: Int {
+        groupedAccounts.values.reduce(0) { $0 + $1.count }
+    }
+
+    private var errorMessage: String? {
+        if let message = snapshot?.errorMessage { return message }
+        if case .error(let message) = status { return message }
+        return nil
+    }
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $isExpanded) {
+            if totalCount > 0 {
+                if let errorMessage {
+                    monitorMessage(errorMessage, systemImage: "exclamationmark.triangle.fill")
+                }
+                ForEach(sortedProviders) { provider in
+                    RemoteMonitorProviderAccountGroup(
+                        provider: provider,
+                        accounts: groupedAccounts[provider] ?? []
+                    )
+                }
+            } else if snapshot == nil && isLoading {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("settings.remote.loading".localized())
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 6)
+            } else if let errorMessage {
+                monitorMessage(errorMessage, systemImage: "exclamationmark.triangle.fill")
+            } else {
+                monitorMessage("quota.noDataYet".localized(), systemImage: "chart.bar.xaxis")
+            }
+        } label: {
+            sourceHeader
+        }
+    }
+
+    private var sourceHeader: some View {
+        HStack(spacing: 10) {
+            Circle()
+                .fill(statusColor)
+                .frame(width: 8, height: 8)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(config.displayName)
+                    .fontWeight(.medium)
+                Text(config.endpointURL)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer()
+
+            Text(statusText)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(Color.secondary.opacity(0.1))
+                .clipShape(Capsule())
+        }
+    }
+
+    private func monitorMessage(_ message: String, systemImage: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: systemImage)
+                .foregroundStyle(.secondary)
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer()
+        }
+        .padding(.vertical, 6)
+    }
+
+    private var statusColor: Color {
+        switch status {
+        case .connected: return .green
+        case .connecting: return .orange
+        case .disconnected: return .gray
+        case .error: return .red
+        }
+    }
+
+    private var statusText: String {
+        switch status {
+        case .connected: return "status.connected".localized()
+        case .connecting: return "status.connecting".localized()
+        case .disconnected: return "status.disconnected".localized()
+        case .error: return "status.error".localized()
+        }
+    }
+}
+
+private struct RemoteMonitorProviderAccountGroup: View {
+    let provider: AIProvider
+    let accounts: [RemoteMonitorAccountRowData]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                ProviderIcon(provider: provider, size: 18)
+                Text(provider.displayName)
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+                Text("\(accounts.count)")
+                    .font(.caption2)
+                    .fontWeight(.semibold)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(provider.color.opacity(0.15))
+                    .foregroundStyle(provider.color)
+                    .clipShape(Capsule())
+            }
+
+            ForEach(accounts) { account in
+                RemoteMonitorAccountRow(account: account)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+private struct RemoteMonitorAccountRowData: Identifiable {
+    let id: String
+    let provider: AIProvider
+    let displayName: String
+    let status: String
+    let statusMessage: String?
+    let isDisabled: Bool
+
+    var statusColor: Color {
+        switch status {
+        case "ready": return isDisabled ? .gray : .green
+        case "cooling": return .orange
+        case "error": return .red
+        default: return .gray
+        }
+    }
+
+    var statusText: String {
+        switch status {
+        case "ready": return "status.ready".localizedStatic()
+        case "cooling": return "status.cooling".localizedStatic()
+        case "error": return "status.error".localizedStatic()
+        default: return status
+        }
+    }
+}
+
+private struct RemoteMonitorAccountRow: View {
+    let account: RemoteMonitorAccountRowData
+    @State private var settings = MenuBarSettingsManager.shared
+
+    private var displayName: String {
+        account.displayName.masked(if: settings.hideSensitiveInfo)
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Circle()
+                .fill(account.statusColor)
+                .frame(width: 7, height: 7)
+            Text(displayName)
+                .font(.subheadline)
+                .lineLimit(1)
+            Spacer()
+            Text(account.statusMessage ?? account.statusText)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .padding(.leading, 26)
+        .padding(.vertical, 2)
     }
 }
 

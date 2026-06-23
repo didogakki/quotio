@@ -3,10 +3,10 @@
 // This file is tracked by git
 
 // Default Debug settings (will be overridden by Local.xcconfig if it exists)
-PRODUCT_BUNDLE_IDENTIFIER = dev.quotio.desktop
-PRODUCT_NAME = Quotio
-INFOPLIST_KEY_CFBundleDisplayName = Quotio
-ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon
+PRODUCT_BUNDLE_IDENTIFIER = dev.quotio.desktop.debug
+PRODUCT_NAME = Quotio Dev
+INFOPLIST_KEY_CFBundleDisplayName = Quotio Dev
+ASSETCATALOG_COMPILER_APPICON_NAME = AppIconBeta
 
 // Include local overrides AFTER defaults (so Local.xcconfig can override)
 // Local.xcconfig is gitignored and can contain developer-specific settings

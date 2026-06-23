@@ -143,6 +143,35 @@ actor OpenAIQuotaFetcher {
 #endif
         return CodexQuotaData(from: quotaResponse)
     }
+
+    private func fetchQuota(authIndex: String, accountId: String?, apiClient: ManagementAPIClient) async throws -> CodexQuotaData {
+        var headers: [String: String] = [
+            "Authorization": "Bearer $TOKEN$",
+            "Accept": "application/json"
+        ]
+        if let accountId, !accountId.isEmpty {
+            headers["ChatGPT-Account-Id"] = accountId
+        }
+
+        let response = try await apiClient.apiCall(APICallRequest(
+            authIndex: authIndex,
+            method: "GET",
+            url: usageURL,
+            header: headers,
+            data: nil
+        ))
+
+        guard 200..<300 ~= response.statusCode else {
+            throw CodexQuotaError.httpError(response.statusCode)
+        }
+        guard let body = response.body,
+              let data = body.data(using: .utf8) else {
+            throw CodexQuotaError.invalidResponse
+        }
+
+        let quotaResponse = try JSONDecoder().decode(CodexUsageResponse.self, from: data)
+        return CodexQuotaData(from: quotaResponse)
+    }
     
     func fetchQuotaForAuthFile(at path: String) async throws -> (accountKey: String, quota: CodexQuotaData) {
         let url = URL(fileURLWithPath: path)
@@ -233,6 +262,47 @@ actor OpenAIQuotaFetcher {
             }
         }
         
+        return results
+    }
+
+    func fetchAllCodexQuotas(authFiles: [AuthFile], apiClient: ManagementAPIClient?) async -> [String: ProviderQuotaData] {
+        guard let apiClient else { return [:] }
+
+        let files = authFiles.filter { file in
+            guard file.providerType == .codex, !file.disabled else { return false }
+            // Allow unavailable files if they still have an authIndex (stale usage_limit_reached
+            // should not permanently block the quota fetch — let the actual /api-call decide).
+            if file.unavailable {
+                guard let idx = file.authIndex,
+                      !idx.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+            }
+            return true
+        }
+
+        guard !files.isEmpty else { return [:] }
+
+        var results: [String: ProviderQuotaData] = [:]
+
+        for file in files {
+            guard let authIndex = file.authIndex?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !authIndex.isEmpty else {
+                continue
+            }
+
+            do {
+                let accountId = trimmedNonEmpty(file.idToken?.chatgptAccountID)
+                let quota = try await fetchQuota(
+                    authIndex: authIndex,
+                    accountId: accountId,
+                    apiClient: apiClient
+                )
+                let accountKey = file.quotaLookupKey.isEmpty ? file.name : file.quotaLookupKey
+                results[accountKey] = quota.toProviderQuotaData()
+            } catch {
+                Log.quota("Failed to fetch Codex quota via CLIProxyAPI for \(file.name): \(error)")
+            }
+        }
+
         return results
     }
 }

@@ -77,8 +77,10 @@ log_success "Bundled proxy verified ($(get_step_duration "verify-proxy"))"
 print_step 4 4 "Ad-hoc Signing"
 start_step_timer "sign"
 
-codesign --force --deep --sign - "${APP_PATH}" 2>/dev/null || true
-log_success "App signed ($(get_step_duration "sign"))"
+xattr -cr "${APP_PATH}" 2>/dev/null || true
+codesign --force --deep --sign - "${APP_PATH}"
+codesign --verify --deep --strict --verbose=2 "${APP_PATH}"
+log_success "App signed and verified ($(get_step_duration "sign"))"
 
 APP_SIZE=$(get_file_size "${APP_PATH}")
 
