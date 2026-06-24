@@ -32,7 +32,7 @@ Quotio is a native macOS application for managing **CLIProxyAPI** - a local prox
 - **📈 Real-time Dashboard**: Monitor request traffic, token usage, and success rates live.
 - **📉 Smart Quota Management**: Visual quota tracking per account with automatic failover strategies (Round Robin / Fill First).
 - **🔑 API Key Management**: Generate and manage API keys for your local proxy.
-- **🖥️ Menu Bar Integration**: Quick access to server status, quota overview, and custom provider icons from your menu bar.
+- **🖥️ Menu Bar Integration**: Quick access to server status, quota overview, and custom provider icons from your menu bar — including remote CLIProxyAPI monitor quotas for Claude and Codex, with pin-to-top support.
 - **🔔 Notifications**: Alerts for low quotas, account cooling periods, or service issues.
 - **🔄 Auto-Update**: Built-in Sparkle updater for seamless updates.
 - **🌍 Multilingual**: English, Vietnamese, and Simplified Chinese support.
