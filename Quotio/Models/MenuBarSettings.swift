@@ -45,20 +45,43 @@ extension String {
 /// Represents a single item selected for menu bar display
 struct MenuBarQuotaItem: Codable, Identifiable, Hashable {
     let provider: String      // AIProvider.rawValue
-    let accountKey: String    // email or account identifier
-    
-    var id: String { "\(provider)_\(accountKey)" }
-    
-    /// Get the AIProvider enum value
+    let accountKey: String    // email, account identifier, or "__pool__" for pool items
+    let sourceConfigId: String?  // nil = local; non-nil = remote monitor config id
+
+    enum CodingKeys: String, CodingKey {
+        case provider, accountKey, sourceConfigId
+    }
+
+    init(provider: String, accountKey: String, sourceConfigId: String? = nil) {
+        self.provider = provider
+        self.accountKey = accountKey
+        self.sourceConfigId = sourceConfigId
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.provider = try c.decode(String.self, forKey: .provider)
+        self.accountKey = try c.decode(String.self, forKey: .accountKey)
+        self.sourceConfigId = try c.decodeIfPresent(String.self, forKey: .sourceConfigId)
+    }
+
+    var id: String {
+        if let cid = sourceConfigId {
+            return "remote:\(cid):\(provider)_\(accountKey)"
+        }
+        return "\(provider)_\(accountKey)"  // unchanged for local — backward compatible
+    }
+
+    var isRemote: Bool { sourceConfigId != nil }
+    var isPool: Bool { accountKey == "__pool__" }
+
     var aiProvider: AIProvider? {
-        // Handle "copilot" alias
         if provider == "copilot" {
             return .copilot
         }
         return AIProvider(rawValue: provider)
     }
-    
-    /// Short display symbol for the provider
+
     var providerSymbol: String {
         aiProvider?.menuBarSymbol ?? "?"
     }
@@ -685,6 +708,7 @@ extension MenuBarSettingsManager {
         var aggregatedItems: [String: AggregatedMenuBarQuotaItem] = [:]
 
         for selectedItem in selectedItems {
+            guard !selectedItem.isRemote else { continue }
             guard let provider = selectedItem.aiProvider else { continue }
 
             var displayPercent: Double = -1
@@ -743,9 +767,15 @@ extension MenuBarSettingsManager {
         for provider: AIProvider,
         quotaData: ProviderQuotaData
     ) -> MenuBarQuotaPlanGroup? {
-        guard provider == .codex else { return nil }
-        guard let rawPlan = quotaData.planDisplayName ?? quotaData.planType,
-              !rawPlan.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        guard provider == .codex || provider == .claude else { return nil }
+
+        let rawPlan: String
+        if let plan = quotaData.planDisplayName ?? quotaData.planType,
+           !plan.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            rawPlan = plan
+        } else if provider == .claude {
+            rawPlan = "Pro"
+        } else {
             return nil
         }
 
@@ -754,6 +784,9 @@ extension MenuBarSettingsManager {
             return MenuBarQuotaPlanGroup(key: "team", label: "Team")
         }
         if lowercased.contains("plus") {
+            if provider == .claude {
+                return MenuBarQuotaPlanGroup(key: "pro", label: "Pro")
+            }
             return MenuBarQuotaPlanGroup(key: "plus", label: "Plus")
         }
         if lowercased.contains("pro") {

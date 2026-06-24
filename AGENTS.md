@@ -35,6 +35,13 @@ Only run release scripts when changing packaging, notarization, appcast, or rele
 
 For UI changes, also run the app manually and check light/dark mode. For provider, OAuth, proxy, or menu bar changes, manually verify the affected flow.
 
+## CodeGraph
+
+- This repo is initialized for CodeGraph; local index data lives under `.codegraph/`.
+- Prefer CodeGraph or the `codegraph` CLI for structural questions such as definitions, callers, callees, impact, and focused context.
+- Use `rg` for literal text, comments, log messages, and user-facing strings.
+- Check freshness with `codegraph status`; refresh with `codegraph sync`.
+
 ## Project rules
 
 - Keep UI-facing mutable state on `@MainActor`; use `actor` for async services with mutable state.

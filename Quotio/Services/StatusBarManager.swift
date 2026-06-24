@@ -59,15 +59,13 @@ final class StatusBarManager: NSObject, NSMenuDelegate {
             menu?.delegate = self
         }
         
-        // Attach menu to status item
         statusItem?.menu = menu
-        
+
         guard let button = statusItem?.button else { return }
-        
+
         button.subviews.forEach { $0.removeFromSuperview() }
         button.title = ""
         button.image = nil
-        
         let contentView: AnyView
         if !showQuota || !isRunning || items.isEmpty {
             contentView = AnyView(
@@ -82,8 +80,7 @@ final class StatusBarManager: NSObject, NSMenuDelegate {
         let hostingView = NSHostingView(rootView: contentView)
         hostingView.setFrameSize(hostingView.intrinsicContentSize)
         
-        // Add horizontal padding to align with native status bar spacing
-        let horizontalPadding: CGFloat = 4
+        let horizontalPadding: CGFloat = 1
         let contentSize = hostingView.intrinsicContentSize
         let containerSize = NSSize(
             width: contentSize.width + horizontalPadding * 2,
@@ -104,16 +101,15 @@ final class StatusBarManager: NSObject, NSMenuDelegate {
     }
     
     // MARK: - NSMenuDelegate
-    
+
     func menuWillOpen(_ menu: NSMenu) {
         hasPendingMenuRebuild = false
         performMenuRebuild(using: menu)
     }
-    
+
     func menuDidClose(_ menu: NSMenu) {
-        // Cleanup
     }
-    
+
     /// Force rebuild menu while it's open (e.g., when provider changes)
     func rebuildMenuInPlace() {
         guard let menu = menu else { return }
@@ -184,11 +180,11 @@ final class StatusBarManager: NSObject, NSMenuDelegate {
 
 final class StatusBarContainerView: NSView {
     override var allowsVibrancy: Bool { true }
-    
+
     override func mouseDown(with event: NSEvent) {
         superview?.mouseDown(with: event)
     }
-    
+
     override func mouseUp(with event: NSEvent) {
         superview?.mouseUp(with: event)
     }
@@ -211,15 +207,14 @@ struct StatusBarDefaultView: View {
 struct StatusBarQuotaView: View {
     let items: [MenuBarQuotaDisplayItem]
     let colorMode: MenuBarColorMode
-    
+
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 6) {
             ForEach(items) { item in
                 StatusBarQuotaItemView(item: item, colorMode: colorMode)
             }
         }
-        .padding(.horizontal, 4)
-        .frame(height: 22)
+        .padding(.horizontal, 1)
         .fixedSize()
     }
 }
@@ -229,30 +224,30 @@ struct StatusBarQuotaView: View {
 struct StatusBarQuotaItemView: View {
     let item: MenuBarQuotaDisplayItem
     let colorMode: MenuBarColorMode
-    
-    @State private var settings = MenuBarSettingsManager.shared
-    
+
     var body: some View {
-        let displayMode = settings.quotaDisplayMode
-        let displayPercent = displayMode.displayValue(from: item.percentage)
-        
-        HStack(spacing: 2) {
+        // Always use used-percent semantics for both display and color
+        let usedPercent = item.percentage >= 0 ? (100.0 - item.percentage) : -1.0
+
+        HStack(spacing: 5) {
             if let assetName = item.provider.menuBarIconAsset {
                 Image(assetName)
                     .resizable()
+                    .renderingMode(.template)
                     .aspectRatio(contentMode: .fit)
-                    .frame(width: 14, height: 14)
+                    .frame(width: 13, height: 13)
+                    .foregroundStyle(colorMode == .colored ? iconTint : Color.primary)
             } else {
                 Text(item.provider.menuBarSymbol)
                     .font(.system(size: 11, weight: .semibold, design: .rounded))
-                    .foregroundStyle(colorMode == .colored ? item.provider.color : .primary)
+                    .foregroundStyle(colorMode == .colored ? iconTint : Color.primary)
                     .fixedSize()
             }
 
-            if let groupLabel = item.groupLabel {
-                Text(groupLabel)
-                    .font(.system(size: 11, weight: .semibold, design: .rounded))
-                    .foregroundStyle(groupLabelColor)
+            if let planLabel = item.groupLabel {
+                Text(planLabel)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Color.primary.opacity(0.55))
                     .fixedSize()
             }
 
@@ -261,28 +256,40 @@ struct StatusBarQuotaItemView: View {
                     .font(.system(size: 10))
                     .foregroundStyle(.orange)
             } else if item.percentage >= 0 {
-                Text(formatPercentage(displayPercent))
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    .foregroundStyle(colorMode == .colored ? item.statusColor : .primary)
+                Text(formatPercentage(usedPercent))
+                    .font(.system(size: 12, weight: .semibold).monospacedDigit())
+                    .foregroundStyle(colorMode == .colored ? percentColor(usedPercent) : Color.primary)
                     .fixedSize()
             }
         }
         .fixedSize()
-        .padding(.horizontal, 5)
-        .padding(.vertical, 1)
-    }
-    
-    private func formatPercentage(_ value: Double) -> String {
-        if value < 0 { return "--%"}
-        // Defensive clamp to valid 0-100 range
-        let clamped = min(100, max(0, value))
-        return String(format: "%.0f%%", clamped.rounded())
     }
 
-    private var groupLabelColor: Color {
-        guard colorMode == .colored, item.percentage >= 0 || item.isForbidden else {
-            return .primary
+    private var iconTint: Color {
+        switch item.provider {
+        case .claude:
+            return Color(red: 0xe0 / 255.0, green: 0x8c / 255.0, blue: 0x66 / 255.0)
+        case .codex:
+            return Color(red: 0xec / 255.0, green: 0xec / 255.0, blue: 0xee / 255.0)
+        default:
+            return Color.primary
         }
-        return item.statusColor
+    }
+
+    private func percentColor(_ usedPercent: Double) -> Color {
+        guard usedPercent >= 0 else { return Color.primary }
+        if usedPercent >= 85 {
+            return Color(red: 0xff / 255.0, green: 0x45 / 255.0, blue: 0x3a / 255.0)
+        }
+        if usedPercent >= 60 {
+            return Color(red: 0xff / 255.0, green: 0xd6 / 255.0, blue: 0x0a / 255.0)
+        }
+        return Color(red: 0x30 / 255.0, green: 0xd1 / 255.0, blue: 0x58 / 255.0)
+    }
+
+    private func formatPercentage(_ value: Double) -> String {
+        if value < 0 { return "--%"}
+        let clamped = min(100, max(0, value))
+        return String(format: "%.0f%%", clamped.rounded())
     }
 }

@@ -535,6 +535,8 @@ private struct RemoteMonitorSourceAccountGroup: View {
                 id: config.id + ":" + file.id,
                 provider: provider,
                 displayName: name,
+                quotaKey: quotaKey,
+                sourceConfigId: config.id,
                 status: hasQuotaData ? "ready" : file.status,
                 statusMessage: hasQuotaData ? nil : file.humanReadableStatus,
                 isDisabled: hasQuotaData ? file.disabled : (file.disabled || file.unavailable)
@@ -568,6 +570,7 @@ private struct RemoteMonitorSourceAccountGroup: View {
                 }
                 ForEach(sortedProviders) { provider in
                     RemoteMonitorProviderAccountGroup(
+                        configId: config.id,
                         provider: provider,
                         accounts: groupedAccounts[provider] ?? []
                     )
@@ -649,8 +652,19 @@ private struct RemoteMonitorSourceAccountGroup: View {
 }
 
 private struct RemoteMonitorProviderAccountGroup: View {
+    let configId: String
     let provider: AIProvider
     let accounts: [RemoteMonitorAccountRowData]
+
+    @State private var settings = MenuBarSettingsManager.shared
+    @State private var showWarning = false
+    @State private var showMaxItemsAlert = false
+
+    private var poolItem: MenuBarQuotaItem {
+        MenuBarQuotaItem(provider: provider.rawValue, accountKey: "__pool__", sourceConfigId: configId)
+    }
+
+    private var isPoolSelected: Bool { settings.isSelected(poolItem) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -667,6 +681,8 @@ private struct RemoteMonitorProviderAccountGroup: View {
                     .background(provider.color.opacity(0.15))
                     .foregroundStyle(provider.color)
                     .clipShape(Capsule())
+                Spacer()
+                MenuBarBadge(isSelected: isPoolSelected, onTap: handlePoolToggle)
             }
 
             ForEach(accounts) { account in
@@ -674,6 +690,29 @@ private struct RemoteMonitorProviderAccountGroup: View {
             }
         }
         .padding(.vertical, 4)
+        .alert("menubar.warning.title".localized(), isPresented: $showWarning) {
+            Button("menubar.warning.confirm".localized()) { settings.toggleItem(poolItem) }
+            Button("menubar.warning.cancel".localized(), role: .cancel) {}
+        } message: {
+            Text("menubar.warning.message".localized())
+        }
+        .alert("menubar.maxItems.title".localized(), isPresented: $showMaxItemsAlert) {
+            Button("action.ok".localized(), role: .cancel) {}
+        } message: {
+            Text(String(format: "menubar.maxItems.message".localized(), settings.menuBarMaxItems))
+        }
+    }
+
+    private func handlePoolToggle() {
+        if isPoolSelected {
+            settings.toggleItem(poolItem)
+        } else if settings.isAtMaxItems {
+            showMaxItemsAlert = true
+        } else if settings.shouldWarnOnAdd {
+            showWarning = true
+        } else {
+            settings.toggleItem(poolItem)
+        }
     }
 }
 
@@ -681,6 +720,8 @@ private struct RemoteMonitorAccountRowData: Identifiable {
     let id: String
     let provider: AIProvider
     let displayName: String
+    let quotaKey: String
+    let sourceConfigId: String
     let status: String
     let statusMessage: String?
     let isDisabled: Bool
@@ -707,10 +748,22 @@ private struct RemoteMonitorAccountRowData: Identifiable {
 private struct RemoteMonitorAccountRow: View {
     let account: RemoteMonitorAccountRowData
     @State private var settings = MenuBarSettingsManager.shared
+    @State private var showWarning = false
+    @State private var showMaxItemsAlert = false
 
     private var displayName: String {
         account.displayName.masked(if: settings.hideSensitiveInfo)
     }
+
+    private var menuBarItem: MenuBarQuotaItem {
+        MenuBarQuotaItem(
+            provider: account.provider.rawValue,
+            accountKey: account.quotaKey,
+            sourceConfigId: account.sourceConfigId
+        )
+    }
+
+    private var isMenuBarSelected: Bool { settings.isSelected(menuBarItem) }
 
     var body: some View {
         HStack(spacing: 10) {
@@ -725,9 +778,33 @@ private struct RemoteMonitorAccountRow: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
+            MenuBarBadge(isSelected: isMenuBarSelected, onTap: handleMenuBarToggle)
         }
         .padding(.leading, 26)
         .padding(.vertical, 2)
+        .alert("menubar.warning.title".localized(), isPresented: $showWarning) {
+            Button("menubar.warning.confirm".localized()) { settings.toggleItem(menuBarItem) }
+            Button("menubar.warning.cancel".localized(), role: .cancel) {}
+        } message: {
+            Text("menubar.warning.message".localized())
+        }
+        .alert("menubar.maxItems.title".localized(), isPresented: $showMaxItemsAlert) {
+            Button("action.ok".localized(), role: .cancel) {}
+        } message: {
+            Text(String(format: "menubar.maxItems.message".localized(), settings.menuBarMaxItems))
+        }
+    }
+
+    private func handleMenuBarToggle() {
+        if isMenuBarSelected {
+            settings.toggleItem(menuBarItem)
+        } else if settings.isAtMaxItems {
+            showMaxItemsAlert = true
+        } else if settings.shouldWarnOnAdd {
+            showWarning = true
+        } else {
+            settings.toggleItem(menuBarItem)
+        }
     }
 }
 

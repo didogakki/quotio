@@ -1929,6 +1929,43 @@ final class QuotaViewModel {
             }
         }
         
+        // Add remote items from current snapshots so selected remote badges survive pruning
+        for snapshot in remoteMonitorSnapshots {
+            for (provider, accountQuotas) in snapshot.providerQuotas {
+                let poolItem = MenuBarQuotaItem(
+                    provider: provider.rawValue,
+                    accountKey: "__pool__",
+                    sourceConfigId: snapshot.id
+                )
+                if !seen.contains(poolItem.id) {
+                    seen.insert(poolItem.id)
+                    validItems.append(poolItem)
+                }
+                for accountKey in accountQuotas.keys {
+                    let item = MenuBarQuotaItem(
+                        provider: provider.rawValue,
+                        accountKey: accountKey,
+                        sourceConfigId: snapshot.id
+                    )
+                    if !seen.contains(item.id) {
+                        seen.insert(item.id)
+                        validItems.append(item)
+                    }
+                }
+            }
+        }
+
+        // Preserve selected remote items whose source is still configured, even if snapshots
+        // haven't loaded yet (e.g., during app startup before refreshRemoteMonitors completes).
+        let configuredSourceIds = Set(modeManager.remoteMonitorSources.map { $0.id })
+        for item in menuBarSettings.selectedItems where item.isRemote {
+            guard let configId = item.sourceConfigId,
+                  configuredSourceIds.contains(configId),
+                  !seen.contains(item.id) else { continue }
+            seen.insert(item.id)
+            validItems.append(item)
+        }
+
         menuBarSettings.pruneInvalidItems(validItems: validItems)
     }
 
@@ -2176,12 +2213,100 @@ final class QuotaViewModel {
     var menuBarQuotaItems: [MenuBarQuotaDisplayItem] {
         var items = menuBarSettings.makeQuotaDisplayItems(providerQuotas: providerQuotas)
         guard menuBarSettings.showQuotaInMenuBar else { return items }
-        let remoteItems = remoteMonitorDisplayItems
+        let remoteItems = menuBarSettings.hasUserModifiedMenuBar
+            ? buildRemoteSelectedDisplayItems()
+            : remoteMonitorDisplayItems
         let remaining = menuBarSettings.menuBarMaxItems - items.count
         if remaining > 0 {
             items.append(contentsOf: remoteItems.prefix(remaining))
         }
         return items
+    }
+
+    /// Normalizes Claude remote plan labels: Plus → Pro to match Claude's subscription naming.
+    /// Codex Plus/Business and all other providers are returned unchanged.
+    private func normalizeClaudeRemoteLabel(_ label: String, for provider: AIProvider) -> String {
+        guard provider == .claude else { return label }
+        return label.lowercased().contains("plus") ? "Pro" : label
+    }
+
+    private func buildRemoteSelectedDisplayItems() -> [MenuBarQuotaDisplayItem] {
+        let remoteSelected = menuBarSettings.selectedItems.filter { $0.isRemote }
+        guard !remoteSelected.isEmpty else { return [] }
+
+        var result: [MenuBarQuotaDisplayItem] = []
+        var seenIds = Set<String>()
+
+        for item in remoteSelected {
+            guard let configId = item.sourceConfigId,
+                  let snapshot = remoteMonitorSnapshots.first(where: { $0.id == configId }),
+                  let provider = item.aiProvider,
+                  let accountQuotas = snapshot.providerQuotas[provider]
+            else { continue }
+
+            let displayId = item.id
+            guard !seenIds.contains(displayId) else { continue }
+            seenIds.insert(displayId)
+
+            if item.isPool {
+                let percentages = accountQuotas.values.compactMap { quotaData -> Double? in
+                    guard !quotaData.models.isEmpty else { return nil }
+                    let models = quotaData.models.map { (name: $0.name, percentage: $0.percentage) }
+                    let pct = menuBarSettings.totalUsagePercent(models: models)
+                    return pct >= 0 ? pct : nil
+                }
+                let poolForbidden = accountQuotas.values.contains { $0.isForbidden }
+                let sourceName = snapshot.config.displayName
+                let compactLabel: String = {
+                    let prefixes = ["CLIProxyAPI ", "CLIProxyAPI"]
+                    var raw: String?
+                    for prefix in prefixes {
+                        if sourceName.hasPrefix(prefix) {
+                            let stripped = String(sourceName.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
+                            if !stripped.isEmpty { raw = stripped; break }
+                        }
+                    }
+                    if raw == nil {
+                        let lastWord = sourceName.split(separator: " ").last.map(String.init) ?? ""
+                        raw = lastWord.isEmpty ? provider.displayName : lastWord
+                    }
+                    var label = raw!
+                    // For Claude, also check planDisplayName/planType across pool accounts
+                    if provider == .claude {
+                        let planStr = accountQuotas.values.compactMap { $0.planDisplayName ?? $0.planType }.first ?? ""
+                        if planStr.lowercased().contains("plus") { label = "Pro" }
+                    }
+                    return normalizeClaudeRemoteLabel(label, for: provider)
+                }()
+                result.append(MenuBarQuotaDisplayItem(
+                    id: displayId,
+                    providerSymbol: provider.menuBarSymbol,
+                    accountShort: provider.displayName,
+                    percentage: percentages.min() ?? -1,
+                    provider: provider,
+                    isForbidden: poolForbidden,
+                    groupLabel: compactLabel
+                ))
+            } else {
+                guard let quotaData = accountQuotas[item.accountKey] else { continue }
+                let pct: Double
+                if quotaData.models.isEmpty {
+                    pct = -1
+                } else {
+                    let models = quotaData.models.map { (name: $0.name, percentage: $0.percentage) }
+                    pct = menuBarSettings.totalUsagePercent(models: models)
+                }
+                result.append(MenuBarQuotaDisplayItem(
+                    id: displayId,
+                    providerSymbol: provider.menuBarSymbol,
+                    accountShort: item.accountKey,
+                    percentage: pct,
+                    provider: provider,
+                    isForbidden: quotaData.isForbidden
+                ))
+            }
+        }
+        return result
     }
 
     private var remoteMonitorDisplayItems: [MenuBarQuotaDisplayItem] {
@@ -2227,13 +2352,15 @@ final class QuotaViewModel {
         return result
     }
 
-    private func remotePlanKeyLabel(from quotaData: ProviderQuotaData, sourceName: String) -> (key: String, label: String) {
+    private func remotePlanKeyLabel(from quotaData: ProviderQuotaData, sourceName: String, provider: AIProvider = .codex) -> (key: String, label: String) {
         if let rawPlan = quotaData.planDisplayName ?? quotaData.planType,
            !rawPlan.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return menuBarSettings.resolveRemotePlanLabel(rawPlan: rawPlan)
+            let (key, label) = menuBarSettings.resolveRemotePlanLabel(rawPlan: rawPlan)
+            return (key: key, label: normalizeClaudeRemoteLabel(label, for: provider))
         }
         // Fallback: extract last word from source name, e.g. "CLIProxyAPI Plus" → "Plus"
-        let label = sourceName.split(separator: " ").last.map(String.init) ?? sourceName
+        let raw = sourceName.split(separator: " ").last.map(String.init) ?? sourceName
+        let label = normalizeClaudeRemoteLabel(raw, for: provider)
         return (key: label.lowercased(), label: label)
     }
 }
