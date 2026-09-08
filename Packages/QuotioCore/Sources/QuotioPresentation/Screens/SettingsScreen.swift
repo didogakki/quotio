@@ -91,7 +91,12 @@ struct SettingsScreen: View {
             
             // Menu Bar
             MenuBarSettingsSection()
-            
+
+            // Remote Quota Sources - Only in Monitor Mode
+            if modeManager.isMonitorMode {
+                RemoteQuotaSourcesSection()
+            }
+
             // Paths - Only in Local Proxy Mode
             if modeManager.isLocalProxyMode {
                 LocalPathsSection()
@@ -173,10 +178,15 @@ struct OperatingModeSection: View {
     }
     
     private func switchToMode(_ mode: OperatingMode) {
+        // Remote quota sources' start/stop lifecycle is owned by
+        // `RemoteQuotaSourceScreenModel` itself, via a handler it registers on
+        // `modeManager` at construction — so it fires from `switchMode` below even if
+        // this Settings view was never opened (login/headless launches, mode switches
+        // triggered elsewhere).
         modeManager.switchMode(to: mode) {
             viewModel.stopProxy()
         }
-        
+
         // Re-initialize based on new mode
         Task {
             if modeManager.isLocalProxyMode {
@@ -2776,6 +2786,296 @@ struct UsageDisplaySettingsSection: View {
         } footer: {
             Text("settings.usageDisplay.description".localized())
                 .font(.caption)
+        }
+    }
+}
+
+// MARK: - Remote Quota Sources Section
+
+struct RemoteQuotaSourcesSection: View {
+    @Environment(RemoteQuotaSourceScreenModel.self) private var model
+    @State private var editingSource: RemoteQuotaSourceConfig?
+    @State private var showingAddSheet = false
+    @State private var pendingDeletion: RemoteQuotaSourceConfig?
+
+    var body: some View {
+        Section {
+            if model.sources.isEmpty {
+                Text("remote.quotaSource.empty".localized())
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(model.sources) { source in
+                    RemoteQuotaSourceRow(source: source)
+                        .contentShape(Rectangle())
+                        .onTapGesture { editingSource = source }
+                        .swipeActions(edge: .trailing) {
+                            Button(role: .destructive) {
+                                pendingDeletion = source
+                            } label: {
+                                Label("remote.quotaSource.delete".localized(), systemImage: "trash")
+                            }
+                        }
+                }
+            }
+
+            Button {
+                showingAddSheet = true
+            } label: {
+                Label("remote.quotaSource.add".localized(), systemImage: "plus.circle")
+            }
+        } header: {
+            Label("remote.quotaSource.section.title".localized(), systemImage: "network")
+        } footer: {
+            Text("remote.quotaSource.section.footer".localized())
+                .font(.caption)
+        }
+        .sheet(isPresented: $showingAddSheet) {
+            RemoteQuotaSourceEditSheet(source: nil)
+        }
+        .sheet(item: $editingSource) { source in
+            RemoteQuotaSourceEditSheet(source: source)
+        }
+        .alert(
+            "remote.quotaSource.deleteConfirm.title".localized(),
+            isPresented: Binding(
+                get: { pendingDeletion != nil },
+                set: { if !$0 { pendingDeletion = nil } }
+            )
+        ) {
+            Button("action.cancel".localized(), role: .cancel) { pendingDeletion = nil }
+            Button("remote.quotaSource.delete".localized(), role: .destructive) {
+                if let source = pendingDeletion {
+                    Task { await model.removeSource(source.id) }
+                }
+                pendingDeletion = nil
+            }
+        } message: {
+            Text("remote.quotaSource.deleteConfirm.message".localized())
+        }
+    }
+}
+
+private struct RemoteQuotaSourceRow: View {
+    let source: RemoteQuotaSourceConfig
+    @Environment(RemoteQuotaSourceScreenModel.self) private var model
+    @Environment(MenuBarSettingsManager.self) private var menuBarSettings
+
+    private var status: RemoteQuotaSourceConnectionStatus {
+        model.statuses[source.id] ?? .unknown
+    }
+
+    /// Providers this source currently has pooled quota data for — each gets its own
+    /// menu bar pin, since a source can expose Claude, Codex, and Grok pools at once.
+    private var pooledProviders: [QuotaProvider] {
+        (model.poolQuotas[source.id]?.keys).map { Array($0).sorted { $0.rawValue < $1.rawValue } } ?? []
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Circle()
+                .fill(status.color)
+                .frame(width: 8, height: 8)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(source.name)
+                    .fontWeight(.medium)
+                Text(source.baseURL)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .opacity(source.isEnabled ? 1 : 0.5)
+
+            Spacer()
+
+            Text(status.displayText)
+                .font(.caption)
+                .foregroundStyle(status.color)
+
+            ForEach(pooledProviders) { provider in
+                let item = MenuBarQuotaItem(
+                    provider: provider.rawValue,
+                    accountKey: RemoteQuotaPoolIdentity.accountKey,
+                    sourceConfigId: source.id
+                )
+                Button {
+                    menuBarSettings.toggleItem(item)
+                } label: {
+                    Image(systemName: menuBarSettings.isSelected(item) ? "pin.fill" : "pin")
+                        .foregroundStyle(menuBarSettings.isSelected(item) ? Color.accentColor : Color.secondary)
+                }
+                .buttonStyle(.plain)
+                .help(provider.displayName)
+            }
+
+            Button {
+                Task { await model.refresh(sourceId: source.id) }
+            } label: {
+                Image(systemName: "arrow.clockwise")
+            }
+            .buttonStyle(.plain)
+            .disabled(model.isRefreshing)
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+private struct RemoteQuotaSourceEditSheet: View {
+    let source: RemoteQuotaSourceConfig?
+    @Environment(RemoteQuotaSourceScreenModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var name = ""
+    @State private var baseURL = ""
+    @State private var managementKey = ""
+    @State private var isEnabled = true
+    @State private var isSaving = false
+    @State private var isTestingConnection = false
+    @State private var saveErrorMessage: String?
+
+    private var isEditing: Bool { source != nil }
+    private var trimmedURL: String { baseURL.trimmingCharacters(in: .whitespacesAndNewlines) }
+    private var isURLValid: Bool { RemoteQuotaSourceURLValidation.isValid(trimmedURL) }
+    private var canSave: Bool {
+        !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && isURLValid
+            && (isEditing || !managementKey.isEmpty)
+    }
+    private var connectionStatus: RemoteQuotaSourceConnectionStatus? {
+        source.flatMap { model.statuses[$0.id] }
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("remote.quotaSource.name.placeholder".localized(), text: $name)
+                } header: {
+                    Text("remote.quotaSource.name.label".localized())
+                }
+
+                Section {
+                    TextField("remote.quotaSource.baseURL.placeholder".localized(), text: $baseURL)
+                    if !trimmedURL.isEmpty, !isURLValid {
+                        Text("remote.quotaSource.baseURL.invalid".localized())
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
+                } header: {
+                    Text("remote.quotaSource.baseURL.label".localized())
+                }
+
+                Section {
+                    SecureField("remote.quotaSource.managementKey.placeholder".localized(), text: $managementKey)
+                    Text("remote.quotaSource.managementKey.rotateHint".localized())
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } header: {
+                    Text("remote.quotaSource.managementKey.label".localized())
+                }
+
+                Section {
+                    Toggle("remote.quotaSource.enabled.label".localized(), isOn: $isEnabled)
+                }
+
+                if isEditing {
+                    Section {
+                        HStack {
+                            Button {
+                                testConnection()
+                            } label: {
+                                if isTestingConnection {
+                                    ProgressView().scaleEffect(0.7)
+                                } else {
+                                    Text("remote.quotaSource.testConnection".localized())
+                                }
+                            }
+                            .disabled(isTestingConnection)
+
+                            Spacer()
+
+                            if let connectionStatus {
+                                Text(connectionStatus.displayText)
+                                    .font(.caption)
+                                    .foregroundStyle(connectionStatus.color)
+                            }
+                        }
+                    }
+                }
+
+                if let saveErrorMessage {
+                    Section {
+                        Text(saveErrorMessage)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
+                }
+            }
+            .formStyle(.grouped)
+            .frame(minWidth: 420, minHeight: 360)
+            .navigationTitle(
+                isEditing
+                    ? "remote.quotaSource.edit".localized()
+                    : "remote.quotaSource.add".localized()
+            )
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("action.cancel".localized()) { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("action.save".localized()) { save() }
+                        .disabled(!canSave || isSaving)
+                }
+            }
+        }
+        .onAppear {
+            guard let source else { return }
+            name = source.name
+            baseURL = source.baseURL
+            isEnabled = source.isEnabled
+        }
+    }
+
+    private func testConnection() {
+        guard let source else { return }
+        isTestingConnection = true
+        Task {
+            await model.testConnection(source.id)
+            isTestingConnection = false
+        }
+    }
+
+    private func save() {
+        isSaving = true
+        saveErrorMessage = nil
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let url = trimmedURL
+        Task {
+            let succeeded: Bool
+            if let source {
+                let updated = RemoteQuotaSourceConfig(
+                    id: source.id,
+                    name: trimmedName,
+                    baseURL: url,
+                    isEnabled: isEnabled
+                )
+                succeeded = await model.updateSource(updated, managementKey: managementKey.isEmpty ? nil : managementKey)
+            } else {
+                let created = RemoteQuotaSourceConfig(
+                    name: trimmedName,
+                    baseURL: url,
+                    isEnabled: isEnabled
+                )
+                succeeded = await model.addSource(created, managementKey: managementKey)
+            }
+            isSaving = false
+            if succeeded {
+                dismiss()
+            } else {
+                saveErrorMessage = "remote.quotaSource.error.credentialSaveFailed".localized()
+            }
         }
     }
 }

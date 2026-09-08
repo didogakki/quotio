@@ -19,6 +19,7 @@ import SwiftUI
 public final class OperatingModeManager {
     @ObservationIgnored private let repository: any OperatingModePreferencesRepository
     @ObservationIgnored private var didChangeHandler: (@MainActor (OperatingModePreferences) -> Void)?
+    @ObservationIgnored private var persistentDidChangeHandlers: [@MainActor (OperatingModePreferences) -> Void] = []
     
     // MARK: - Observable State
     
@@ -86,6 +87,17 @@ public final class OperatingModeManager {
         didChangeHandler = handler
     }
 
+    /// Registers a handler that `setDidChangeHandler` never replaces or clears (that
+    /// call — used to silence status bar updates during shutdown — only touches the
+    /// single `didChangeHandler` slot). Meant for long-lived subscribers such as a
+    /// mode-driven lifecycle hook that must keep firing independent of the status bar's
+    /// handler lifecycle.
+    public func addDidChangeHandler(
+        _ handler: @escaping @MainActor (OperatingModePreferences) -> Void
+    ) {
+        persistentDidChangeHandlers.append(handler)
+    }
+
     private func persist() {
         let preferences = OperatingModePreferences(
             mode: currentMode,
@@ -93,5 +105,6 @@ public final class OperatingModeManager {
         )
         repository.save(preferences)
         didChangeHandler?(preferences)
+        persistentDidChangeHandlers.forEach { $0(preferences) }
     }
 }

@@ -144,7 +144,8 @@ public extension QuotaProvider {
         case .glm: "glm-menubar"
         case .warp: "warp-menubar"
         case .clinePass: "clinepass-menubar"
-        case .factoryDroid, .devin, .grok, .openRouter: nil
+        case .grok: "grok-menubar"
+        case .factoryDroid, .devin, .openRouter: nil
         }
     }
 }

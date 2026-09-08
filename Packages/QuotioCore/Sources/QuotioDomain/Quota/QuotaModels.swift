@@ -355,4 +355,93 @@ public enum QuotaPolicy {
             ?? quota.models.first?.percentage
             ?? -1
     }
+
+    /// Aggregates several accounts' quotas from one remote quota-source pool into a
+    /// single `ProviderQuota`: per metric name, keeps the worst-case (lowest available)
+    /// reading, and picks the most common plan label so existing plan-badge UI just works.
+    public static func aggregatePool(_ quotas: [ProviderQuota]) -> ProviderQuota? {
+        guard !quotas.isEmpty else { return nil }
+
+        var order: [String] = []
+        var worstByName: [String: QuotaMetric] = [:]
+        for quota in quotas {
+            for metric in quota.models {
+                guard let existing = worstByName[metric.name] else {
+                    worstByName[metric.name] = metric
+                    order.append(metric.name)
+                    continue
+                }
+                let existingRank = existing.percentage >= 0 ? existing.percentage : .greatestFiniteMagnitude
+                let candidateRank = metric.percentage >= 0 ? metric.percentage : .greatestFiniteMagnitude
+                if candidateRank < existingRank {
+                    worstByName[metric.name] = metric
+                }
+            }
+        }
+
+        let planCounts = quotas.compactMap(\.planType).reduce(into: [String: Int]()) { counts, plan in
+            counts[plan, default: 0] += 1
+        }
+        let planType = planCounts.max { $0.value < $1.value }?.key
+
+        return ProviderQuota(
+            models: order.compactMap { worstByName[$0] },
+            lastUpdated: quotas.map(\.lastUpdated).max() ?? Date(),
+            isForbidden: quotas.allSatisfy(\.isForbidden),
+            planType: planType
+        )
+    }
+
+    /// Buckets a raw `planType` string into a small, stable set of keys so accounts on
+    /// equivalent plans (e.g. "Pro", "Pro 5x", "Pro 20x") group together instead of
+    /// each raw label producing its own pool. Unrecognized labels fall back to a
+    /// slugified version of themselves so they still group consistently.
+    public static func normalizedPlanKey(_ planType: String?) -> String {
+        guard let trimmed = planType?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else { return "unknown" }
+        let lower = trimmed.lowercased()
+        // Matched on a punctuation/whitespace-stripped form so "Pro 5x", "pro-lite",
+        // "pro_lite", and "prolite" all normalize the same way, without the looser
+        // substring check on `lower` swallowing them into plain "pro".
+        let compact = lower.filter { $0.isLetter || $0.isNumber }
+        if lower.contains("enterprise") { return "enterprise" }
+        if lower.contains("business") { return "business" }
+        if lower.contains("team") { return "team" }
+        if compact.contains("prolite") || compact.contains("pro5x") { return "pro_lite" }
+        if lower.contains("pro") { return "pro" }
+        if lower.contains("plus") { return "plus" }
+        if lower.contains("free") || lower.contains("standard") { return "free" }
+        return slugify(lower)
+    }
+
+    /// Reduces an unrecognized plan label to a key made only of ASCII letters, digits,
+    /// and underscores, so it can never break `RemoteQuotaPoolIdentity`'s `::`-delimited
+    /// composite storage keys (a raw label containing `::` or `/` would corrupt parsing).
+    private static func slugify(_ lower: String) -> String {
+        var result = String(lower.map { $0.isLetter || $0.isNumber ? $0 : "_" })
+        while result.contains("__") { result = result.replacingOccurrences(of: "__", with: "_") }
+        result = result.trimmingCharacters(in: CharacterSet(charactersIn: "_"))
+        return result.isEmpty ? "unknown" : result
+    }
+
+    /// User-facing label for a normalized plan key. Claude's "Plus" plan has always
+    /// displayed as "Pro" in this app's UI, so that one mapping is provider-specific.
+    public static func planGroupDisplayLabel(
+        provider: QuotaProvider,
+        planKey: String,
+        rawPlanType: String?
+    ) -> String {
+        if provider == .claude, planKey == "plus" { return "Pro" }
+        switch planKey {
+        case "plus": return "Plus"
+        case "business": return "Business"
+        case "pro": return "Pro 20x"
+        case "pro_lite": return "Pro 5x"
+        case "team": return "Team"
+        case "enterprise": return "Enterprise"
+        case "free": return "Free"
+        case "unknown": return "Unknown"
+        default: return rawPlanType?.capitalized ?? planKey.capitalized
+        }
+    }
 }

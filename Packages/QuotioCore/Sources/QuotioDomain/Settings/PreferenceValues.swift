@@ -33,13 +33,35 @@ public struct OperatingModePreferences: Equatable, Sendable {
 public struct MenuBarQuotaItem: Codable, Identifiable, Hashable, Sendable {
     public let provider: String
     public let accountKey: String
+    /// nil = local account; non-nil = the `RemoteQuotaSourceConfig.id` this item's
+    /// pooled quota was fetched from. Kept optional so pre-existing persisted items
+    /// (and JSON written before this field existed) decode unchanged.
+    public let sourceConfigId: String?
 
-    public init(provider: String, accountKey: String) {
-        self.provider = provider
-        self.accountKey = accountKey
+    private enum CodingKeys: String, CodingKey {
+        case provider, accountKey, sourceConfigId
     }
 
-    public var id: String { "\(provider)_\(accountKey)" }
+    public init(provider: String, accountKey: String, sourceConfigId: String? = nil) {
+        self.provider = provider
+        self.accountKey = accountKey
+        self.sourceConfigId = sourceConfigId
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        provider = try container.decode(String.self, forKey: .provider)
+        accountKey = try container.decode(String.self, forKey: .accountKey)
+        sourceConfigId = try container.decodeIfPresent(String.self, forKey: .sourceConfigId)
+    }
+
+    public var id: String {
+        guard let sourceConfigId else { return "\(provider)_\(accountKey)" }
+        return "remote:\(sourceConfigId):\(provider)_\(accountKey)"
+    }
+
+    public var isRemote: Bool { sourceConfigId != nil }
+    public var isPool: Bool { accountKey == RemoteQuotaPoolIdentity.accountKey }
 }
 
 public enum MenuBarColorMode: String, Codable, CaseIterable, Identifiable, Sendable {

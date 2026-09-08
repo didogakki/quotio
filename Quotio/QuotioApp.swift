@@ -30,6 +30,7 @@ struct QuotioApp: App {
                     .environment(proxyManagement)
                     .environment(runtime.quotaController)
                     .environment(quotaScreenModel)
+                    .environment(runtime.remoteQuotaSourceScreenModel)
                     .environment(runtime.accountsScreenModel)
                     .environment(runtime.dashboardScreenModel)
                     .environment(runtime.providersScreenModel)

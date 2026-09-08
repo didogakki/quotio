@@ -7,6 +7,7 @@ protocol AppRuntimeServices: AnyObject, Sendable {
     var proxyManagement: ProxyManagementScreenModel { get }
     var quotaController: QuotaFeatureController { get }
     var quotaScreenModel: QuotaScreenModel { get }
+    var remoteQuotaSourceScreenModel: RemoteQuotaSourceScreenModel { get }
     var accountsScreenModel: AccountsScreenModel { get }
     var dashboardScreenModel: DashboardScreenModel { get }
     var providersScreenModel: ProvidersScreenModel { get }
@@ -73,6 +74,7 @@ final class AppRuntime {
     var proxyManagement: ProxyManagementScreenModel { services.proxyManagement }
     var quotaController: QuotaFeatureController { services.quotaController }
     var quotaScreenModel: QuotaScreenModel { services.quotaScreenModel }
+    var remoteQuotaSourceScreenModel: RemoteQuotaSourceScreenModel { services.remoteQuotaSourceScreenModel }
     var accountsScreenModel: AccountsScreenModel { services.accountsScreenModel }
     var dashboardScreenModel: DashboardScreenModel { services.dashboardScreenModel }
     var providersScreenModel: ProvidersScreenModel { services.providersScreenModel }

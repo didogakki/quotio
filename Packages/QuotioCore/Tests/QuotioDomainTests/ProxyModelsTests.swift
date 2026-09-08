@@ -46,4 +46,50 @@ final class ProxyModelsTests: XCTestCase {
         }
         XCTAssertEqual(stateMachine.state, .active)
     }
+
+    func testManagedAuthFileIsReadyForCurrentActiveStatus() {
+        let file = ManagedAuthFile(
+            id: "1", name: "codex-a", provider: "codex",
+            status: "active", disabled: false, unavailable: false
+        )
+
+        XCTAssertTrue(file.isReady)
+    }
+
+    func testManagedAuthFileIsReadyForLegacyReadyStatus() {
+        let file = ManagedAuthFile(
+            id: "1", name: "codex-a", provider: "codex",
+            status: "ready", disabled: false, unavailable: false
+        )
+
+        XCTAssertTrue(file.isReady)
+    }
+
+    func testManagedAuthFileRejectsDisabledOrUnavailableOrErrorStatus() {
+        let disabled = ManagedAuthFile(
+            id: "1", name: "codex-a", provider: "codex",
+            status: "active", disabled: true, unavailable: false
+        )
+        let unavailable = ManagedAuthFile(
+            id: "2", name: "codex-b", provider: "codex",
+            status: "active", disabled: false, unavailable: true
+        )
+        let errored = ManagedAuthFile(
+            id: "3", name: "codex-c", provider: "codex",
+            status: "error", disabled: false, unavailable: false
+        )
+
+        XCTAssertFalse(disabled.isReady)
+        XCTAssertFalse(unavailable.isReady)
+        XCTAssertFalse(errored.isReady)
+    }
+
+    func testManagedAuthFileMapsXaiProviderAliasToGrok() {
+        let file = ManagedAuthFile(
+            id: "1", name: "xai-a", provider: "xai",
+            status: "active", disabled: false, unavailable: false
+        )
+
+        XCTAssertEqual(file.providerID, .grok)
+    }
 }

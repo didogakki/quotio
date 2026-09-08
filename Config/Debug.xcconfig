@@ -10,6 +10,19 @@ ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon
 POSTHOG_PROJECT_TOKEN =
 POSTHOG_HOST = https:/$()/us.i.posthog.com
 
+// QuotioTests' TEST_HOST/BUNDLE_LOADER need to know the Debug app's on-disk
+// name, but Xcode has no macro that lets one target read another target's
+// resolved PRODUCT_NAME. If you override PRODUCT_NAME below (via
+// Local.xcconfig), also set TEST_HOST_APP_NAME to the same value there so
+// `xcodebuild test` can find the hosted app without a command-line override.
+TEST_HOST_APP_NAME = Quotio
+
 // Include local overrides AFTER defaults (so Local.xcconfig can override)
 // Local.xcconfig is gitignored and can contain developer-specific settings
 #include? "Local.xcconfig"
+
+// Keep the Swift module name stable as "Quotio" regardless of any
+// PRODUCT_NAME override above (Xcode derives PRODUCT_MODULE_NAME from
+// PRODUCT_NAME by default, which breaks `@testable import Quotio` when
+// PRODUCT_NAME contains a space, e.g. "Quotio Dev" -> "Quotio_Dev").
+PRODUCT_MODULE_NAME = Quotio

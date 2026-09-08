@@ -335,6 +335,11 @@ public struct MenuBarQuotaDisplayItem: Identifiable, Equatable {
     public let provider: QuotaProvider
     public var isForbidden: Bool
     public var quotaPair: MenuBarQuotaPair?
+    /// Set when a single selected menu bar item (e.g. a remote pool with
+    /// `accountKey == "__pool__"`) expands into several plan-group items — shown next
+    /// to the provider icon so, for example, a source's Pro and Team pools are
+    /// distinguishable. `nil` for ordinary single-plan/local items.
+    public var groupLabel: String?
 
     public init(
         id: String,
@@ -343,7 +348,8 @@ public struct MenuBarQuotaDisplayItem: Identifiable, Equatable {
         percentage: Double,
         provider: QuotaProvider,
         isForbidden: Bool = false,
-        quotaPair: MenuBarQuotaPair? = nil
+        quotaPair: MenuBarQuotaPair? = nil,
+        groupLabel: String? = nil
     ) {
         self.id = id
         self.providerSymbol = providerSymbol
@@ -352,6 +358,7 @@ public struct MenuBarQuotaDisplayItem: Identifiable, Equatable {
         self.provider = provider
         self.isForbidden = isForbidden
         self.quotaPair = quotaPair
+        self.groupLabel = groupLabel
     }
     
     public var statusColor: Color {

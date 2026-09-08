@@ -20,6 +20,11 @@ PRODUCT_NAME = Quotio Dev
 // Display name shown under app icon
 INFOPLIST_KEY_CFBundleDisplayName = Quotio Dev
 
+// Required alongside the PRODUCT_NAME override above: lets QuotioTests
+// locate the hosted Debug app (TEST_HOST/BUNDLE_LOADER) without needing a
+// command-line TEST_HOST override. Keep this in sync with PRODUCT_NAME.
+TEST_HOST_APP_NAME = Quotio Dev
+
 // Development App Icon (uses AppIconDev instead of AppIcon)
 ASSETCATALOG_COMPILER_APPICON_NAME = AppIconDev
 

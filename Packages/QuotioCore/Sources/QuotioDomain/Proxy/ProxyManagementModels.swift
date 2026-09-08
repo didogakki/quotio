@@ -72,7 +72,9 @@ public struct ManagedAuthFile: Codable, Identifiable, Hashable, Sendable {
     }
 
     public var providerID: QuotaProvider? {
-        provider == "copilot" ? .copilot : QuotaProvider(rawValue: provider)
+        if provider == "copilot" { return .copilot }
+        if provider == "xai" { return .grok }
+        return QuotaProvider(rawValue: provider)
     }
 
     public var quotaLookupKey: String {
@@ -99,7 +101,7 @@ public struct ManagedAuthFile: Codable, Identifiable, Hashable, Sendable {
     }
 
     public var isReady: Bool {
-        status == "ready" && !disabled && !unavailable
+        (status == "ready" || status == "active") && !disabled && !unavailable
     }
 
     public func hash(into hasher: inout Hasher) {

@@ -107,6 +107,7 @@ private final class FakeAppRuntimeServices: AppRuntimeServices {
     var proxyManagement: ProxyManagementScreenModel { dependencies.proxyManagement }
     var quotaController: QuotaFeatureController { dependencies.quotaController }
     var quotaScreenModel: QuotaScreenModel { dependencies.quotaScreenModel }
+    var remoteQuotaSourceScreenModel: RemoteQuotaSourceScreenModel { dependencies.remoteQuotaSourceScreenModel }
     var accountsScreenModel: AccountsScreenModel { dependencies.accountsScreenModel }
     var dashboardScreenModel: DashboardScreenModel { dependencies.dashboardScreenModel }
     var providersScreenModel: ProvidersScreenModel { dependencies.providersScreenModel }

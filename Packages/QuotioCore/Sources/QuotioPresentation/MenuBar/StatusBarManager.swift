@@ -351,7 +351,14 @@ struct StatusBarQuotaItemView: View {
                     .foregroundStyle(colorMode == .colored ? item.provider.color : .primary)
                     .fixedSize()
             }
-            
+
+            if let groupLabel = item.groupLabel {
+                Text(groupLabel)
+                    .font(.system(size: 9, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.secondary)
+                    .fixedSize()
+            }
+
             if item.isForbidden {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.system(size: 10))

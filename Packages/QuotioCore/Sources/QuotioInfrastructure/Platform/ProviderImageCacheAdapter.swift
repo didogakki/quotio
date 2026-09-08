@@ -20,7 +20,13 @@ public final class ProviderImageCacheAdapter {
     }
 
     public func image(named name: String, size: CGFloat? = nil) -> NSImage? {
-        let key = size.map { "\(name)_\(Int($0))" } ?? name
+        // Asset catalog images can ship separate Any/Dark appearance variants (e.g.
+        // Grok's logomark). Redrawing below bakes in whichever variant was active at
+        // draw time, so the cache key — and the draw itself — must be pinned to the
+        // *current* effective appearance or a later appearance switch would keep
+        // serving the stale bitmap.
+        let appearanceSuffix = isDarkAppearance ? "dark" : "light"
+        let key = size.map { "\(name)_\(Int($0))_\(appearanceSuffix)" } ?? "\(name)_\(appearanceSuffix)"
         if let cached = cache.object(forKey: key as NSString) {
             return cached
         }
@@ -29,15 +35,18 @@ public final class ProviderImageCacheAdapter {
         let image: NSImage
         if let size, size < min(original.size.width, original.size.height) {
             let targetSize = NSSize(width: size, height: size)
-            image = NSImage(size: targetSize)
-            image.lockFocus()
-            original.draw(
-                in: NSRect(origin: .zero, size: targetSize),
-                from: NSRect(origin: .zero, size: original.size),
-                operation: .copy,
-                fraction: 1
-            )
-            image.unlockFocus()
+            let resized = NSImage(size: targetSize)
+            currentAppearance.performAsCurrentDrawingAppearance {
+                resized.lockFocus()
+                original.draw(
+                    in: NSRect(origin: .zero, size: targetSize),
+                    from: NSRect(origin: .zero, size: original.size),
+                    operation: .copy,
+                    fraction: 1
+                )
+                resized.unlockFocus()
+            }
+            image = resized
         } else {
             image = original
         }
@@ -45,6 +54,14 @@ public final class ProviderImageCacheAdapter {
         let cost = Int(image.size.width) * Int(image.size.height) * 4
         cache.setObject(image, forKey: key as NSString, cost: cost)
         return image
+    }
+
+    private var currentAppearance: NSAppearance {
+        NSApp?.effectiveAppearance ?? NSAppearance(named: .aqua)!
+    }
+
+    private var isDarkAppearance: Bool {
+        currentAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
     }
 
     public func clear() {

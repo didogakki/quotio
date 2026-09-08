@@ -285,6 +285,25 @@ enum CompositionRoot {
             repository: UserDefaultsWarmupPreferencesRepository()
         )
         let ideScanSettings = IDEScanSettingsManager()
+        let remoteQuotaSourceScreenModel = RemoteQuotaSourceScreenModel(
+            coordinator: RemoteQuotaSourceCoordinator(
+                repository: UserDefaultsRemoteQuotaSourceRepository(),
+                credentials: KeychainRemoteQuotaSourceCredentialVault(
+                    dataStore: KeychainCredentialDataStore(
+                        service: AppIdentity.keychainService(suffix: "remote-quota-source"),
+                        canMigrateLegacy: false,
+                        protectedStore: yubiKeyVault
+                    ),
+                    legacyReader: RawKeychainStringReader(),
+                    legacyService: AppIdentity.keychainService(suffix: "remote-management")
+                ),
+                fetcher: RemoteManagementQuotaFetcher(),
+                snapshotStore: UserDefaultsRemoteQuotaPoolSnapshotStore(),
+                clock: SystemDateProvider()
+            ),
+            refreshSettings: refreshSettings,
+            modeManager: modeManager
+        )
         let quotaController = QuotaFeatureController(
             quota: quotaScreenModel,
             accounts: accountsScreenModel,
@@ -499,6 +518,7 @@ enum CompositionRoot {
             proxyManagement: proxyManagement,
             quotaController: quotaController,
             quotaScreenModel: quotaScreenModel,
+            remoteQuotaSourceScreenModel: remoteQuotaSourceScreenModel,
             accountsScreenModel: accountsScreenModel,
             dashboardScreenModel: dashboardScreenModel,
             providersScreenModel: providersScreenModel,
@@ -554,6 +574,7 @@ private final class ProductionAppRuntimeServices: AppRuntimeServices {
     let proxyManagement: ProxyManagementScreenModel
     let quotaController: QuotaFeatureController
     let quotaScreenModel: QuotaScreenModel
+    let remoteQuotaSourceScreenModel: RemoteQuotaSourceScreenModel
     let accountsScreenModel: AccountsScreenModel
     let dashboardScreenModel: DashboardScreenModel
     let providersScreenModel: ProvidersScreenModel
@@ -597,6 +618,7 @@ private final class ProductionAppRuntimeServices: AppRuntimeServices {
         proxyManagement: ProxyManagementScreenModel,
         quotaController: QuotaFeatureController,
         quotaScreenModel: QuotaScreenModel,
+        remoteQuotaSourceScreenModel: RemoteQuotaSourceScreenModel,
         accountsScreenModel: AccountsScreenModel,
         dashboardScreenModel: DashboardScreenModel,
         providersScreenModel: ProvidersScreenModel,
@@ -634,6 +656,7 @@ private final class ProductionAppRuntimeServices: AppRuntimeServices {
         self.proxyManagement = proxyManagement
         self.quotaController = quotaController
         self.quotaScreenModel = quotaScreenModel
+        self.remoteQuotaSourceScreenModel = remoteQuotaSourceScreenModel
         self.accountsScreenModel = accountsScreenModel
         self.dashboardScreenModel = dashboardScreenModel
         self.providersScreenModel = providersScreenModel
@@ -748,6 +771,7 @@ private final class ProductionAppRuntimeServices: AppRuntimeServices {
         tunnel.setDidChangeHandler { _ in handler?() }
         menuBarSettings.setDidChangeHandler { _ in handler?() }
         modeManager.setDidChangeHandler { _ in handler?() }
+        remoteQuotaSourceScreenModel.setDidChangeHandler { handler?() }
         appearanceManager.setDidChangeHandler { _ in handler?() }
         languageManager.setDidChangeHandler { _ in handler?() }
     }
@@ -757,7 +781,7 @@ private final class ProductionAppRuntimeServices: AppRuntimeServices {
             items: quotaItems,
             colorMode: menuBarSettings.colorMode,
             quotaDisplayMode: menuBarSettings.quotaDisplayMode,
-            isRunning: !quotaScreenModel.providerQuotas.isEmpty,
+            isRunning: mergedProviderQuotas.contains { !$0.value.isEmpty },
             showMenuBarIcon: menuBarSettings.showMenuBarIcon,
             showQuota: menuBarSettings.showQuotaInMenuBar,
             appearanceMode: appearanceManager.appearanceMode,
@@ -778,6 +802,9 @@ private final class ProductionAppRuntimeServices: AppRuntimeServices {
         }
         await quotaController.initialize()
         await warmupScreenModel.configure()
+        if modeManager.isMonitorMode {
+            await remoteQuotaSourceScreenModel.initialize()
+        }
     }
 
     func checkForUpdatesInBackground() {
@@ -797,6 +824,7 @@ private final class ProductionAppRuntimeServices: AppRuntimeServices {
     }
 
     func shutdownOAuth() async {
+        remoteQuotaSourceScreenModel.shutdown()
         await warmupScreenModel.shutdown()
         await quotaController.shutdown()
     }
@@ -822,6 +850,8 @@ private final class ProductionAppRuntimeServices: AppRuntimeServices {
         let installedAgents = Set(CLIAgent.allCases.filter { agent in
             knownStatuses[agent] ?? isCLIInstalled(agent)
         })
+        var snapshot = quotaScreenModel.state
+        snapshot.quotas = mergedProviderQuotas
         return StatusBarMenuSnapshotMapper.makeSnapshot(
             mode: modeManager.currentMode,
             proxyPort: proxyManagement.proxy.port,
@@ -831,7 +861,7 @@ private final class ProductionAppRuntimeServices: AppRuntimeServices {
                 QuotaProvider(rawValue: $0.providerID.rawValue)
             }),
             monitorAccounts: accountsScreenModel.accounts,
-            quota: quotaScreenModel.state,
+            quota: snapshot,
             installedAgents: installedAgents,
             activeAntigravityEmail: antigravityAccountScreenModel.snapshot.activeAccount?.email,
             menuBarPreferences: menuBarSettings.preferences,
@@ -840,17 +870,42 @@ private final class ProductionAppRuntimeServices: AppRuntimeServices {
         )
     }
 
+    /// Local `QuotaScreenModel` quotas merged with visible remote quota-source pools.
+    /// Pool entries are stored under a `RemoteQuotaPoolIdentity` composite key, so they
+    /// can never collide with a real local account key or another source's pool.
+    private var mergedProviderQuotas: [QuotaProvider: [String: ProviderQuota]] {
+        guard modeManager.isMonitorMode else { return quotaScreenModel.providerQuotas }
+        var merged = quotaScreenModel.providerQuotas
+        for (provider, poolEntries) in remoteQuotaSourceScreenModel.visibleProviderQuotas {
+            merged[provider, default: [:]].merge(poolEntries) { _, remote in remote }
+        }
+        return merged
+    }
+
     private var quotaItems: [MenuBarQuotaDisplayItem] {
         guard menuBarSettings.showQuotaInMenuBar else { return [] }
 
-        return menuBarSettings.selectedItems.compactMap { selectedItem in
-            guard let provider = selectedItem.aiProvider else { return nil }
+        let providerQuotas = mergedProviderQuotas
+        let items = menuBarSettings.selectedItems.flatMap { selectedItem -> [MenuBarQuotaDisplayItem] in
+            guard let provider = selectedItem.aiProvider else { return [] }
+
+            // A remote pool selection (`accountKey == "__pool__"`) deterministically
+            // expands into one item per plan group present for that source/provider,
+            // so multiple plans (Pro, Team, ...) never collapse into a single reading.
+            if let sourceId = selectedItem.sourceConfigId, selectedItem.isPool {
+                return poolDisplayItems(
+                    selectedItem: selectedItem,
+                    sourceId: sourceId,
+                    provider: provider,
+                    accountQuotas: providerQuotas[provider] ?? [:]
+                )
+            }
 
             var displayPercent: Double = -1
             var isForbidden = false
             var quotaPair: MenuBarQuotaPair?
 
-            if let accountQuotas = quotaScreenModel.providerQuotas[provider],
+            if let accountQuotas = providerQuotas[provider],
                let quotaData = resolveQuotaData(
                    for: selectedItem,
                    provider: provider,
@@ -866,7 +921,7 @@ private final class ProductionAppRuntimeServices: AppRuntimeServices {
                 }
             }
 
-            return MenuBarQuotaDisplayItem(
+            return [MenuBarQuotaDisplayItem(
                 id: selectedItem.id,
                 providerSymbol: provider.menuBarSymbol,
                 accountShort: selectedItem.accountKey,
@@ -874,15 +929,49 @@ private final class ProductionAppRuntimeServices: AppRuntimeServices {
                 provider: provider,
                 isForbidden: isForbidden,
                 quotaPair: quotaPair
-            )
+            )]
         }
+        // Pool expansion can produce more rows than one row per selected item, so the
+        // configured cap is enforced here rather than by `selectedItems.count`.
+        return Array(items.prefix(menuBarSettings.menuBarMaxItems))
     }
 
+    /// Expands one selected pool `MenuBarQuotaItem` into one display item per plan
+    /// group found under `RemoteQuotaPoolIdentity` composite keys for this
+    /// source/provider, via the pure, unit-tested `RemoteQuotaPoolDisplayMapper`.
+    private func poolDisplayItems(
+        selectedItem: MenuBarQuotaItem,
+        sourceId: String,
+        provider: QuotaProvider,
+        accountQuotas: [String: ProviderQuota]
+    ) -> [MenuBarQuotaDisplayItem] {
+        let groups = accountQuotas.compactMap { key, quota -> RemoteQuotaPoolDisplayMapper.PlanGroup? in
+            guard let components = RemoteQuotaPoolIdentity.components(fromStorageKey: key),
+                  components.sourceId == sourceId else { return nil }
+            return RemoteQuotaPoolDisplayMapper.PlanGroup(planKey: components.planKey, quota: quota)
+        }
+        guard !groups.isEmpty else { return [] }
+
+        return RemoteQuotaPoolDisplayMapper.displayItems(
+            itemId: selectedItem.id,
+            provider: provider,
+            groups: groups,
+            stackPairedQuotaMetrics: menuBarSettings.stackPairedQuotaMetrics,
+            totalUsagePercent: menuBarSettings.totalUsagePercent
+        )
+    }
+
+    /// Local-account lookup only — remote pool items (`selectedItem.isPool`) are always
+    /// intercepted earlier in `quotaItems` and resolved via `poolDisplayItems` instead.
     private func resolveQuotaData(
         for selectedItem: MenuBarQuotaItem,
         provider: QuotaProvider,
         accountQuotas: [String: ProviderQuota]
     ) -> ProviderQuota? {
+        if selectedItem.sourceConfigId != nil {
+            return nil
+        }
+
         if let quotaData = accountQuotas[selectedItem.accountKey] {
             return quotaData
         }

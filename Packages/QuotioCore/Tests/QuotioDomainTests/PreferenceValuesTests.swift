@@ -29,4 +29,53 @@ final class PreferenceValuesTests: XCTestCase {
         XCTAssertEqual(QuotaDisplayMode.remaining.displayValue(from: 125), 100)
         XCTAssertEqual(QuotaDisplayMode.remaining.displayValue(from: -1), -1)
     }
+
+    func testMenuBarQuotaItemDecodesPreExistingJSONWithoutSourceConfigIdAsLocal() throws {
+        let legacyJSON = Data(#"{"provider":"claude","accountKey":"user@example.com"}"#.utf8)
+
+        let item = try JSONDecoder().decode(MenuBarQuotaItem.self, from: legacyJSON)
+
+        XCTAssertNil(item.sourceConfigId)
+        XCTAssertFalse(item.isRemote)
+        XCTAssertFalse(item.isPool)
+        XCTAssertEqual(item.id, "claude_user@example.com")
+    }
+
+    func testMenuBarQuotaItemRoundTripsSourceConfigIdAndRecognizesPoolAccountKey() throws {
+        let item = MenuBarQuotaItem(provider: "codex", accountKey: "__pool__", sourceConfigId: "src-1")
+
+        let data = try JSONEncoder().encode(item)
+        let decoded = try JSONDecoder().decode(MenuBarQuotaItem.self, from: data)
+
+        XCTAssertEqual(decoded, item)
+        XCTAssertEqual(decoded.sourceConfigId, "src-1")
+        XCTAssertTrue(decoded.isRemote)
+        XCTAssertTrue(decoded.isPool)
+    }
+
+    func testMenuBarQuotaItemIdentityIncludesSourceToAvoidSamePlanCollisionsAcrossServers() {
+        // The exact Raycast-written defaults: same provider/accountKey, different servers.
+        let plusPool = MenuBarQuotaItem(provider: "codex", accountKey: "__pool__", sourceConfigId: "quotio-monitor-cliproxyapi-plus")
+        let businessPool = MenuBarQuotaItem(provider: "codex", accountKey: "__pool__", sourceConfigId: "quotio-monitor-cliproxyapi-business")
+
+        XCTAssertNotEqual(plusPool.id, businessPool.id)
+        XCTAssertNotEqual(plusPool, businessPool)
+    }
+
+    func testMenuBarQuotaItemDecodesRaycastDefaultConfiguration() throws {
+        let json = Data("""
+        [
+          {"provider":"claude","accountKey":"__pool__","sourceConfigId":"quotio-monitor-cliproxyapi-plus"},
+          {"provider":"codex","accountKey":"__pool__","sourceConfigId":"quotio-monitor-cliproxyapi-plus"},
+          {"provider":"codex","accountKey":"__pool__","sourceConfigId":"quotio-monitor-cliproxyapi-business"}
+        ]
+        """.utf8)
+
+        let items = try JSONDecoder().decode([MenuBarQuotaItem].self, from: json)
+
+        XCTAssertEqual(items.count, 3)
+        XCTAssertTrue(items.allSatisfy(\.isPool))
+        XCTAssertTrue(items.allSatisfy(\.isRemote))
+        XCTAssertEqual(Set(items.map(\.id)).count, 3, "all three must have distinct identities")
+    }
 }

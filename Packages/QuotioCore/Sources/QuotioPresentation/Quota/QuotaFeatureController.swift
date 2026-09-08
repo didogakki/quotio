@@ -274,7 +274,11 @@ public final class QuotaFeatureController {
         }
 
         var selectedIDs = Set<String>()
-        let selected = menuBarSettings.selectedItems.map(canonicalItem).filter {
+        // Remote quota-source pool items (`sourceConfigId != nil`) never appear in
+        // local quota/account data, so they must not be canonicalized against local
+        // aliases or pruned as "unavailable" below — RemoteQuotaSourceScreenModel
+        // owns their lifecycle.
+        let selected = menuBarSettings.selectedItems.map { $0.isRemote ? $0 : canonicalItem($0) }.filter {
             selectedIDs.insert($0.id).inserted
         }
         if selected != menuBarSettings.selectedItems {
@@ -312,7 +316,10 @@ public final class QuotaFeatureController {
                 available.append(item)
             }
         }
-        menuBarSettings.pruneInvalidItems(validItems: available)
+        // Remote pool items are always "valid" from this controller's point of view —
+        // it has no visibility into remote quota sources — so they must survive pruning.
+        let remoteSelected = menuBarSettings.selectedItems.filter(\.isRemote)
+        menuBarSettings.pruneInvalidItems(validItems: available + remoteSelected)
         menuBarSettings.autoSelectNewAccounts(availableItems: available)
     }
 
