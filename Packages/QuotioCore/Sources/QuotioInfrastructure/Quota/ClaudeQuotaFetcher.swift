@@ -173,6 +173,7 @@ public struct LocalClaudeQuotaCredentialLoader: ClaudeQuotaCredentialLoading {
 public actor ClaudeQuotaFetcher: QuotaFetching {
   public nonisolated let provider = QuotaProvider.claude
   public static let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
+  public static let profileURL = URL(string: "https://api.anthropic.com/api/oauth/profile")!
   public static let tokenURL = URL(string: "https://platform.claude.com/v1/oauth/token")!
   public static let clientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
   public static let refreshScope =
@@ -218,7 +219,9 @@ public actor ClaudeQuotaFetcher: QuotaFetching {
     )
   }
 
-  public nonisolated static func mapUsage(_ data: Data, now: Date = Date()) -> ProviderQuota? {
+  public nonisolated static func mapUsage(
+    _ data: Data, planFallback: String? = nil, now: Date = Date()
+  ) -> ProviderQuota? {
     guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
       json["type"] as? String != "error"
     else { return nil }
@@ -253,7 +256,32 @@ public actor ClaudeQuotaFetcher: QuotaFetching {
           limit: limit.map(Int.init)
         ))
     }
-    return metrics.isEmpty ? nil : ProviderQuota(models: metrics, lastUpdated: now)
+    return metrics.isEmpty ? nil : ProviderQuota(models: metrics, lastUpdated: now, planType: planFallback)
+  }
+
+  /// Conservative mapping from `GET /api/oauth/profile` to a plan display label. Reads
+  /// only `account.has_claude_max` / `account.has_claude_pro` — Max checked first, since
+  /// an account mid-transition can carry both flags — and falls back to
+  /// `organization.organization_type` solely to recognize non-individual seats (team /
+  /// enterprise). Deliberately never reads `organization.subscription_status`: a
+  /// canceled *renewal* does not mean the account has lost its current entitlement, so
+  /// "canceled" must never downgrade an account that still reports `has_claude_pro`.
+  /// Also never reads `organization.rate_limit_tier` — there is no reliable mapping from
+  /// that field to a "5x"/"20x" multiplier, and guessing one would be worse than
+  /// surfacing no plan at all. Returns `nil` (never a guessed "Free") when neither flag
+  /// is set and the organization type gives no explicit signal either.
+  public nonisolated static func mapProfilePlan(_ data: Data) -> String? {
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+    let account = json["account"] as? [String: Any]
+    if account?["has_claude_max"] as? Bool == true { return "Max" }
+    if account?["has_claude_pro"] as? Bool == true { return "Pro" }
+    guard let organizationType = (json["organization"] as? [String: Any])?["organization_type"] as? String
+    else { return nil }
+    let normalized = organizationType.lowercased()
+    if normalized.contains("enterprise") { return "Enterprise" }
+    if normalized.contains("team") { return "Team" }
+    if normalized.contains("free") { return "Free" }
+    return nil
   }
 
   private func fetchQuota(

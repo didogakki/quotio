@@ -67,7 +67,13 @@ final class AgentDetectionAdapterTests: XCTestCase {
         try FileManager.default.createDirectory(at: binary.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data().write(to: binary)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
-        let adapter = AgentDetectionAdapter(homeDirectory: home.path, environment: [:], commandRunner: { _, _ in nil })
+        // Keep cache invalidation independent of CLI binaries installed on the host.
+        let adapter = AgentDetectionAdapter(
+            homeDirectory: home.path,
+            environment: [:],
+            commandRunner: { _, _ in nil },
+            binarySearchPaths: ["~/.local/bin"]
+        )
 
         let initial = await adapter.detectAll(forceRefresh: false)
         XCTAssertTrue(initial.first { $0.agent == .claudeCode }?.installed == true)

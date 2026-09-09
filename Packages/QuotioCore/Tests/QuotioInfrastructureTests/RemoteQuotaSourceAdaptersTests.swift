@@ -136,6 +136,58 @@ final class RemoteQuotaSourceAdaptersTests: XCTestCase {
         XCTAssertEqual(query[kSecAttrAccount as String] as? String, "acct")
     }
 
+    // MARK: - Pool snapshot versioning
+
+    /// The pre-versioning payload keyed each provider's entries by **plan group** — an
+    /// aggregate across accounts — with byte-identical JSON to today's per-account
+    /// shape. Decoding it would resurrect those aggregates as if they were real
+    /// accounts, so an unversioned payload must be discarded outright.
+    func testLoadDiscardsUnversionedLegacyAggregateSnapshot() {
+        let defaults = makeDefaults()
+        // Deliberately still decodable as today's payload minus `version` — that is
+        // exactly what makes the version marker, not a decode failure, the thing doing
+        // the work here.
+        let legacyJSON = """
+        {"quotasBySource":{"src-1":{"codex":{"pro":{"models":[],"lastUpdated":0,"isForbidden":false}}}}}
+        """
+        defaults.set(Data(legacyJSON.utf8), forKey: UserDefaultsRemoteQuotaPoolSnapshotStore.storageKey)
+        let store = UserDefaultsRemoteQuotaPoolSnapshotStore(defaults: defaults)
+
+        XCTAssertTrue(
+            store.load().quotasBySource.isEmpty,
+            "a v1 plan-group aggregate must never load back as a per-account entry"
+        )
+    }
+
+    /// Discarding the stale cache must not reach beyond it: the source list and its
+    /// management key live under their own keys and have to survive untouched.
+    func testDiscardingLegacySnapshotLeavesSourcesAndCredentialsAlone() async {
+        let defaults = makeDefaults()
+        let legacyJSON = #"{"quotasBySource":{"src-1":{"codex":{"pro":{"models":[],"lastUpdated":0,"isForbidden":false}}}}}"#
+        defaults.set(Data(legacyJSON.utf8), forKey: UserDefaultsRemoteQuotaPoolSnapshotStore.storageKey)
+        let repository = UserDefaultsRemoteQuotaSourceRepository(defaults: defaults)
+        repository.save([RemoteQuotaSourceConfig(id: "src-1", name: "Pool", baseURL: "https://a.test")])
+        let vault = KeychainRemoteQuotaSourceCredentialVault(dataStore: MemoryCredentialDataStore())
+        _ = await vault.saveManagementKey("admin-key", sourceId: "src-1")
+
+        _ = UserDefaultsRemoteQuotaPoolSnapshotStore(defaults: defaults).load()
+
+        XCTAssertEqual(repository.load().map(\.id), ["src-1"])
+        let storedKey = await vault.loadManagementKey(sourceId: "src-1")
+        XCTAssertEqual(storedKey, "admin-key")
+    }
+
+    func testSaveThenLoadRoundTripsCurrentVersionSnapshot() {
+        let defaults = makeDefaults()
+        let store = UserDefaultsRemoteQuotaPoolSnapshotStore(defaults: defaults)
+        let quota = ProviderQuota(models: [QuotaMetric(name: "usage", percentage: 42, resetTime: "")])
+        store.save(RemoteQuotaPoolSnapshot(quotasBySource: ["src-1": [.codex: ["acct-a": quota]]]))
+
+        let loaded = UserDefaultsRemoteQuotaPoolSnapshotStore(defaults: defaults).load()
+
+        XCTAssertEqual(loaded.quotasBySource["src-1"]?[.codex]?["acct-a"]?.models.first?.percentage, 42)
+    }
+
     // MARK: - Helpers
 
     private func makeDefaults() -> UserDefaults {

@@ -23,9 +23,10 @@ public protocol LegacyKeychainReading: Sendable {
     func read(service: String, account: String) async -> String?
 }
 
-/// Last-known-good pooled quotas per source, grouped by provider and normalized plan
-/// key, so a failed refresh never has to discard the previous successful reading and
-/// distinct plans (Plus/Business/Team/...) never get merged into one another.
+/// Last-known-good quotas per source, grouped by provider and by each real remote
+/// account's own raw key (never a plan-level aggregate), so a failed refresh never has
+/// to discard the previous successful reading and distinct accounts never get merged
+/// into one another.
 public struct RemoteQuotaPoolSnapshot: Equatable, Sendable {
     public var quotasBySource: [String: [QuotaProvider: [String: ProviderQuota]]]
 
@@ -34,34 +35,85 @@ public struct RemoteQuotaPoolSnapshot: Equatable, Sendable {
     }
 }
 
+/// Implementations must treat a snapshot persisted by an older, incompatibly-keyed
+/// build as absent rather than decoding it: the innermost key changed meaning (it used
+/// to identify a plan-level aggregate, it now identifies one real account), so a stale
+/// payload would resurface aggregates masquerading as accounts. This applies only to
+/// this cache — source configs, management keys, and menu bar pins are stored elsewhere
+/// and must never be discarded by it.
 public protocol RemoteQuotaPoolSnapshotStoring: Sendable {
     func load() -> RemoteQuotaPoolSnapshot
     func save(_ snapshot: RemoteQuotaPoolSnapshot)
 }
 
-/// Result of one pool fetch: only the provider/plan groups that were successfully
-/// fetched and aggregated this round. `hasPartialFailure` is true when at least one
-/// ready, supported auth file failed to produce a quota — the coordinator merges
-/// `quotasByProviderAndPlan` on top of the last-known-good reading rather than
-/// replacing it, and still records the round as a failure for the hide-threshold.
+/// Result of one fetch round. A result is only ever returned when the auth-file listing
+/// itself succeeded, so `knownAccountKeys` is **always** this round's authoritative
+/// account list — even when no account produced a quota, and even when the list is
+/// empty. Quota failures are reported separately in `outcome` and never weaken that
+/// authority: the coordinator merges `quotasByProviderAndAccount` on top of the
+/// last-known-good reading (so an account that merely failed keeps its old value) while
+/// still pruning whatever the listing no longer contains.
 public struct RemoteQuotaPoolFetchResult: Equatable, Sendable {
-    public var quotasByProviderAndPlan: [QuotaProvider: [String: ProviderQuota]]
-    public var hasPartialFailure: Bool
+    /// How much of this round's *quota* work succeeded. Independent of the listing,
+    /// which always succeeded when a result exists (a listing failure throws instead).
+    public enum QuotaOutcome: Equatable, Sendable {
+        /// Every listed account produced a quota this round.
+        case complete
+        /// Some — but not all — listed accounts produced a quota.
+        case partial
+        /// The listing reported accounts, but none of them produced a quota.
+        case allFailed
+        /// The listing reported no supported, ready account at all. Still authoritative:
+        /// the source genuinely has nothing left, so stale entries must be pruned rather
+        /// than kept forever.
+        case noAccountsListed
+    }
+
+    public var quotasByProviderAndAccount: [QuotaProvider: [String: ProviderQuota]]
+    public var outcome: QuotaOutcome
+    /// This round's complete account listing: one entry for every provider the fetcher
+    /// supports, whose value is every account key that provider currently has as a
+    /// ready, supported auth file — **including an empty set** when it has none left.
+    /// That is what lets the coordinator drop a provider's last remaining account (and
+    /// the provider itself) instead of leaving a stale reading behind forever. A
+    /// provider absent from this dictionary is one the listing said nothing about, so
+    /// its previous accounts are left untouched.
+    public var knownAccountKeys: [QuotaProvider: Set<String>]
 
     public init(
-        quotasByProviderAndPlan: [QuotaProvider: [String: ProviderQuota]] = [:],
-        hasPartialFailure: Bool = false
+        quotasByProviderAndAccount: [QuotaProvider: [String: ProviderQuota]] = [:],
+        outcome: QuotaOutcome = .complete,
+        knownAccountKeys: [QuotaProvider: Set<String>] = [:]
     ) {
-        self.quotasByProviderAndPlan = quotasByProviderAndPlan
-        self.hasPartialFailure = hasPartialFailure
+        self.quotasByProviderAndAccount = quotasByProviderAndAccount
+        self.outcome = outcome
+        self.knownAccountKeys = knownAccountKeys
+    }
+
+    /// Whether this round counts as a failure for the status badge and the
+    /// consecutive-failure hide threshold.
+    public var isFailure: Bool { outcome != .complete }
+
+    /// The non-sensitive `Localizable.xcstrings` key to surface for this round, or nil
+    /// when everything succeeded.
+    public var failureLocalizationKey: String? {
+        switch outcome {
+        case .complete: nil
+        case .partial: RemoteQuotaSourceFailure.partialFailure.localizationKey
+        case .allFailed: RemoteQuotaFetchError.allRequestsFailed.localizationKey
+        case .noAccountsListed: RemoteQuotaFetchError.noSupportedReadyFiles.localizationKey
+        }
     }
 }
 
 /// Talks directly to a remote CLIProxyAPI's Management API (never through ProxyBridge)
-/// to test connectivity and pull pooled `ProviderQuota` groups, one per provider/plan
-/// combination. Throws only when nothing at all could be fetched (auth-file listing
-/// failed, no supported ready files exist, or every quota request failed) — a total
-/// failure must never be allowed to silently look like an empty-but-successful pool.
+/// to test connectivity and pull each real remote account's own `ProviderQuota`, one per
+/// account — never aggregated into a plan-level pool. Throws **only** when the auth-file
+/// listing itself could not be obtained, since that is the one case where the returned
+/// account list would be a guess. "No supported ready files" and "every quota request
+/// failed" both return a result instead: the listing succeeded, so it is authoritative
+/// and must still be allowed to prune, while `outcome` keeps the round marked as a
+/// failure so it can never look like a successful refresh.
 public protocol RemoteQuotaSourceFetching: Sendable {
     func isResponding(_ source: RemoteQuotaSourceConfig, managementKey: String) async -> Bool
     func fetchPool(
@@ -86,7 +138,12 @@ public enum RemoteQuotaFetchError: Error, Equatable, Sendable {
     case connectivityUnavailable
     /// Listing auth files failed for a reason that doesn't fit the categories above.
     case authFilesUnavailable
+    /// Never thrown — the listing that reported "nothing supported and ready" succeeded,
+    /// so it comes back as `RemoteQuotaPoolFetchResult.QuotaOutcome.noAccountsListed`
+    /// and this case exists only to name that outcome's localization key.
     case noSupportedReadyFiles
+    /// Never thrown, for the same reason: see
+    /// `RemoteQuotaPoolFetchResult.QuotaOutcome.allFailed`.
     case allRequestsFailed
 
     /// A Localizable.xcstrings key — Presentation is responsible for localizing it.

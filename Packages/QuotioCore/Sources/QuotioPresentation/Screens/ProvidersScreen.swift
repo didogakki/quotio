@@ -24,6 +24,9 @@ struct ProvidersScreen: View {
     @Environment(ProvidersScreenModel.self) private var providersModel
     @Environment(WarpTokenScreenModel.self) private var warpTokens
     @Environment(OperatingModeManager.self) private var modeManager
+    @Environment(RemoteQuotaSourceScreenModel.self) private var remoteQuotaSources
+    @Environment(MenuBarSettingsManager.self) private var menuBarSettings
+    @Environment(NavigationScreenModel.self) private var navigation
     @State private var isImporterPresented = false
     @State private var selectedProvider: QuotaProvider?
     @State private var showProxyRequiredAlert = false
@@ -134,6 +137,81 @@ struct ProvidersScreen: View {
             groups[.clinePass, default: []].append(data)
         }
 
+        // Remote quota-source accounts (Monitor mode only): read-only identities owned
+        // entirely by RemoteQuotaSourceScreenModel — never local login/disable/delete,
+        // only the shared menu-bar-pin toggle every other account row already has.
+        // Plan aggregate rows (also read-only, owned by the same screen model) are added
+        // alongside them so the hierarchy reads as: vendor (the outer `groups` key) →
+        // source → that source's plan aggregate row → the real accounts making up that
+        // plan. Appended after every local row and sorted by source name, then by
+        // normalized plan key (so a source's several plan groups don't interleave), then
+        // aggregate-before-account within the same plan, then account name — so one
+        // source's rows always sit together, and one plan's aggregate always sits
+        // directly above just the accounts it summarizes, instead of every aggregate
+        // row for a source being stacked ahead of all of its real accounts.
+        if modeManager.isMonitorMode {
+            let sourceNames = Dictionary(uniqueKeysWithValues: remoteQuotaSources.sources.map { ($0.id, $0.name) })
+            var remoteRowsByProvider: [QuotaProvider: [(planKey: String, sortRank: Int, row: AccountRowData)]] = [:]
+
+            for (provider, byKey) in remoteQuotaSources.visibleProviderQuotas {
+                for (storageKey, quota) in byKey {
+                    guard let components = RemoteQuotaAccountIdentity.components(fromStorageKey: storageKey) else {
+                        continue
+                    }
+                    let row = AccountRowData.from(
+                        provider: provider,
+                        sourceId: components.sourceId,
+                        sourceName: sourceNames[components.sourceId] ?? components.sourceId,
+                        rawAccountKey: components.accountKey,
+                        storageKey: storageKey,
+                        quota: quota
+                    )
+                    let planKey = QuotaPolicy.normalizedPlanKey(quota.planType)
+                    remoteRowsByProvider[provider, default: []].append((planKey: planKey, sortRank: 1, row: row))
+                }
+            }
+
+            for (provider, byKey) in remoteQuotaSources.planAggregates(mode: menuBarSettings.modelAggregationMode) {
+                for (storageKey, aggregate) in byKey {
+                    guard let components = RemoteQuotaAggregateIdentity.components(fromStorageKey: storageKey) else {
+                        continue
+                    }
+                    let sourceName = sourceNames[components.sourceId] ?? components.sourceId
+                    // "Unknown" is an explicit, localized label for accounts that report
+                    // no recognizable plan — never a guessed plan name (e.g. "Pro").
+                    let planLabel = components.planKey == "unknown"
+                        ? "providers.aggregate.planUnknown".localizedStatic()
+                        : QuotaPolicy.planGroupDisplayLabel(
+                            provider: provider,
+                            planKey: components.planKey,
+                            rawPlanType: aggregate.quota.planType
+                        )
+                    let row = AccountRowData.aggregate(
+                        provider: provider,
+                        sourceId: components.sourceId,
+                        sourceName: sourceName,
+                        planLabel: planLabel,
+                        accountCount: aggregate.accountCount,
+                        storageKey: storageKey,
+                        quota: aggregate.quota
+                    )
+                    remoteRowsByProvider[provider, default: []].append((planKey: components.planKey, sortRank: 0, row: row))
+                }
+            }
+
+            for (provider, entries) in remoteRowsByProvider {
+                let sorted = entries.sorted { lhs, rhs in
+                    let lhsSource = lhs.row.source.remoteSourceName ?? ""
+                    let rhsSource = rhs.row.source.remoteSourceName ?? ""
+                    if lhsSource != rhsSource { return lhsSource < rhsSource }
+                    if lhs.planKey != rhs.planKey { return lhs.planKey < rhs.planKey }
+                    if lhs.sortRank != rhs.sortRank { return lhs.sortRank < rhs.sortRank }
+                    return lhs.row.displayName < rhs.row.displayName
+                }
+                groups[provider, default: []].append(contentsOf: sorted.map(\.row))
+            }
+        }
+
         for warpToken in warpTokens.tokens.filter({ $0.isEnabled }) {
             let data = AccountRowData(
                 id: warpToken.id.uuidString,
@@ -158,14 +236,16 @@ struct ProvidersScreen: View {
         groupedAccounts.keys.sorted { $0.displayName < $1.displayName }
     }
     
-    /// Total account count across all providers
+    /// Total account count across all providers. Excludes plan-aggregate rows — each
+    /// aggregate already double-counts the real accounts it summarizes.
     private var totalAccountCount: Int {
-        groupedAccounts.values.reduce(0) { $0 + $1.count }
+        groupedAccounts.values.reduce(0) { $0 + $1.filter { !$0.source.isAggregate }.count }
     }
 
-    /// Account count per provider (for AddProviderPopover badge display)
+    /// Account count per provider (for AddProviderPopover badge display). Excludes
+    /// plan-aggregate rows for the same reason as `totalAccountCount`.
     private var providerAccountCounts: [QuotaProvider: Int] {
-        groupedAccounts.mapValues { $0.count }
+        groupedAccounts.mapValues { accounts in accounts.filter { !$0.source.isAggregate }.count }
     }
     
     // MARK: - Body
@@ -174,8 +254,13 @@ struct ProvidersScreen: View {
         List {
             // Section 1: Your Accounts (grouped by provider)
             accountsSection
-            
-            // Section 2: Custom Providers (Local Proxy Mode only)
+
+            // Section 2: Remote quota sources that currently contribute no rows above
+            if modeManager.isMonitorMode && !unavailableRemoteSources.isEmpty {
+                unavailableRemoteSourcesSection
+            }
+
+            // Section 3: Custom Providers (Local Proxy Mode only)
             if modeManager.isLocalProxyMode {
                 customProvidersSection
             }
@@ -406,6 +491,36 @@ struct ProvidersScreen: View {
         }
     }
     
+    // MARK: - Unavailable Remote Sources Section
+
+    /// Configured remote quota sources that contribute no account row above right now —
+    /// disabled, hidden after repeated automatic failures, or simply reporting no
+    /// accounts. Without this they would vanish from the accounts screen entirely, so a
+    /// source that stopped working would be indistinguishable from one that was never
+    /// configured.
+    private var unavailableRemoteSources: [RemoteQuotaSourceConfig] {
+        remoteQuotaSources.sources
+            .filter { source in
+                guard remoteQuotaSources.isVisible(sourceId: source.id) else { return true }
+                return remoteQuotaSources.poolQuotas[source.id]?.values.contains { !$0.isEmpty } != true
+            }
+            .sorted { $0.name < $1.name }
+    }
+
+    @ViewBuilder
+    private var unavailableRemoteSourcesSection: some View {
+        Section {
+            ForEach(unavailableRemoteSources) { source in
+                UnavailableRemoteSourceRow(
+                    source: source,
+                    onOpenSettings: { navigation.currentPage = .settings }
+                )
+            }
+        } header: {
+            Label("providers.remoteSources.unavailable".localized(), systemImage: "network.slash")
+        }
+    }
+
     // MARK: - Custom Providers Section
 
     @ViewBuilder
@@ -648,6 +763,69 @@ struct ProvidersScreen: View {
         try? providersModel.synchronizeCustomProviders(
             at: proxyManagement.proxy.configPath
         )
+    }
+}
+
+// MARK: - Unavailable Remote Source Row
+
+/// One configured remote quota source that currently shows no accounts, with why and a
+/// way to reach its settings. Read-only: it never offers login, disable, or delete —
+/// the source is managed entirely in Settings ▸ Remote Quota Sources.
+private struct UnavailableRemoteSourceRow: View {
+    let source: RemoteQuotaSourceConfig
+    let onOpenSettings: () -> Void
+
+    @Environment(RemoteQuotaSourceScreenModel.self) private var model
+
+    /// Why this source has nothing to show, most specific reason first: a user-disabled
+    /// source is not a failure, a source past the automatic-failure threshold reports
+    /// the failure that hid it, and anything else genuinely listed no accounts.
+    private var reason: String {
+        if !source.isEnabled {
+            return "remote.quotaSource.unavailable.disabled".localized()
+        }
+        if case .error(let key) = model.statuses[source.id] ?? .unknown {
+            return key.localized()
+        }
+        if !model.isVisible(sourceId: source.id) {
+            return "remote.quotaSource.unavailable.hidden".localized()
+        }
+        return "remote.quotaSource.unavailable.noAccounts".localized()
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "network")
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(source.name)
+                    .fontWeight(.medium)
+                    .lineLimit(1)
+                Text(reason)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+
+            Spacer()
+
+            Button {
+                Task { await model.refresh(sourceId: source.id) }
+            } label: {
+                Image(systemName: "arrow.clockwise")
+            }
+            .buttonStyle(.plain)
+            .disabled(!source.isEnabled)
+            .help("remote.quotaSource.refresh".localized())
+
+            Button(action: onOpenSettings) {
+                Image(systemName: "gearshape")
+            }
+            .buttonStyle(.plain)
+            .help("remote.quotaSource.section.title".localized())
+        }
+        .padding(.vertical, 4)
     }
 }
 

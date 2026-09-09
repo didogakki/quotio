@@ -89,6 +89,57 @@ final class UserDefaultsPreferenceRepositoriesTests: XCTestCase {
         XCTAssertNil(repository.load().selectedProvider)
     }
 
+    /// A pre-existing install that persisted every other menu bar preference before
+    /// `hiddenDropdownKeys` existed must decode it as "nothing hidden" rather than
+    /// crashing or defaulting incorrectly.
+    func testMissingHiddenDropdownKeysDefaultsToEmptyOnAPreExistingInstall() {
+        defaults.set(true, forKey: "showMenuBarIcon")
+        defaults.set(true, forKey: "menuBarShowQuota")
+        defaults.set(3, forKey: "menuBarMaxItems")
+        defaults.set(["turned-off-account"], forKey: "menuBarDeselectedPoolAccounts")
+        // Deliberately not setting "menuBarHiddenDropdownKeys".
+
+        let loaded = UserDefaultsMenuBarPreferencesRepository(defaults: defaults).load()
+
+        XCTAssertTrue(loaded.hiddenDropdownKeys.isEmpty)
+        XCTAssertEqual(loaded.deselectedPoolAccounts, ["turned-off-account"])
+    }
+
+    /// Regression: raw storage must never truncate `selectedItems` to `menuBarMaxItems`
+    /// on either `save` or `load` — only *effective* occupancy is capacity-limited, and
+    /// the repository has no visibility into which legacy pool pins currently cover a
+    /// real account (that lives only in `MenuBarSettingsManager`'s in-memory
+    /// `knownRemoteAccountItems`). Three legacy pool pins plus a freshly-pinned plan
+    /// aggregate is four raw pins against a `menuBarMaxItems` of 3 — a pre-fix repository
+    /// silently dropped the newest pin (the aggregate) on save, and would drop it again
+    /// on the next load even if it had survived save, permanently losing it across a
+    /// restart despite it never actually exceeding effective capacity (all three pools
+    /// could easily be empty).
+    func testMenuBarSelectedItemsRoundTripSurvivesRestartBeyondRawMaximum() throws {
+        let poolPins = (1...3).map {
+            MenuBarQuotaItem(provider: "codex", accountKey: RemoteQuotaPoolIdentity.accountKey, sourceConfigId: "src-\($0)")
+        }
+        let aggregate = MenuBarQuotaItem(
+            provider: "codex",
+            accountKey: RemoteQuotaAggregateIdentity.storageKey(sourceId: "src-4", planKey: "pro"),
+            sourceConfigId: "src-4"
+        )
+        var preferences = MenuBarPreferences()
+        preferences.menuBarMaxItems = 3
+        preferences.selectedItems = poolPins + [aggregate]
+
+        let repository = UserDefaultsMenuBarPreferencesRepository(defaults: defaults)
+        repository.save(preferences)
+
+        // A fresh repository instance over the same storage simulates an app restart.
+        let reloaded = UserDefaultsMenuBarPreferencesRepository(defaults: defaults).load()
+
+        XCTAssertEqual(
+            reloaded.selectedItems, poolPins + [aggregate],
+            "raw storage must keep every pin regardless of menuBarMaxItems"
+        )
+    }
+
     func testEmptyStoresUseExistingDefaults() {
         let menu = UserDefaultsMenuBarPreferencesRepository(defaults: defaults).load()
         let refresh = UserDefaultsRefreshPreferencesRepository(defaults: defaults).load()
@@ -134,7 +185,9 @@ final class UserDefaultsPreferenceRepositoriesTests: XCTestCase {
             hideSensitiveInfo: true,
             totalUsageMode: .combined,
             modelAggregationMode: .average,
-            hasUserModifiedMenuBar: true
+            hasUserModifiedMenuBar: true,
+            deselectedPoolAccounts: ["remote:src-1:codex_acct::src-1::a"],
+            hiddenDropdownKeys: ["remote:src-1:codex_acct::src-1::b"]
         )
         let menuRepository = UserDefaultsMenuBarPreferencesRepository(defaults: defaults)
         menuRepository.save(menuPreferences)

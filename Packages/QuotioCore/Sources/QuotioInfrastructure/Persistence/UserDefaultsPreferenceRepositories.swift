@@ -64,12 +64,18 @@ public final class UserDefaultsMenuBarPreferencesRepository: MenuBarPreferencesR
             defaults.set(maximum, forKey: "menuBarMaxItems")
         }
 
-        let selectedItems = loadSelectedItems()
         return MenuBarPreferences(
             showMenuBarIcon: defaults.bool(forKey: "showMenuBarIcon"),
             showQuotaInMenuBar: defaults.bool(forKey: "menuBarShowQuota"),
             menuBarMaxItems: maximum,
-            selectedItems: Array(selectedItems.prefix(maximum)),
+            // Deliberately not truncated by `maximum`: raw storage is the full pin
+            // lifecycle (including legacy pool pins that may currently be empty and so
+            // occupy no slot — see `MenuBarSettingsManager.effectiveSelectedItemCount`).
+            // Truncating here on every load could permanently drop a pin that never
+            // actually exceeded the *effective* capacity, just the raw count. Only what
+            // is actually rendered/selectable is capacity-limited, and that limit is
+            // enforced by `MenuBarSettingsManager`, not this repository.
+            selectedItems: loadSelectedItems(),
             selectedProvider: defaults.string(forKey: "menuBarSelectedProvider")
                 .flatMap(QuotaProvider.init(rawValue:)),
             colorMode: MenuBarColorMode(rawValue: defaults.string(forKey: "menuBarColorMode") ?? "") ?? .colored,
@@ -79,7 +85,15 @@ public final class UserDefaultsMenuBarPreferencesRepository: MenuBarPreferencesR
             hideSensitiveInfo: defaults.bool(forKey: "hideSensitiveInfo"),
             totalUsageMode: TotalUsageMode(rawValue: defaults.string(forKey: "totalUsageMode") ?? "") ?? .sessionOnly,
             modelAggregationMode: ModelAggregationMode(rawValue: defaults.string(forKey: "modelAggregationMode") ?? "") ?? .lowest,
-            hasUserModifiedMenuBar: defaults.bool(forKey: "hasUserModifiedMenuBar")
+            hasUserModifiedMenuBar: defaults.bool(forKey: "hasUserModifiedMenuBar"),
+            // Deliberately not truncated by `maximum`: this records deselections, so
+            // dropping entries would silently re-select accounts a legacy pool pin
+            // expands into.
+            deselectedPoolAccounts: Set(defaults.stringArray(forKey: "menuBarDeselectedPoolAccounts") ?? []),
+            // Also not truncated: it hides entries from the dropdown regardless of how
+            // many items fit in the menu bar, and pre-existing installs have no such key
+            // yet, so an absent value must decode to "nothing hidden".
+            hiddenDropdownKeys: Set(defaults.stringArray(forKey: "menuBarHiddenDropdownKeys") ?? [])
         )
     }
 
@@ -97,7 +111,10 @@ public final class UserDefaultsMenuBarPreferencesRepository: MenuBarPreferencesR
         defaults.set(preferences.totalUsageMode.rawValue, forKey: "totalUsageMode")
         defaults.set(preferences.modelAggregationMode.rawValue, forKey: "modelAggregationMode")
         defaults.set(preferences.hasUserModifiedMenuBar, forKey: "hasUserModifiedMenuBar")
-        if let data = try? JSONEncoder().encode(Array(preferences.selectedItems.prefix(maximum))) {
+        defaults.set(preferences.deselectedPoolAccounts.sorted(), forKey: "menuBarDeselectedPoolAccounts")
+        defaults.set(preferences.hiddenDropdownKeys.sorted(), forKey: "menuBarHiddenDropdownKeys")
+        // Not truncated by `maximum` — see the matching note in `load()`.
+        if let data = try? JSONEncoder().encode(preferences.selectedItems) {
             defaults.set(data, forKey: "menuBarSelectedQuotaItems")
         }
     }

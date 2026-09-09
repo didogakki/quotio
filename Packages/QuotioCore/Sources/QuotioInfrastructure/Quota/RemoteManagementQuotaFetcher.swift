@@ -61,38 +61,85 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
         let candidates = files.filter { file in
             file.isReady && file.providerID.map(Self.supportedProviders.contains) == true
         }
+
+        // The listing succeeded, so it is authoritative for **every** provider this
+        // fetcher supports — seeding each with an empty set (rather than only recording
+        // providers that happen to have a candidate) is what tells the coordinator that
+        // a provider whose last account was deleted now genuinely has none, instead of
+        // leaving its stale reading behind forever.
+        var knownAccountKeys = Dictionary(
+            uniqueKeysWithValues: Self.supportedProviders.map { ($0, Set<String>()) }
+        )
         guard !candidates.isEmpty else {
-            throw RemoteQuotaFetchError.noSupportedReadyFiles
+            // An empty listing is a real, authoritative answer — never a fetch error —
+            // so it must still be allowed to prune. `outcome` keeps the round marked
+            // as a failure so it can't be mistaken for a healthy refresh.
+            return RemoteQuotaPoolFetchResult(
+                outcome: .noAccountsListed,
+                knownAccountKeys: knownAccountKeys
+            )
         }
 
-        var quotasByProvider: [QuotaProvider: [ProviderQuota]] = [:]
+        // Each ready, supported auth file is one real remote account — its quota is
+        // kept under its own raw key (never merged/aggregated with any other account's
+        // reading), so the same identity survives from fetch through display.
+        var byProviderAndAccount: [QuotaProvider: [String: ProviderQuota]] = [:]
         var succeededCount = 0
         for file in candidates {
             guard let provider = file.providerID else { continue }
-            guard let quota = try? await fetchQuota(provider: provider, file: file, api: api) else {
+            let accountKey = file.authIndex ?? file.name
+            knownAccountKeys[provider, default: []].insert(accountKey)
+            guard var quota = try? await fetchQuota(provider: provider, file: file, api: api) else {
                 continue
             }
             succeededCount += 1
-            quotasByProvider[provider, default: []].append(quota)
-        }
-
-        guard succeededCount > 0 else {
-            throw RemoteQuotaFetchError.allRequestsFailed
-        }
-
-        var byProviderAndPlan: [QuotaProvider: [String: ProviderQuota]] = [:]
-        for (provider, quotas) in quotasByProvider {
-            let grouped = Dictionary(grouping: quotas) { QuotaPolicy.normalizedPlanKey($0.planType) }
-            for (planKey, planQuotas) in grouped {
-                guard let aggregated = QuotaPolicy.aggregatePool(planQuotas) else { continue }
-                byProviderAndPlan[provider, default: [:]][planKey] = aggregated
+            if quota.accountDisplayName == nil {
+                quota.accountDisplayName = file.email?.nilIfBlank ?? file.name
             }
+            byProviderAndAccount[provider, default: [:]][accountKey] = quota
+        }
+
+        // Even when no quota request survived, the listing above still reported exactly
+        // which accounts exist — that list stays authoritative and is returned rather
+        // than thrown away, so a round where every request fails can still prune
+        // accounts that disappeared from the remote server.
+        let outcome: RemoteQuotaPoolFetchResult.QuotaOutcome
+        if succeededCount == 0 {
+            outcome = .allFailed
+        } else if succeededCount < candidates.count {
+            outcome = .partial
+        } else {
+            outcome = .complete
         }
 
         return RemoteQuotaPoolFetchResult(
-            quotasByProviderAndPlan: byProviderAndPlan,
-            hasPartialFailure: succeededCount < candidates.count
+            quotasByProviderAndAccount: byProviderAndAccount,
+            outcome: outcome,
+            knownAccountKeys: knownAccountKeys
         )
+    }
+
+    private static let claudeAPIHeaders = [
+        "Authorization": "Bearer $TOKEN$",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": "claude-code/2.1.69",
+    ]
+
+    /// Fetches `GET /api/oauth/profile` through the same `$TOKEN$` pass-through as the
+    /// usage call and maps it via `ClaudeQuotaFetcher.mapProfilePlan`. Swallows every
+    /// failure into `nil` — this is a best-effort supplement to a usage fetch that
+    /// already succeeded, never a requirement for it.
+    private func fetchClaudeProfilePlan(authIndex: String, api: any ProxyManagementAPI) async -> String? {
+        guard let result = try? await api.apiCall(ProxyAPICall(
+            authIndex: authIndex,
+            method: "GET",
+            url: ClaudeQuotaFetcher.profileURL.absoluteString,
+            header: Self.claudeAPIHeaders,
+            data: nil
+        )), let data = bodyData(result) else { return nil }
+        return ClaudeQuotaFetcher.mapProfilePlan(data)
     }
 
     private func makeAPI(
@@ -116,17 +163,21 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
                 authIndex: authIndex,
                 method: "GET",
                 url: ClaudeQuotaFetcher.usageURL.absoluteString,
-                header: [
-                    "Authorization": "Bearer $TOKEN$",
-                    "Accept": "application/json",
-                    "Content-Type": "application/json",
-                    "anthropic-beta": "oauth-2025-04-20",
-                    "User-Agent": "claude-code/2.1.69",
-                ],
+                header: Self.claudeAPIHeaders,
                 data: nil
             ))
             guard let data = bodyData(result) else { return nil }
-            return ClaudeQuotaFetcher.mapUsage(data, now: now())
+            var quota = ClaudeQuotaFetcher.mapUsage(data, planFallback: trustedPlanFallback(file), now: now())
+            // Claude only ever authenticates via OAuth, so the auth-file listing never
+            // carries a trustworthy plan for it (see `trustedPlanFallback`) — the OAuth
+            // profile endpoint is the only source that does. Only consulted when usage
+            // came back with no trusted plan already, and a failure here (network error,
+            // non-2xx, unparsable body) must never discard the usage quota that already
+            // succeeded — it just leaves the plan unset, same as before this existed.
+            if quota?.planType == nil {
+                quota?.planType = await fetchClaudeProfilePlan(authIndex: authIndex, api: api)
+            }
+            return quota
 
         case .codex:
             var header = [
@@ -144,7 +195,7 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
                 data: nil
             ))
             guard let data = bodyData(result) else { return nil }
-            return try? CodexQuotaFetcher.mapUsage(data, planFallback: file.accountType, now: now())
+            return try? CodexQuotaFetcher.mapUsage(data, planFallback: trustedPlanFallback(file), now: now())
 
         case .grok:
             let result = try await api.apiCall(ProxyAPICall(
@@ -161,11 +212,30 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
             ))
             guard let data = bodyData(result) else { return nil }
             let displayName = file.email?.nilIfBlank ?? file.name
-            return GrokQuotaFetcher.mapBilling(data, plan: file.accountType, displayName: displayName, now: now())
+            return GrokQuotaFetcher.mapBilling(data, plan: trustedPlanFallback(file), displayName: displayName, now: now())
 
         default:
             return nil
         }
+    }
+
+    /// Auth-mechanism labels the Management API's `account_type` field can carry (e.g.
+    /// Claude only ever authenticates via OAuth, so its `account_type` is always
+    /// `"oauth"`) — never a subscription/plan name. The auth-file listing this fetcher
+    /// reads from has no separate plan/tier field at all, so `account_type` was
+    /// previously passed straight through as the quota's plan fallback, which showed a
+    /// literal "oauth" tier badge instead of the account's real plan (or none at all).
+    /// Filtering out the known auth-mechanism values here — rather than substituting a
+    /// guessed plan name — means an account with no real plan data shows no tier badge
+    /// instead of a misleading one.
+    private static let authMechanismValues: Set<String> = ["oauth", "api_key", "apikey", "api-key"]
+
+    private func trustedPlanFallback(_ file: ManagedAuthFile) -> String? {
+        guard let accountType = file.accountType?.nilIfBlank,
+              !Self.authMechanismValues.contains(accountType.lowercased()) else {
+            return nil
+        }
+        return accountType
     }
 
     private func bodyData(_ result: ProxyAPICallResult) -> Data? {

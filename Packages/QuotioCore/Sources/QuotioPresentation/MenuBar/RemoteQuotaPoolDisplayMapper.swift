@@ -1,59 +1,63 @@
 import Foundation
 import QuotioDomain
 
-/// Pure mapping from a remote quota pool's plan groups to menu bar display items.
-/// Pulled out of `CompositionRoot` so the "always show a plan label, respect the total
-/// item cap" behavior is unit-testable without a UI snapshot.
+/// Pure mapping used only to keep a **legacy** pinned selection working: before
+/// per-account remote pins existed, pinning a remote source's pool persisted a
+/// `MenuBarQuotaItem` with `accountKey == RemoteQuotaPoolIdentity.accountKey` scoped to
+/// one source+provider. That old selection must keep showing something meaningful
+/// instead of silently vanishing or collapsing into a synthetic aggregate, so it is
+/// expanded here into one display item per **real** remote account currently present
+/// for that source/provider — never a plan-level or pool-level aggregate. New pins
+/// target one real account's own storage key directly and never go through this path.
 public enum RemoteQuotaPoolDisplayMapper {
-    public struct PlanGroup {
-        public let planKey: String
+    public struct AccountEntry {
+        public let accountKey: String
         public let quota: ProviderQuota
 
-        public init(planKey: String, quota: ProviderQuota) {
-            self.planKey = planKey
+        public init(accountKey: String, quota: ProviderQuota) {
+            self.accountKey = accountKey
             self.quota = quota
         }
     }
 
-    /// Builds one `MenuBarQuotaDisplayItem` per plan group, sorted by plan key for a
-    /// stable order. Every item carries a `groupLabel` — even when there is exactly one
-    /// group — so a single-plan pool still identifies itself (e.g. "Codex Business")
-    /// next to the provider icon instead of reading as an anonymous account.
+    /// Builds one `MenuBarQuotaDisplayItem` per real remote account, sorted by display
+    /// name for a stable order. Every item carries a `groupLabel` set to that account's
+    /// own display name (never a plan label, never the internal pool sentinel), so a
+    /// legacy pool pin with several accounts still distinguishes each one in the compact
+    /// menu bar row instead of reading as duplicate anonymous entries.
     public static func displayItems(
         itemId: String,
         provider: QuotaProvider,
-        groups: [PlanGroup],
+        accounts: [AccountEntry],
         stackPairedQuotaMetrics: Bool,
         totalUsagePercent: ([(name: String, percentage: Double)]) -> Double
     ) -> [MenuBarQuotaDisplayItem] {
-        groups.sorted { $0.planKey < $1.planKey }.map { group in
-            var displayPercent: Double = -1
-            var quotaPair: MenuBarQuotaPair?
-            if !group.quota.models.isEmpty {
-                let models = group.quota.models.map { (name: $0.name, percentage: $0.percentage) }
-                displayPercent = totalUsagePercent(models)
-                if stackPairedQuotaMetrics {
-                    quotaPair = MenuBarQuotaPair.resolve(for: provider, from: group.quota.models)
+        accounts
+            .sorted { ($0.quota.accountDisplayName ?? $0.accountKey) < ($1.quota.accountDisplayName ?? $1.accountKey) }
+            .map { entry in
+                var displayPercent: Double = -1
+                var quotaPair: MenuBarQuotaPair?
+                if !entry.quota.models.isEmpty {
+                    let models = entry.quota.models.map { (name: $0.name, percentage: $0.percentage) }
+                    displayPercent = totalUsagePercent(models)
+                    if stackPairedQuotaMetrics {
+                        quotaPair = MenuBarQuotaPair.resolve(for: provider, from: entry.quota.models)
+                    }
                 }
-            }
-            // `accountDisplayName` is populated with the remote source's name by
-            // `RemoteQuotaSourceScreenModel.visibleProviderQuotas`; never fall back to
-            // the internal `RemoteQuotaPoolIdentity.accountKey` sentinel here.
-            let accountShort = group.quota.accountDisplayName ?? provider.displayName
-            return MenuBarQuotaDisplayItem(
-                id: "\(itemId):\(group.planKey)",
-                providerSymbol: provider.menuBarSymbol,
-                accountShort: accountShort,
-                percentage: displayPercent,
-                provider: provider,
-                isForbidden: group.quota.isForbidden,
-                quotaPair: quotaPair,
-                groupLabel: QuotaPolicy.planGroupDisplayLabel(
+                // `accountDisplayName` is the remote account's own email/name, set by the
+                // fetcher; never fall back to the internal `RemoteQuotaPoolIdentity`/
+                // `RemoteQuotaAccountIdentity` sentinel or raw storage key here.
+                let accountShort = entry.quota.accountDisplayName ?? provider.displayName
+                return MenuBarQuotaDisplayItem(
+                    id: "\(itemId):\(entry.accountKey)",
+                    providerSymbol: provider.menuBarSymbol,
+                    accountShort: accountShort,
+                    percentage: displayPercent,
                     provider: provider,
-                    planKey: group.planKey,
-                    rawPlanType: group.quota.planType
+                    isForbidden: entry.quota.isForbidden,
+                    quotaPair: quotaPair,
+                    groupLabel: accountShort
                 )
-            )
-        }
+            }
     }
 }

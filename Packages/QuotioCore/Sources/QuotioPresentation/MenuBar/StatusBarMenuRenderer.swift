@@ -73,12 +73,23 @@ final class StatusBarMenuRenderer {
                     menu.addItem(viewItem(for: headerView))
                 }
 
-                if providerSnapshot.accounts.isEmpty {
+                if providerSnapshot.groups.isEmpty {
                     menu.addItem(buildEmptyStateItem())
                 } else {
-                    for account in providerSnapshot.accounts {
-                        let cardItem = buildAccountCardItem(account)
-                        menu.addItem(cardItem)
+                    // Single-source filter still keeps local/remote separated: within
+                    // one provider, the local group (if present) renders first, then
+                    // each remote source's own group under its own sub-header — so two
+                    // sources (or a local + a remote account) sharing a raw key/email
+                    // never read as one merged row.
+                    let showsSourceSubheaders = providerSnapshot.groups.count > 1
+                        || providerSnapshot.groups.first?.origin != .local
+                    for group in providerSnapshot.groups {
+                        if showsSourceSubheaders {
+                            menu.addItem(viewItem(for: MenuAccountGroupSubheader(origin: group.origin)))
+                        }
+                        for account in group.accounts {
+                            menu.addItem(buildAccountCardItem(account))
+                        }
                     }
                 }
 
@@ -172,7 +183,9 @@ final class StatusBarMenuRenderer {
             onRefresh: {
                 self.commands.dispatch(.refreshAccount(account.id))
             },
-            onUseAccount: provider == .antigravity && !account.isActiveInIDE ? {
+            // A remote-origin account is a read-only reflection of another server's
+            // auth file — it must never drive local IDE account switching.
+            onUseAccount: account.origin == .local && provider == .antigravity && !account.isActiveInIDE ? {
                 self.commands.dispatch(.useAntigravityAccount(email: account.email))
             } : nil
         )
@@ -323,6 +336,38 @@ private struct MenuProviderSectionHeader: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 4)
+    }
+}
+
+// MARK: - Account Group Subheader (local vs. remote source, within one provider)
+
+/// Labels which source a group of account rows came from — "Local" or a configured
+/// remote quota source's own name — so accounts never read as an undifferentiated pile
+/// once more than one source is visible for the same provider.
+private struct MenuAccountGroupSubheader: View {
+    let origin: StatusBarMenuAccountOrigin
+
+    private var title: String {
+        switch origin {
+        case .local:
+            return "menubar.source.local".localized()
+        case .remote(_, let sourceName):
+            return sourceName
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: origin == .local ? "desktopcomputer" : "network")
+                .font(.system(size: 9, weight: .medium))
+                .foregroundStyle(.tertiary)
+            Text(title)
+                .font(.system(size: 9.5, weight: .medium, design: .rounded))
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 4)
     }
 }
 

@@ -16,7 +16,19 @@ enum AccountRowSource: Equatable {
     case direct          // From disk auth files (DirectAuthFile)
     case autoDetected    // Auto-detected from IDE (Cursor, Trae)
     case monitor(AccountSource)
-    
+    /// A real account fetched from a configured remote quota source (Settings ▸ Remote
+    /// Quota Sources), identified by that source's own display name. Read-only: it must
+    /// never expose local login/disable/delete actions — its identity and quota are
+    /// entirely owned by `RemoteQuotaSourceScreenModel`.
+    case remoteQuotaSource(String)
+    /// A derived, read-only summary row combining every real remote account that shares
+    /// one source + provider + plan — never a real account in its own right. Owned by
+    /// `RemoteQuotaSourceScreenModel.planAggregates`, so it is exactly as read-only as
+    /// `remoteQuotaSource`, plus it can never be individually hidden from the dropdown
+    /// (there is nothing beneath it to hide — hiding applies to the real accounts it
+    /// summarizes).
+    case remoteQuotaSourceAggregate(sourceName: String, planLabel: String)
+
     @MainActor
     var displayName: String {
         switch self {
@@ -24,14 +36,49 @@ enum AccountRowSource: Equatable {
         case .direct: return "providers.source.disk".localizedStatic()
         case .autoDetected: return "providers.autoDetected".localizedStatic()
         case .monitor(let source): return source.displayName
+        case .remoteQuotaSource(let sourceName): return sourceName
+        case .remoteQuotaSourceAggregate(let sourceName, _): return sourceName
         }
     }
 
     var supportsDisable: Bool {
         switch self {
         case .proxy, .monitor: true
-        case .direct, .autoDetected: false
+        case .direct, .autoDetected, .remoteQuotaSource, .remoteQuotaSourceAggregate: false
         }
+    }
+
+    /// Whether this row gets the "hide from the menu bar dropdown" ✓/✕ toggle, shown
+    /// inline for every real account regardless of whether it also has a real
+    /// enable/disable action — the two controls are independent: this one only ever
+    /// changes whether the account shows up in the menu bar's per-provider dropdown
+    /// list, never whether the account itself keeps fetching. Every real account source
+    /// (proxy, direct, monitor, remoteQuotaSource) gets it; an aggregate row does not,
+    /// since it is already just a derived view of accounts that can each be hidden
+    /// individually and has nothing of its own to hide.
+    var supportsDropdownVisibilityToggle: Bool {
+        switch self {
+        case .proxy, .direct, .monitor, .remoteQuotaSource: true
+        case .autoDetected, .remoteQuotaSourceAggregate: false
+        }
+    }
+
+    /// The configured source's own name for a remote-quota-source row; nil for every
+    /// local source. Lets callers order rows so one source's accounts stay together
+    /// without reaching for the localized, main-actor-bound `displayName`.
+    var remoteSourceName: String? {
+        switch self {
+        case .remoteQuotaSource(let name), .remoteQuotaSourceAggregate(let name, _): return name
+        default: return nil
+        }
+    }
+
+    /// Whether this row is a derived plan summary rather than a real account. Every
+    /// account count shown to the user (provider badges, total counts) must exclude
+    /// aggregate rows — otherwise the accounts they summarize would be counted twice.
+    var isAggregate: Bool {
+        if case .remoteQuotaSourceAggregate = self { return true }
+        return false
     }
 }
 
@@ -49,6 +96,11 @@ struct AccountRowData: Identifiable, Hashable {
     let canDelete: Bool           // Only proxy accounts can be deleted
     let canEdit: Bool             // Whether this account can be edited (GLM only)
     let canSwitch: Bool           // Whether this account can be switched (Antigravity only)
+    /// The `RemoteQuotaSourceConfig.id` this account's quota was fetched from, if any.
+    /// `nil` for every local source — only remote-quota-source rows set this, so their
+    /// menu bar pin carries the source id `RemoteQuotaSourceCoordinator`/refresh routing
+    /// needs, instead of being indistinguishable from a local account.
+    let sourceConfigId: String?
 
     // Custom initializer to handle canEdit parameter
     init(
@@ -63,7 +115,8 @@ struct AccountRowData: Identifiable, Hashable {
         isDisabled: Bool,
         canDelete: Bool,
         canEdit: Bool = false,
-        canSwitch: Bool = false
+        canSwitch: Bool = false,
+        sourceConfigId: String? = nil
     ) {
         self.id = id
         self.provider = provider
@@ -77,11 +130,12 @@ struct AccountRowData: Identifiable, Hashable {
         self.canDelete = canDelete
         self.canEdit = canEdit
         self.canSwitch = canSwitch
+        self.sourceConfigId = sourceConfigId
     }
 
     // For menu bar selection
     var menuBarItem: MenuBarQuotaItem {
-        MenuBarQuotaItem(provider: provider.rawValue, accountKey: menuBarAccountKey)
+        MenuBarQuotaItem(provider: provider.rawValue, accountKey: menuBarAccountKey, sourceConfigId: sourceConfigId)
     }
 
     var canDownloadAuthFile: Bool {
@@ -164,6 +218,61 @@ struct AccountRowData: Identifiable, Hashable {
         )
     }
 
+    /// Create from one real account fetched from a configured remote quota source.
+    /// `storageKey` is the exact `RemoteQuotaAccountIdentity` composite key already
+    /// present in the merged quota dictionary, so the resulting `menuBarItem` pins
+    /// precisely that account — never a source-wide/plan-level aggregate.
+    static func from(
+        provider: QuotaProvider,
+        sourceId: String,
+        sourceName: String,
+        rawAccountKey: String,
+        storageKey: String,
+        quota: ProviderQuota
+    ) -> AccountRowData {
+        AccountRowData(
+            id: "remote:\(sourceId):\(rawAccountKey)",
+            provider: provider,
+            displayName: quota.accountDisplayName ?? rawAccountKey,
+            menuBarAccountKey: storageKey,
+            source: .remoteQuotaSource(sourceName),
+            status: nil,
+            statusMessage: nil,
+            isDisabled: false,
+            canDelete: false,
+            sourceConfigId: sourceId
+        )
+    }
+
+    /// Create one derived summary row for every real account sharing `sourceId` +
+    /// `provider` + `planKey`. `storageKey` is the exact `RemoteQuotaAggregateIdentity`
+    /// composite key, so pinning this row (via the normal `menuBarItem`/`MenuBarBadge`
+    /// path already used by every other row) targets that source + provider + plan
+    /// aggregate specifically — never one of the real accounts it summarizes.
+    @MainActor
+    static func aggregate(
+        provider: QuotaProvider,
+        sourceId: String,
+        sourceName: String,
+        planLabel: String,
+        accountCount: Int,
+        storageKey: String,
+        quota: ProviderQuota
+    ) -> AccountRowData {
+        AccountRowData(
+            id: "remote-aggregate:\(sourceId):\(provider.rawValue):\(storageKey)",
+            provider: provider,
+            displayName: String(format: "providers.aggregate.rowTitle".localizedStatic(), planLabel, accountCount),
+            menuBarAccountKey: storageKey,
+            source: .remoteQuotaSourceAggregate(sourceName: sourceName, planLabel: planLabel),
+            status: nil,
+            statusMessage: nil,
+            isDisabled: quota.isForbidden,
+            canDelete: false,
+            sourceConfigId: sourceId
+        )
+    }
+
     func hash(into hasher: inout Hasher) {
         hasher.combine(id)
         hasher.combine(authFileName)
@@ -198,9 +307,21 @@ struct AccountRow: View {
     private var isMenuBarSelected: Bool {
         settings.isSelected(account.menuBarItem)
     }
+
+    /// Every real account gets this — see `AccountRowSource.supportsDropdownVisibilityToggle`.
+    /// Keyed by `menuBarItem.id` (not the raw `menuBarAccountKey`) so the same raw
+    /// key/email used by two different local sources, or by a local and a remote
+    /// account, can never collide in the hidden set — `menuBarItem.id` already namespaces
+    /// by provider and, for remote accounts, by source id.
+    private var isHiddenFromDropdown: Bool {
+        settings.isHiddenFromDropdown(account.menuBarItem.id)
+    }
     
+    /// An aggregate row's `displayName` is a synthesized title ("Pro (3 accounts)"), not
+    /// a real account identifier, so it is never masked — only a real account's own
+    /// email/name is sensitive here.
     private var maskedDisplayName: String {
-        account.displayName.masked(if: settings.hideSensitiveInfo)
+        account.displayName.masked(if: settings.hideSensitiveInfo && !account.source.isAggregate)
     }
     
     private var statusColor: Color {
@@ -309,24 +430,27 @@ struct AccountRow: View {
                 onTap: handleMenuBarToggle
             )
 
-            // Disable/Enable toggle button (only for proxy accounts)
-            if account.source.supportsDisable, let onToggleDisabled = onToggleDisabled {
+            // Dropdown-visibility ✓/✕ toggle (every real account). This only controls
+            // whether the account shows up in the menu bar's per-provider dropdown list —
+            // never the account's real enable/disable state, which (for sources that
+            // support it) lives in the context menu only, reachable via right-click.
+            if account.source.supportsDropdownVisibilityToggle {
                 Button {
-                    onToggleDisabled()
+                    settings.toggleDropdownVisibility(account.menuBarItem.id)
                 } label: {
                     ZStack {
                         RoundedRectangle(cornerRadius: 6)
-                            .fill(account.isDisabled ? Color.red.opacity(0.1) : Color.clear)
+                            .fill(isHiddenFromDropdown ? Color.red.opacity(0.1) : Color.clear)
                             .frame(width: 28, height: 28)
 
-                        Image(systemName: account.isDisabled ? "xmark.circle.fill" : "checkmark.circle")
+                        Image(systemName: isHiddenFromDropdown ? "xmark.circle.fill" : "checkmark.circle")
                             .font(.system(size: 14))
-                            .foregroundStyle(account.isDisabled ? .red : .secondary)
+                            .foregroundStyle(isHiddenFromDropdown ? .red : .secondary)
                     }
                 }
                 .buttonStyle(.rowAction)
-                .help(account.isDisabled ? "providers.enable".localized() : "providers.disable".localized())
-                .accessibilityLabel(account.isDisabled ? "providers.enable".localized() : "providers.disable".localized())
+                .help(isHiddenFromDropdown ? "providers.dropdown.show".localized() : "providers.dropdown.hide".localized())
+                .accessibilityLabel(isHiddenFromDropdown ? "providers.dropdown.show".localized() : "providers.dropdown.hide".localized())
             }
 
             // Edit button (GLM only)
@@ -396,6 +520,16 @@ struct AccountRow: View {
                         Label("providers.disable".localized(), systemImage: "minus.circle")
                     }
                 }
+            } else if account.source.supportsDropdownVisibilityToggle {
+                Button {
+                    settings.toggleDropdownVisibility(account.menuBarItem.id)
+                } label: {
+                    if isHiddenFromDropdown {
+                        Label("providers.dropdown.show".localized(), systemImage: "checkmark.circle")
+                    } else {
+                        Label("providers.dropdown.hide".localized(), systemImage: "minus.circle")
+                    }
+                }
             }
 
             // Delete option (only for proxy accounts)
@@ -436,7 +570,12 @@ struct AccountRow: View {
     }
     
     private func handleMenuBarToggle() {
-        if isMenuBarSelected {
+        // Turning an account off never consumes a menu bar slot, and restoring an
+        // account covered by a legacy pool pin only consumes one if that pool pin is
+        // currently empty (occupies no slot yet) — `toggleWouldOccupyNewSlot` captures
+        // exactly that distinction, so the warning/limit checks only apply when the
+        // toggle would actually grow effective occupancy.
+        if !settings.toggleWouldOccupyNewSlot(account.menuBarItem) {
             settings.toggleItem(account.menuBarItem)
         } else if settings.isAtMaxItems {
             showMaxItemsAlert = true

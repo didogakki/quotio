@@ -157,10 +157,21 @@ public actor RawKeychainStringReader: LegacyKeychainReading {
 
 public final class UserDefaultsRemoteQuotaPoolSnapshotStore: RemoteQuotaPoolSnapshotStoring, @unchecked Sendable {
     private struct Payload: Codable {
+        /// Absent in the unversioned v1 payload, which is exactly how that payload is
+        /// recognized and discarded.
+        var version: Int?
         var quotasBySource: [String: [String: [String: ProviderQuota]]]
     }
 
     public static let storageKey = "remoteQuotaPoolSnapshot"
+    /// Bumped whenever the *meaning* of the persisted keys changes, not just their
+    /// shape. v1 (unversioned) keyed each provider's entries by plan group — a
+    /// cross-account aggregate; v2 keys them by one real account. The two are
+    /// structurally identical JSON, so without this marker a v1 aggregate would silently
+    /// load back as if it were an account. A snapshot from any other version is dropped
+    /// on load; only this cache is affected — source configs, management keys, and menu
+    /// bar pins live under their own keys and are never touched here.
+    public static let currentVersion = 2
     private let defaults: UserDefaults
 
     public init(defaults: UserDefaults = .standard) {
@@ -169,7 +180,8 @@ public final class UserDefaultsRemoteQuotaPoolSnapshotStore: RemoteQuotaPoolSnap
 
     public func load() -> RemoteQuotaPoolSnapshot {
         guard let data = defaults.data(forKey: Self.storageKey),
-              let payload = try? JSONDecoder().decode(Payload.self, from: data)
+              let payload = try? JSONDecoder().decode(Payload.self, from: data),
+              payload.version == Self.currentVersion
         else { return RemoteQuotaPoolSnapshot() }
         let decoded = payload.quotasBySource.reduce(into: [String: [QuotaProvider: [String: ProviderQuota]]]()) {
             result, entry in
@@ -190,7 +202,8 @@ public final class UserDefaultsRemoteQuotaPoolSnapshotStore: RemoteQuotaPoolSnap
                 result[pair.key.rawValue] = pair.value
             }
         }
-        guard let data = try? JSONEncoder().encode(Payload(quotasBySource: encoded)) else { return }
+        let payload = Payload(version: Self.currentVersion, quotasBySource: encoded)
+        guard let data = try? JSONEncoder().encode(payload) else { return }
         defaults.set(data, forKey: Self.storageKey)
     }
 }

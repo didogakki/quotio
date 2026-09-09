@@ -189,7 +189,7 @@ private actor LifecycleStubFetcher: RemoteQuotaSourceFetching {
         queues[source.id] = queue
         switch outcome {
         case .success(let quotas):
-            return RemoteQuotaPoolFetchResult(quotasByProviderAndPlan: quotas, hasPartialFailure: false)
+            return RemoteQuotaPoolFetchResult(quotasByProviderAndAccount: quotas, outcome: .complete)
         }
     }
 }
@@ -216,13 +216,16 @@ private final class LifecycleMemoryModeRepository: OperatingModePreferencesRepos
 
 @MainActor
 final class RemoteQuotaSourceScreenModelTests: XCTestCase {
-    func testVisibleProviderQuotasExpandsIntoOneKeyPerPlanGroup() async {
+    /// Regression: this used to expand into one key per **plan group** (an aggregate
+    /// masquerading as an account); it must now expose each real remote account under
+    /// its own key with its own untouched reading — never merged/aggregated together.
+    func testVisibleProviderQuotasExpandsIntoOneKeyPerRealRemoteAccount() async {
         let fetcher = StubFetcher()
         let coordinator = makeCoordinator(fetcher: fetcher)
         let source = RemoteQuotaSourceConfig(id: "s1", name: "Pool", baseURL: "https://a.test")
         await coordinator.addSource(source, managementKey: "k")
         await fetcher.enqueue(
-            .success([.codex: ["pro": Self.quota(70), "team": Self.quota(20)]]),
+            .success([.codex: ["codex-a": Self.quota(70), "codex-b": Self.quota(20)]]),
             for: "s1"
         )
         let model = RemoteQuotaSourceScreenModel(coordinator: coordinator, refreshSettings: makeRefreshSettings())
@@ -234,10 +237,35 @@ final class RemoteQuotaSourceScreenModelTests: XCTestCase {
 
         let codexEntries = model.visibleProviderQuotas[.codex] ?? [:]
         XCTAssertEqual(codexEntries.count, 2)
-        let proKey = RemoteQuotaPoolIdentity.storageKey(sourceId: "s1", planKey: "pro")
-        let teamKey = RemoteQuotaPoolIdentity.storageKey(sourceId: "s1", planKey: "team")
-        XCTAssertEqual(codexEntries[proKey]?.models.first?.percentage, 70)
-        XCTAssertEqual(codexEntries[teamKey]?.models.first?.percentage, 20)
+        let accountAKey = RemoteQuotaAccountIdentity.storageKey(sourceId: "s1", accountKey: "codex-a")
+        let accountBKey = RemoteQuotaAccountIdentity.storageKey(sourceId: "s1", accountKey: "codex-b")
+        XCTAssertEqual(codexEntries[accountAKey]?.models.first?.percentage, 70)
+        XCTAssertEqual(codexEntries[accountBKey]?.models.first?.percentage, 20)
+    }
+
+    /// Two different remote sources both surfacing an account under the same raw key
+    /// (e.g. the same email) must never collide in `visibleProviderQuotas` — this is
+    /// the exact scenario `RemoteQuotaAccountIdentity`'s composite key exists to prevent.
+    func testVisibleProviderQuotasIsolatesSameRawAccountKeyAcrossDifferentSources() async {
+        let fetcher = StubFetcher()
+        let coordinator = makeCoordinator(fetcher: fetcher)
+        let sourceA = RemoteQuotaSourceConfig(id: "src-a", name: "A", baseURL: "https://a.test")
+        let sourceB = RemoteQuotaSourceConfig(id: "src-b", name: "B", baseURL: "https://b.test")
+        await coordinator.addSource(sourceA, managementKey: "k")
+        await coordinator.addSource(sourceB, managementKey: "k")
+        await fetcher.enqueue(.success([.claude: ["same@example.com": Self.quota(70)]]), for: "src-a")
+        await fetcher.enqueue(.success([.claude: ["same@example.com": Self.quota(20)]]), for: "src-b")
+        let model = RemoteQuotaSourceScreenModel(coordinator: coordinator, refreshSettings: makeRefreshSettings())
+
+        await model.initialize()
+        await waitUntil { (model.visibleProviderQuotas[.claude] ?? [:]).count >= 2 }
+
+        let claudeEntries = model.visibleProviderQuotas[.claude] ?? [:]
+        XCTAssertEqual(claudeEntries.count, 2)
+        let keyA = RemoteQuotaAccountIdentity.storageKey(sourceId: "src-a", accountKey: "same@example.com")
+        let keyB = RemoteQuotaAccountIdentity.storageKey(sourceId: "src-b", accountKey: "same@example.com")
+        XCTAssertEqual(claudeEntries[keyA]?.models.first?.percentage, 70)
+        XCTAssertEqual(claudeEntries[keyB]?.models.first?.percentage, 20)
     }
 
     func testVisibleProviderQuotasOmitsDisabledSourceEvenWithASnapshot() async {
@@ -259,6 +287,198 @@ final class RemoteQuotaSourceScreenModelTests: XCTestCase {
         await waitUntil { (model.visibleProviderQuotas[.claude] ?? [:]).isEmpty }
 
         XCTAssertTrue((model.visibleProviderQuotas[.claude] ?? [:]).isEmpty)
+    }
+
+    /// A provider-scoped refresh (the Quota screen's per-provider button and the menu
+    /// bar's provider header) has to reach that provider's remote accounts too, without
+    /// dragging in sources that carry an unrelated provider.
+    func testProviderScopedRefreshHitsOnlySourcesCarryingThatProvider() async {
+        let fetcher = StubFetcher()
+        let coordinator = makeCoordinator(fetcher: fetcher)
+        await coordinator.addSource(
+            RemoteQuotaSourceConfig(id: "codex-src", name: "A", baseURL: "https://a.test"),
+            managementKey: "k"
+        )
+        await coordinator.addSource(
+            RemoteQuotaSourceConfig(id: "claude-src", name: "B", baseURL: "https://b.test"),
+            managementKey: "k"
+        )
+        await fetcher.enqueue(.success([.codex: ["a": Self.quota(70)]]), for: "codex-src")
+        await fetcher.enqueue(.success([.claude: ["b": Self.quota(30)]]), for: "claude-src")
+        let model = RemoteQuotaSourceScreenModel(coordinator: coordinator, refreshSettings: makeRefreshSettings())
+        await model.initialize()
+        await waitUntil { model.hasVisibleAccounts(provider: .claude) }
+
+        XCTAssertTrue(model.hasVisibleAccounts(provider: .codex))
+        XCTAssertTrue(model.hasVisibleAccounts(provider: .claude))
+        XCTAssertFalse(model.hasVisibleAccounts(provider: .grok))
+
+        await fetcher.resetFetchLog()
+        await model.refresh(provider: .codex)
+
+        let fetched = await fetcher.fetchedSourceIds
+        XCTAssertEqual(fetched, ["codex-src"])
+    }
+
+    /// A source with no accounts for the provider (or none at all) offers no remote
+    /// work, so the caller can fall back to whatever the local side supports instead of
+    /// showing a refresh action that would do nothing.
+    func testHasVisibleAccountsIsFalseWhenNoSourceCarriesTheProvider() async {
+        let fetcher = StubFetcher()
+        let coordinator = makeCoordinator(fetcher: fetcher)
+        await coordinator.addSource(
+            RemoteQuotaSourceConfig(id: "s1", name: "Pool", baseURL: "https://a.test"),
+            managementKey: "k"
+        )
+        let model = RemoteQuotaSourceScreenModel(coordinator: coordinator, refreshSettings: makeRefreshSettings())
+        await model.initialize()
+
+        XCTAssertFalse(model.hasVisibleAccounts(provider: .codex))
+
+        await fetcher.resetFetchLog()
+        await model.refresh(provider: .codex)
+        let fetched = await fetcher.fetchedSourceIds
+        XCTAssertTrue(fetched.isEmpty)
+    }
+
+    // MARK: - planAggregates
+
+    /// Two accounts sharing a normalized plan key produce exactly one aggregate row,
+    /// keyed with `RemoteQuotaAggregateIdentity`, combining their readings via the
+    /// requested mode — while `visibleProviderQuotas` keeps both real accounts untouched.
+    func testPlanAggregatesCombinesAccountsSharingANormalizedPlanKey() async {
+        let fetcher = StubFetcher()
+        let coordinator = makeCoordinator(fetcher: fetcher)
+        let source = RemoteQuotaSourceConfig(id: "s1", name: "Pool", baseURL: "https://a.test")
+        await coordinator.addSource(source, managementKey: "k")
+        await fetcher.enqueue(
+            .success([.claude: [
+                "a": Self.quota(80, plan: "Pro"),
+                "b": Self.quota(20, plan: "Pro 20x"),
+            ]]),
+            for: "s1"
+        )
+        let model = RemoteQuotaSourceScreenModel(coordinator: coordinator, refreshSettings: makeRefreshSettings())
+        await model.initialize()
+        await waitUntil { (model.visibleProviderQuotas[.claude] ?? [:]).count == 2 }
+
+        let aggregates = model.planAggregates(mode: .lowest)
+        let key = RemoteQuotaAggregateIdentity.storageKey(sourceId: "s1", planKey: "pro")
+        let aggregate = aggregates[.claude]?[key]
+
+        XCTAssertEqual(aggregate?.accountCount, 2)
+        XCTAssertEqual(aggregate?.quota.models.first?.percentage, 20)
+        // Both real accounts must still be present and untouched.
+        XCTAssertEqual((model.visibleProviderQuotas[.claude] ?? [:]).count, 2)
+    }
+
+    /// A plan group with exactly one account still produces its own aggregate row — a
+    /// single-account plan (e.g. one Claude Pro account) is exactly the summary users
+    /// expect to see, not just a group that happens to have two or more members.
+    func testPlanAggregatesIncludesSingleAccountGroups() async {
+        let fetcher = StubFetcher()
+        let coordinator = makeCoordinator(fetcher: fetcher)
+        let source = RemoteQuotaSourceConfig(id: "s1", name: "Pool", baseURL: "https://a.test")
+        await coordinator.addSource(source, managementKey: "k")
+        await fetcher.enqueue(.success([.claude: ["a": Self.quota(80, plan: "Pro")]]), for: "s1")
+        let model = RemoteQuotaSourceScreenModel(coordinator: coordinator, refreshSettings: makeRefreshSettings())
+        await model.initialize()
+        await waitUntil { !((model.visibleProviderQuotas[.claude] ?? [:]).isEmpty) }
+
+        let aggregates = model.planAggregates(mode: .lowest)[.claude] ?? [:]
+        let key = RemoteQuotaAggregateIdentity.storageKey(sourceId: "s1", planKey: "pro")
+        XCTAssertEqual(aggregates[key]?.accountCount, 1)
+        XCTAssertEqual(aggregates[key]?.quota.models.first?.percentage, 80)
+    }
+
+    /// Regression: the aggregate identity (`RemoteQuotaAggregateIdentity.storageKey`,
+    /// derived from source + plan key only) must stay exactly the same as the group's
+    /// account count changes — 1 account, then 2, then back down to 1 — so a menu bar
+    /// pin targeting this aggregate never silently disappears or gets replaced just
+    /// because a second account joined and later left the same plan.
+    func testPlanAggregateIdentityIsStableAsAccountCountChanges() async {
+        let fetcher = StubFetcher()
+        let coordinator = makeCoordinator(fetcher: fetcher)
+        let source = RemoteQuotaSourceConfig(id: "s1", name: "Pool", baseURL: "https://a.test")
+        await coordinator.addSource(source, managementKey: "k")
+        let model = RemoteQuotaSourceScreenModel(coordinator: coordinator, refreshSettings: makeRefreshSettings())
+        let key = RemoteQuotaAggregateIdentity.storageKey(sourceId: "s1", planKey: "pro")
+
+        // 1 account.
+        await fetcher.enqueue(.success([.claude: ["a": Self.quota(80, plan: "Pro")]]), for: "s1")
+        await model.initialize()
+        await waitUntil { (model.visibleProviderQuotas[.claude] ?? [:]).count == 1 }
+        XCTAssertEqual(model.planAggregates(mode: .lowest)[.claude]?[key]?.accountCount, 1)
+
+        // Grows to 2 accounts on the same plan — same key, updated count.
+        await fetcher.enqueue(
+            .success([.claude: [
+                "a": Self.quota(80, plan: "Pro"),
+                "b": Self.quota(40, plan: "Pro"),
+            ]]),
+            for: "s1"
+        )
+        await model.refresh(sourceId: "s1")
+        await waitUntil { (model.visibleProviderQuotas[.claude] ?? [:]).count == 2 }
+        XCTAssertEqual(model.planAggregates(mode: .lowest)[.claude]?[key]?.accountCount, 2)
+
+        // Shrinks back to 1 account — the aggregate must still exist under the exact
+        // same key, not vanish and reappear as a different identity.
+        await fetcher.enqueue(.success([.claude: ["a": Self.quota(80, plan: "Pro")]]), for: "s1")
+        await model.refresh(sourceId: "s1")
+        await waitUntil { (model.visibleProviderQuotas[.claude] ?? [:]).count == 1 }
+        XCTAssertEqual(model.planAggregates(mode: .lowest)[.claude]?[key]?.accountCount, 1)
+    }
+
+    /// Accounts on different plans within the same source/provider never merge together.
+    func testPlanAggregatesKeepsDifferentPlansSeparate() async {
+        let fetcher = StubFetcher()
+        let coordinator = makeCoordinator(fetcher: fetcher)
+        let source = RemoteQuotaSourceConfig(id: "s1", name: "Pool", baseURL: "https://a.test")
+        await coordinator.addSource(source, managementKey: "k")
+        await fetcher.enqueue(
+            .success([.claude: [
+                "a": Self.quota(80, plan: "Pro"),
+                "b": Self.quota(20, plan: "Team"),
+                "c": Self.quota(50, plan: "Pro"),
+            ]]),
+            for: "s1"
+        )
+        let model = RemoteQuotaSourceScreenModel(coordinator: coordinator, refreshSettings: makeRefreshSettings())
+        await model.initialize()
+        await waitUntil { (model.visibleProviderQuotas[.claude] ?? [:]).count == 3 }
+
+        let aggregates = model.planAggregates(mode: .lowest)[.claude] ?? [:]
+        // Both plan groups get their own aggregate — "Team" has one account, "Pro" has
+        // two — but they must never merge into each other.
+        XCTAssertEqual(aggregates.count, 2)
+        let proKey = RemoteQuotaAggregateIdentity.storageKey(sourceId: "s1", planKey: "pro")
+        let teamKey = RemoteQuotaAggregateIdentity.storageKey(sourceId: "s1", planKey: "team")
+        XCTAssertEqual(aggregates[proKey]?.accountCount, 2)
+        XCTAssertEqual(aggregates[teamKey]?.accountCount, 1)
+    }
+
+    /// A source hidden past the automatic-failure threshold must not contribute an
+    /// aggregate either — the same visibility rule `visibleProviderQuotas` already
+    /// applies to real accounts.
+    func testPlanAggregatesOmitsDisabledSource() async {
+        let fetcher = StubFetcher()
+        let coordinator = makeCoordinator(fetcher: fetcher)
+        var source = RemoteQuotaSourceConfig(id: "s1", name: "Pool", baseURL: "https://a.test")
+        await coordinator.addSource(source, managementKey: "k")
+        await fetcher.enqueue(
+            .success([.claude: ["a": Self.quota(80, plan: "Pro"), "b": Self.quota(20, plan: "Pro")]]),
+            for: "s1"
+        )
+        let model = RemoteQuotaSourceScreenModel(coordinator: coordinator, refreshSettings: makeRefreshSettings())
+        await model.initialize()
+        await waitUntil { !(model.planAggregates(mode: .lowest)[.claude] ?? [:]).isEmpty }
+
+        source.isEnabled = false
+        await coordinator.updateSource(source, managementKey: nil)
+        await waitUntil { (model.visibleProviderQuotas[.claude] ?? [:]).isEmpty }
+
+        XCTAssertTrue((model.planAggregates(mode: .lowest)[.claude] ?? [:]).isEmpty)
     }
 
     /// Polls a condition that becomes true asynchronously off the coordinator's state
@@ -287,8 +507,8 @@ final class RemoteQuotaSourceScreenModelTests: XCTestCase {
         RefreshSettingsManager(repository: MemoryRefreshPreferencesRepository())
     }
 
-    private static func quota(_ percentage: Double) -> ProviderQuota {
-        ProviderQuota(models: [QuotaMetric(name: "usage", percentage: percentage, resetTime: "")])
+    private static func quota(_ percentage: Double, plan: String? = nil) -> ProviderQuota {
+        ProviderQuota(models: [QuotaMetric(name: "usage", percentage: percentage, resetTime: "")], planType: plan)
     }
 }
 
@@ -323,9 +543,16 @@ private actor StubFetcher: RemoteQuotaSourceFetching {
     }
 
     private var queues: [String: [Outcome]] = [:]
+    /// Source ids in fetch order, so a provider-scoped refresh can be checked for
+    /// reaching exactly the sources that carry that provider.
+    private(set) var fetchedSourceIds: [String] = []
 
     func enqueue(_ outcome: Outcome, for sourceId: String) {
         queues[sourceId, default: []].append(outcome)
+    }
+
+    func resetFetchLog() {
+        fetchedSourceIds = []
     }
 
     func isResponding(_ source: RemoteQuotaSourceConfig, managementKey: String) async -> Bool { true }
@@ -334,6 +561,7 @@ private actor StubFetcher: RemoteQuotaSourceFetching {
         _ source: RemoteQuotaSourceConfig,
         managementKey: String
     ) async throws -> RemoteQuotaPoolFetchResult {
+        fetchedSourceIds.append(source.id)
         guard var queue = queues[source.id], !queue.isEmpty else {
             return RemoteQuotaPoolFetchResult()
         }
@@ -341,7 +569,17 @@ private actor StubFetcher: RemoteQuotaSourceFetching {
         queues[source.id] = queue
         switch outcome {
         case .success(let quotas):
-            return RemoteQuotaPoolFetchResult(quotasByProviderAndPlan: quotas, hasPartialFailure: false)
+            // `.success` represents a fully authoritative listing round, so every
+            // account key handed to `enqueue` is this round's complete roster —
+            // otherwise the coordinator treats an omitted provider as "the listing
+            // said nothing about it" and keeps stale accounts around forever
+            // (see `RemoteQuotaPoolFetchResult.knownAccountKeys`).
+            let knownAccountKeys = quotas.mapValues { Set($0.keys) }
+            return RemoteQuotaPoolFetchResult(
+                quotasByProviderAndAccount: quotas,
+                outcome: .complete,
+                knownAccountKeys: knownAccountKeys
+            )
         case .failure:
             throw StubFetcherError.simulatedFailure
         }

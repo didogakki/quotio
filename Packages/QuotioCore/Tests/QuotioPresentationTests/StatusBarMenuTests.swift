@@ -110,6 +110,242 @@ final class StatusBarMenuSnapshotMapperTests: XCTestCase {
         XCTAssertEqual(snapshot.providers.map(\.provider), [.antigravity, .codex])
         XCTAssertNil(snapshot.selectedProvider)
     }
+
+    /// The dropdown must group by source (local, then each remote source) within one
+    /// provider — never a flat merged list — and a remote account must never be
+    /// confused with a local account that happens to share the same raw key/email.
+    func testMonitorSnapshotGroupsLocalAndRemoteAccountsSeparatelyWithinOneProvider() throws {
+        let sharedRemoteKey = RemoteQuotaAccountIdentity.storageKey(sourceId: "src-1", accountKey: "same@example.com")
+        let quota = QuotaSnapshot(quotas: [
+            .claude: [
+                "same@example.com": ProviderQuota(accountDisplayName: "same@example.com"),
+                sharedRemoteKey: ProviderQuota(accountDisplayName: "same@example.com"),
+            ],
+        ])
+
+        let snapshot = StatusBarMenuSnapshotMapper.makeSnapshot(
+            mode: .monitor,
+            proxyPort: 8317,
+            isProxyRunning: false,
+            tunnel: CloudflareTunnelSnapshot(),
+            directAuthProviders: [.claude],
+            monitorAccounts: [],
+            quota: quota,
+            installedAgents: [],
+            activeAntigravityEmail: nil,
+            menuBarPreferences: MenuBarPreferences(),
+            appearanceMode: .system,
+            language: .english,
+            remoteSourceNames: ["src-1": "My Server"]
+        )
+
+        let claude = try XCTUnwrap(snapshot.providers.first { $0.provider == .claude })
+        XCTAssertEqual(claude.groups.count, 2, "local and remote must be separate groups, never merged")
+        XCTAssertEqual(claude.groups[0].origin, .local)
+        XCTAssertEqual(claude.groups[0].accounts.count, 1)
+        XCTAssertEqual(claude.groups[1].origin, .remote(sourceId: "src-1", sourceName: "My Server"))
+        XCTAssertEqual(claude.groups[1].accounts.count, 1)
+        // Same email on both sides must not collapse into one row.
+        XCTAssertEqual(claude.accounts.count, 2)
+    }
+
+    /// Remote accounts must never drive local refresh/IDE-switch semantics: their
+    /// `isRefreshing`/`isRefreshBlocked` reflect the remote refresh flag passed in, not
+    /// the local provider's `refreshingProviders` set.
+    func testRemoteGroupUsesRemoteRefreshingFlagNotLocalProviderRefreshState() throws {
+        let remoteKey = RemoteQuotaAccountIdentity.storageKey(sourceId: "src-1", accountKey: "acct-a")
+        let quota = QuotaSnapshot(
+            quotas: [.claude: [remoteKey: ProviderQuota(accountDisplayName: "remote@example.com")]],
+            refreshingProviders: []
+        )
+
+        let snapshot = StatusBarMenuSnapshotMapper.makeSnapshot(
+            mode: .monitor,
+            proxyPort: 8317,
+            isProxyRunning: false,
+            tunnel: CloudflareTunnelSnapshot(),
+            directAuthProviders: [.claude],
+            monitorAccounts: [],
+            quota: quota,
+            installedAgents: [],
+            activeAntigravityEmail: nil,
+            menuBarPreferences: MenuBarPreferences(),
+            appearanceMode: .system,
+            language: .english,
+            remoteSourceNames: ["src-1": "My Server"],
+            isRemoteRefreshing: true
+        )
+
+        let claude = try XCTUnwrap(snapshot.providers.first { $0.provider == .claude })
+        let account = try XCTUnwrap(claude.accounts.first)
+        XCTAssertTrue(account.isRefreshing)
+        XCTAssertTrue(account.isRefreshBlocked)
+        XCTAssertEqual(account.origin, .remote(sourceId: "src-1", sourceName: "My Server"))
+    }
+
+    /// A remote account hidden from the dropdown must disappear from this listing —
+    /// while `quota.quotas` (the dictionary fetch/refresh/CompositionRoot's own merge
+    /// still see) is untouched, since the filter only ever runs on the copy the mapper
+    /// builds groups from. The hidden set is keyed by the same `MenuBarQuotaItem.id`
+    /// the dropdown's own toggle button computes from an `AccountRowData`.
+    func testHiddenRemoteAccountIsExcludedFromItsProviderGroup() throws {
+        let visibleKey = RemoteQuotaAccountIdentity.storageKey(sourceId: "src-1", accountKey: "visible")
+        let hiddenKey = RemoteQuotaAccountIdentity.storageKey(sourceId: "src-1", accountKey: "hidden")
+        let quota = QuotaSnapshot(quotas: [
+            .claude: [
+                visibleKey: ProviderQuota(accountDisplayName: "visible@example.com"),
+                hiddenKey: ProviderQuota(accountDisplayName: "hidden@example.com"),
+            ],
+        ])
+        let hiddenItemId = MenuBarQuotaItem(provider: "claude", accountKey: hiddenKey, sourceConfigId: "src-1").id
+
+        let snapshot = StatusBarMenuSnapshotMapper.makeSnapshot(
+            mode: .monitor,
+            proxyPort: 8317,
+            isProxyRunning: false,
+            tunnel: CloudflareTunnelSnapshot(),
+            directAuthProviders: [.claude],
+            monitorAccounts: [],
+            quota: quota,
+            installedAgents: [],
+            activeAntigravityEmail: nil,
+            menuBarPreferences: MenuBarPreferences(),
+            appearanceMode: .system,
+            language: .english,
+            remoteSourceNames: ["src-1": "My Server"],
+            hiddenDropdownKeys: [hiddenItemId]
+        )
+
+        let claude = try XCTUnwrap(snapshot.providers.first { $0.provider == .claude })
+        XCTAssertEqual(claude.accounts.map(\.email), ["visible@example.com"])
+        // The dictionary itself must still carry both entries — only the mapper's own
+        // output is filtered, never the source data fetch/refresh reads.
+        XCTAssertEqual(quota.quotas[.claude]?.count, 2)
+    }
+
+    /// When every account in a remote source's group is hidden, that source must
+    /// contribute no group at all — never an empty one.
+    func testSourceWithEveryAccountHiddenContributesNoGroup() throws {
+        let hiddenKey = RemoteQuotaAccountIdentity.storageKey(sourceId: "src-1", accountKey: "hidden")
+        let quota = QuotaSnapshot(quotas: [
+            .claude: [
+                "local-key": ProviderQuota(accountDisplayName: "local@example.com"),
+                hiddenKey: ProviderQuota(accountDisplayName: "hidden@example.com"),
+            ],
+        ])
+        let hiddenItemId = MenuBarQuotaItem(provider: "claude", accountKey: hiddenKey, sourceConfigId: "src-1").id
+
+        let snapshot = StatusBarMenuSnapshotMapper.makeSnapshot(
+            mode: .monitor,
+            proxyPort: 8317,
+            isProxyRunning: false,
+            tunnel: CloudflareTunnelSnapshot(),
+            directAuthProviders: [.claude],
+            monitorAccounts: [],
+            quota: quota,
+            installedAgents: [],
+            activeAntigravityEmail: nil,
+            menuBarPreferences: MenuBarPreferences(),
+            appearanceMode: .system,
+            language: .english,
+            remoteSourceNames: ["src-1": "My Server"],
+            hiddenDropdownKeys: [hiddenItemId]
+        )
+
+        let claude = try XCTUnwrap(snapshot.providers.first { $0.provider == .claude })
+        XCTAssertEqual(claude.groups.count, 1, "the fully-hidden remote source must not appear as an empty group")
+        XCTAssertEqual(claude.groups[0].origin, .local)
+    }
+
+    /// A raw account key/email that happens to also appear (verbatim, with no provider
+    /// namespacing) in `hiddenDropdownKeys` must never accidentally match — entries only
+    /// ever match by the full `MenuBarQuotaItem.id`, so a bare string collision is inert.
+    func testRawKeyInHiddenSetNeverAccidentallyMatchesAnAccount() throws {
+        let quota = QuotaSnapshot(quotas: [
+            .claude: ["local-key": ProviderQuota(accountDisplayName: "local@example.com")],
+        ])
+
+        let snapshot = StatusBarMenuSnapshotMapper.makeSnapshot(
+            mode: .monitor,
+            proxyPort: 8317,
+            isProxyRunning: false,
+            tunnel: CloudflareTunnelSnapshot(),
+            directAuthProviders: [.claude],
+            monitorAccounts: [],
+            quota: quota,
+            installedAgents: [],
+            activeAntigravityEmail: nil,
+            menuBarPreferences: MenuBarPreferences(),
+            appearanceMode: .system,
+            language: .english,
+            hiddenDropdownKeys: ["local-key"]
+        )
+
+        let claude = try XCTUnwrap(snapshot.providers.first { $0.provider == .claude })
+        XCTAssertEqual(claude.accounts.map(\.email), ["local@example.com"])
+    }
+
+    /// Local accounts now get the same dropdown-visibility filter as remote ones, keyed
+    /// by their own `MenuBarQuotaItem.id` (provider + raw account key, no source id).
+    func testHiddenDropdownKeyFiltersALocalAccountToo() throws {
+        let quota = QuotaSnapshot(quotas: [
+            .claude: [
+                "visible-key": ProviderQuota(accountDisplayName: "visible@example.com"),
+                "hidden-key": ProviderQuota(accountDisplayName: "hidden@example.com"),
+            ],
+        ])
+        let hiddenItemId = MenuBarQuotaItem(provider: "claude", accountKey: "hidden-key").id
+
+        let snapshot = StatusBarMenuSnapshotMapper.makeSnapshot(
+            mode: .monitor,
+            proxyPort: 8317,
+            isProxyRunning: false,
+            tunnel: CloudflareTunnelSnapshot(),
+            directAuthProviders: [.claude],
+            monitorAccounts: [],
+            quota: quota,
+            installedAgents: [],
+            activeAntigravityEmail: nil,
+            menuBarPreferences: MenuBarPreferences(),
+            appearanceMode: .system,
+            language: .english,
+            hiddenDropdownKeys: [hiddenItemId]
+        )
+
+        let claude = try XCTUnwrap(snapshot.providers.first { $0.provider == .claude })
+        XCTAssertEqual(claude.accounts.map(\.email), ["visible@example.com"])
+    }
+
+    /// The same raw account key hidden under one provider must not hide the equivalent
+    /// key under a different provider — `MenuBarQuotaItem.id` namespaces by provider.
+    func testHidingALocalAccountUnderOneProviderDoesNotHideItUnderAnother() throws {
+        let quota = QuotaSnapshot(quotas: [
+            .claude: ["shared-key": ProviderQuota(accountDisplayName: "shared@example.com")],
+            .codex: ["shared-key": ProviderQuota(accountDisplayName: "shared@example.com")],
+        ])
+        let hiddenItemId = MenuBarQuotaItem(provider: "claude", accountKey: "shared-key").id
+
+        let snapshot = StatusBarMenuSnapshotMapper.makeSnapshot(
+            mode: .monitor,
+            proxyPort: 8317,
+            isProxyRunning: false,
+            tunnel: CloudflareTunnelSnapshot(),
+            directAuthProviders: [.claude, .codex],
+            monitorAccounts: [],
+            quota: quota,
+            installedAgents: [],
+            activeAntigravityEmail: nil,
+            menuBarPreferences: MenuBarPreferences(),
+            appearanceMode: .system,
+            language: .english,
+            hiddenDropdownKeys: [hiddenItemId]
+        )
+
+        let claude = try XCTUnwrap(snapshot.providers.first { $0.provider == .claude })
+        let codex = try XCTUnwrap(snapshot.providers.first { $0.provider == .codex })
+        XCTAssertTrue(claude.accounts.isEmpty)
+        XCTAssertEqual(codex.accounts.map(\.email), ["shared@example.com"])
+    }
 }
 
 @MainActor
@@ -132,6 +368,39 @@ final class StatusBarMenuRendererTests: XCTestCase {
         XCTAssertEqual(unfilteredMenu.items.filter(\.isSeparatorItem).count, 4)
         XCTAssertEqual(filteredMenu.items.count, 7)
         XCTAssertEqual(filteredMenu.items.filter(\.isSeparatorItem).count, 3)
+    }
+
+    /// Filtering to one provider must still keep local and remote accounts grouped by
+    /// source — a single-provider filter must not silently collapse a source's own
+    /// sub-header back into an undifferentiated list.
+    func testSingleProviderFilterStillShowsSourceSubheadersWhenMultipleSourcesArePresent() {
+        let remoteKey = RemoteQuotaAccountIdentity.storageKey(sourceId: "src-1", accountKey: "acct-a")
+        let snapshot = StatusBarMenuSnapshotMapper.makeSnapshot(
+            mode: .monitor,
+            proxyPort: 8317,
+            isProxyRunning: false,
+            tunnel: CloudflareTunnelSnapshot(),
+            directAuthProviders: [.claude],
+            monitorAccounts: [],
+            quota: QuotaSnapshot(quotas: [
+                .claude: [
+                    "local-key": ProviderQuota(accountDisplayName: "local@example.com"),
+                    remoteKey: ProviderQuota(accountDisplayName: "remote@example.com"),
+                ],
+            ]),
+            installedAgents: [],
+            activeAntigravityEmail: nil,
+            menuBarPreferences: MenuBarPreferences(selectedProvider: .claude),
+            appearanceMode: .system,
+            language: .english,
+            remoteSourceNames: ["src-1": "My Server"]
+        )
+
+        let menu = StatusBarMenuRenderer(snapshot: snapshot, commands: makeNoopDispatcher()).buildMenu()
+
+        // Header + separator + picker + separator + [subheader, account] x2 + separator + actions
+        // = 2 (header) + 2 (picker) + 4 (subheaders+accounts) + 1 (separator) + 1 (actions) = 10
+        XCTAssertEqual(menu.items.count, 10)
     }
 
     private func makeSnapshot(selectedProvider: QuotaProvider?) -> StatusBarMenuSnapshot {

@@ -13,7 +13,8 @@ public actor RemoteQuotaSourceCoordinator {
     public struct State: Equatable, Sendable {
         public var sources: [RemoteQuotaSourceConfig]
         public var statuses: [String: RemoteQuotaSourceConnectionStatus]
-        /// sourceId -> provider -> normalized plan key -> aggregated pool quota.
+        /// sourceId -> provider -> raw remote account key -> that account's own quota
+        /// (never a plan-level aggregate).
         public var poolQuotas: [String: [QuotaProvider: [String: ProviderQuota]]]
         public var failureCounts: [String: Int]
         public var lastUpdated: [String: Date]
@@ -164,19 +165,41 @@ public actor RemoteQuotaSourceCoordinator {
         publish()
         do {
             let result = try await fetcher.fetchPool(source, managementKey: key)
-            // Merge only the groups that succeeded this round on top of the last-known-good
-            // reading; a provider/plan absent from `result` (because every account in that
-            // group failed) keeps its previous value instead of disappearing.
+            // Merge only the accounts that succeeded this round on top of the last-known-good
+            // reading; a provider/account absent from `result` (because that account's
+            // fetch failed) keeps its previous value instead of disappearing.
             var pools = state.poolQuotas[sourceId] ?? [:]
-            for (provider, planGroups) in result.quotasByProviderAndPlan {
-                pools[provider, default: [:]].merge(planGroups) { _, new in new }
+            for (provider, accountQuotas) in result.quotasByProviderAndAccount {
+                pools[provider, default: [:]].merge(accountQuotas) { _, new in new }
+            }
+            // `knownAccountKeys` is this round's authoritative listing (a listing that
+            // could not be obtained throws instead of returning a result), so every
+            // provider it mentions is pruned down to exactly the accounts that still
+            // exist — including down to nothing, which drops the provider entirely.
+            // This runs for a failed round too: quota requests failing says nothing
+            // about which accounts exist. A provider the listing says nothing about is
+            // left untouched, as is an account that is still listed but whose own quota
+            // request merely failed (it keeps its last-known-good reading).
+            for (provider, knownKeys) in result.knownAccountKeys {
+                guard let existing = pools[provider] else { continue }
+                let retained = existing.filter { knownKeys.contains($0.key) }
+                if retained.isEmpty {
+                    pools.removeValue(forKey: provider)
+                } else {
+                    pools[provider] = retained
+                }
             }
             state.poolQuotas[sourceId] = pools
-            state.statuses[sourceId] = result.hasPartialFailure
-                ? .error(RemoteQuotaSourceFailure.partialFailure.localizationKey)
-                : .connected
+            if let failureKey = result.failureLocalizationKey {
+                state.statuses[sourceId] = .error(failureKey)
+            } else {
+                state.statuses[sourceId] = .connected
+            }
+            // The server was reached and its account list read, so this is genuinely
+            // when the source was last synchronized — even if some or all of its quota
+            // requests failed (which the error status above already reports).
             state.lastUpdated[sourceId] = clock.now()
-            recordOutcome(sourceId: sourceId, succeeded: !result.hasPartialFailure, isAutomatic: isAutomatic)
+            recordOutcome(sourceId: sourceId, succeeded: !result.isFailure, isAutomatic: isAutomatic)
             persistSnapshot()
         } catch {
             // Keep the last successful pool reading — never overwrite it with a failure.

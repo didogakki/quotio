@@ -80,6 +80,22 @@ final class AccountSortingTests: XCTestCase {
         ProviderQuota(accountDisplayName: displayName)
     }
 
+    /// All test quotas here are local (no `RemoteQuotaAccountIdentity` keys), so
+    /// `accountGroups` always yields exactly one `.local` group; this unwraps it to
+    /// keep every existing assertion about ordering unchanged.
+    private func localOrderedAccounts(
+        _ quotas: [String: ProviderQuota],
+        provider: QuotaProvider,
+        activeAntigravityEmail: String?
+    ) -> [(accountKey: String, email: String, data: ProviderQuota)] {
+        StatusBarMenuSnapshotMapper.accountGroups(
+            quotas,
+            provider: provider,
+            activeAntigravityEmail: activeAntigravityEmail,
+            remoteSourceNames: [:]
+        ).first?.accounts ?? []
+    }
+
     func testMenuBarFloatsActiveAntigravityAccountToTop() {
         let quotas: [String: ProviderQuota] = [
             "alpha@example.com": quota(displayName: "alpha@example.com"),
@@ -87,7 +103,7 @@ final class AccountSortingTests: XCTestCase {
             "charlie@example.com": quota(displayName: "charlie@example.com")
         ]
 
-        let ordered = StatusBarMenuSnapshotMapper.orderedAccounts(
+        let ordered = localOrderedAccounts(
             quotas,
             provider: .antigravity,
             activeAntigravityEmail: "charlie@example.com"
@@ -107,7 +123,7 @@ final class AccountSortingTests: XCTestCase {
             "bravo@example.com": quota(displayName: "bravo@example.com")
         ]
 
-        let ordered = StatusBarMenuSnapshotMapper.orderedAccounts(
+        let ordered = localOrderedAccounts(
             quotas,
             provider: .antigravity,
             activeAntigravityEmail: nil
@@ -128,7 +144,7 @@ final class AccountSortingTests: XCTestCase {
 
         // The same email may exist on another provider; the Antigravity "in use in the
         // IDE" signal must not reorder that provider's list.
-        let ordered = StatusBarMenuSnapshotMapper.orderedAccounts(
+        let ordered = localOrderedAccounts(
             quotas,
             provider: .claude,
             activeAntigravityEmail: "charlie@example.com"
@@ -146,7 +162,7 @@ final class AccountSortingTests: XCTestCase {
             "zulu@example.com": quota(displayName: nil)
         ]
 
-        let ordered = StatusBarMenuSnapshotMapper.orderedAccounts(
+        let ordered = localOrderedAccounts(
             quotas,
             provider: .antigravity,
             activeAntigravityEmail: "zulu@example.com"
@@ -157,7 +173,7 @@ final class AccountSortingTests: XCTestCase {
     }
 
     func testMenuBarEmptyQuotasProduceNoRows() {
-        let ordered = StatusBarMenuSnapshotMapper.orderedAccounts(
+        let ordered = localOrderedAccounts(
             [:],
             provider: .antigravity,
             activeAntigravityEmail: "active@example.com"

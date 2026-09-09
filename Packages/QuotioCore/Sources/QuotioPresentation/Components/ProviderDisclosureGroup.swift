@@ -30,6 +30,20 @@ struct ProviderDisclosureGroup: View {
         accounts.allSatisfy { $0.source == .autoDetected }
     }
 
+    /// Real account count for the header badge. Excludes plan-aggregate rows, which are
+    /// a derived summary of the real accounts already counted here — not accounts of
+    /// their own.
+    private var realAccountCount: Int {
+        accounts.filter { !$0.source.isAggregate }.count
+    }
+
+    /// Whether this row is one real account fetched from a configured remote quota
+    /// source — the only kind of row ever nested beneath a plan-aggregate row.
+    private func isRemoteQuotaSourceRow(_ account: AccountRowData) -> Bool {
+        if case .remoteQuotaSource = account.source { return true }
+        return false
+    }
+
     /// Accounts with the ones currently in use floated to the top,
     /// keeping the existing order as the tie-breaker.
     private var displayedAccounts: [AccountRowData] {
@@ -51,7 +65,11 @@ struct ProviderDisclosureGroup: View {
                         : nil,
                     isActiveInIDE: isAccountActive?(account) ?? false
                 )
-                .padding(.leading, 4)
+                // A plan-aggregate row stays at the group's base indent, like a
+                // sub-header; the real remote accounts it summarizes sit one step
+                // further in, so the "aggregate → real accounts" hierarchy reads
+                // without needing a different font or row layout.
+                .padding(.leading, isRemoteQuotaSourceRow(account) ? 16 : 4)
             }
         } label: {
             providerHeader
@@ -70,7 +88,7 @@ struct ProviderDisclosureGroup: View {
                 .fontWeight(.medium)
             
             // Account count badge
-            Text("\(accounts.count)")
+            Text("\(realAccountCount)")
                 .font(.caption2)
                 .fontWeight(.semibold)
                 .padding(.horizontal, 6)

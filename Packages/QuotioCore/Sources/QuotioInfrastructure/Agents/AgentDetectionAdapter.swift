@@ -37,15 +37,18 @@ public struct AgentBinaryInstallationProbe: Sendable {
     private let homeDirectory: String
     private let environment: [String: String]
     private let commandRunner: CommandRunner
+    private let binarySearchPaths: [String]
 
     public init(
         homeDirectory: String = FileManager.default.homeDirectoryForCurrentUser.path,
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        commandRunner: @escaping CommandRunner = AgentDetectionAdapter.runCommand
+        commandRunner: @escaping CommandRunner = AgentDetectionAdapter.runCommand,
+        binarySearchPaths: [String]? = nil
     ) {
         self.homeDirectory = homeDirectory
         self.environment = environment
         self.commandRunner = commandRunner
+        self.binarySearchPaths = binarySearchPaths ?? Self.commonBinaryPaths
     }
 
     public func isInstalled(_ agent: CLIAgent) -> Bool {
@@ -69,7 +72,7 @@ public struct AgentBinaryInstallationProbe: Sendable {
            !path.isEmpty {
             return path
         }
-        for basePath in Self.commonBinaryPaths {
+        for basePath in binarySearchPaths {
             let path = expand(basePath) + "/" + name
             if fileManager.isExecutableFile(atPath: path) { return path }
         }
@@ -130,7 +133,8 @@ public actor AgentDetectionAdapter: AgentDetecting {
         environment: [String: String] = ProcessInfo.processInfo.environment,
         defaultsSuiteName: String? = nil,
         now: @escaping @Sendable () -> Date = Date.init,
-        commandRunner: @escaping CommandRunner = AgentDetectionAdapter.runCommand
+        commandRunner: @escaping CommandRunner = AgentDetectionAdapter.runCommand,
+        binarySearchPaths: [String]? = nil
     ) {
         self.homeDirectory = homeDirectory
         self.defaults = defaultsSuiteName.flatMap(UserDefaults.init(suiteName:)) ?? .standard
@@ -139,7 +143,8 @@ public actor AgentDetectionAdapter: AgentDetecting {
         self.installationProbe = AgentBinaryInstallationProbe(
             homeDirectory: homeDirectory,
             environment: environment,
-            commandRunner: commandRunner
+            commandRunner: commandRunner,
+            binarySearchPaths: binarySearchPaths
         )
     }
 

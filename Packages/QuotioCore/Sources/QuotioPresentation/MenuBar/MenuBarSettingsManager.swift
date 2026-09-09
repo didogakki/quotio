@@ -455,16 +455,95 @@ public final class MenuBarSettingsManager {
         didSet { persist() }
     }
 
+    /// Per-account `MenuBarQuotaItem.id`s the user turned off while the account was
+    /// covered only by a legacy pool pin. A pool pin expands dynamically into whatever
+    /// real accounts its source currently reports, so there is no per-account entry in
+    /// `selectedItems` to remove — the deselection is recorded here instead, and the
+    /// expansion skips it. Kept out of `selectedItems` so `menuBarMaxItems` truncation
+    /// can never silently re-select an account the user turned off.
+    public private(set) var deselectedPoolAccounts: Set<String> {
+        didSet { persist() }
+    }
+
+    /// `MenuBarQuotaItem.id`-shaped keys hidden from the menu bar's per-provider dropdown
+    /// account list — local and remote accounts alike. Purely a display filter — never
+    /// touches `selectedItems`, never disables fetching. See
+    /// `MenuBarPreferences.hiddenDropdownKeys` for the full rationale.
+    public private(set) var hiddenDropdownKeys: Set<String> {
+        didSet { persist() }
+    }
+
+    /// Every real remote account `RemoteQuotaSourceScreenModel` reported as visible in
+    /// its most recent sync, refreshed by `syncKnownRemoteAccountItems` after every
+    /// remote refresh. Used only to tell whether a legacy pool pin (`accountKey ==
+    /// "__pool__"`) still covers at least one real account — never to prune or mutate
+    /// `selectedItems`/`deselectedPoolAccounts`, so a transient remote fetch failure can
+    /// never delete a user's pin or change what a pool dynamically covers once it
+    /// recovers. `nil` means "no remote sync has happened yet in this process" and is
+    /// deliberately distinct from an empty array: without that distinction, a cold
+    /// launch (before the first remote refresh completes) would look identical to every
+    /// pool genuinely having zero accounts, and would incorrectly free up capacity that
+    /// isn't really available yet.
+    @ObservationIgnored private var knownRemoteAccountItems: [MenuBarQuotaItem]?
+
+    /// Feeds the latest known set of real remote accounts, keyed exactly as
+    /// `AccountRowData.menuBarItem` builds them, so `effectiveSelectedItemCount` can
+    /// tell a legacy pool pin apart from one that no longer covers anything real.
+    public func syncKnownRemoteAccountItems(_ items: [MenuBarQuotaItem]) {
+        knownRemoteAccountItems = items
+    }
+
+    /// Whether `item` (assumed to be a legacy pool pin) currently expands into at least
+    /// one real, non-excluded account. A pool this manager has never received a remote
+    /// sync for yet is assumed non-empty (see `knownRemoteAccountItems`).
+    private func poolPinIsCurrentlyEmpty(_ item: MenuBarQuotaItem) -> Bool {
+        guard let knownRemoteAccountItems else { return false }
+        let coverage = knownRemoteAccountItems.filter {
+            $0.sourceConfigId == item.sourceConfigId && $0.provider == item.provider
+        }
+        return !coverage.contains { poolExpansionIncludes($0) }
+    }
+
+    /// The number of `selectedItems` that actually occupy a `menuBarMaxItems` slot right
+    /// now. Every ordinary pin (local, remote per-account, or aggregate) always counts
+    /// as one. A legacy pool pin only counts while it still covers at least one real
+    /// account — once every account it would have covered has been individually turned
+    /// off, or its source now reports none at all, it stops reserving a slot exactly as
+    /// if the user had unpinned it. Without this, several stale, fully-excluded pool
+    /// pins could permanently occupy every slot and block all future selection even
+    /// though the menu bar renders nothing for them.
+    private var effectiveSelectedItemCount: Int {
+        selectedItems.filter { !$0.isPool || !poolPinIsCurrentlyEmpty($0) }.count
+    }
+
     /// Check if adding another item would exceed the warning threshold
     /// Warning shows when approaching the limit (at maxItems - 1)
     public var shouldWarnOnAdd: Bool {
         let threshold = max(menuBarMaxItems - 1, 1)
-        return selectedItems.count >= threshold && selectedItems.count < menuBarMaxItems
+        let count = effectiveSelectedItemCount
+        return count >= threshold && count < menuBarMaxItems
     }
 
     /// Check if selection has reached the maximum items
     public var isAtMaxItems: Bool {
-        selectedItems.count >= menuBarMaxItems
+        effectiveSelectedItemCount >= menuBarMaxItems
+    }
+
+    /// Whether toggling `item` on right now would occupy a menu bar slot that isn't
+    /// already occupied — i.e. whether `isAtMaxItems`/`shouldWarnOnAdd` are relevant to
+    /// this particular toggle. False when turning an item off (always allowed), and
+    /// false when restoring a pool-covered account whose pool pin already occupies a
+    /// slot (the pool's single slot doesn't grow with the number of accounts it
+    /// covers). True for a brand new pin, and true for restoring a pool-covered account
+    /// whose pool pin is currently empty — that restoration is what turns the pool from
+    /// occupying zero slots to occupying one.
+    public func toggleWouldOccupyNewSlot(_ item: MenuBarQuotaItem) -> Bool {
+        if isSelected(item) { return false }
+        guard isCoveredByPoolPin(item) else { return true }
+        guard let poolItem = selectedItems.first(where: {
+            $0.isPool && $0.sourceConfigId == item.sourceConfigId && $0.provider == item.provider
+        }) else { return false }
+        return poolPinIsCurrentlyEmpty(poolItem)
     }
 
     public var preferences: MenuBarPreferences {
@@ -481,10 +560,12 @@ public final class MenuBarSettingsManager {
             hideSensitiveInfo: hideSensitiveInfo,
             totalUsageMode: totalUsageMode,
             modelAggregationMode: modelAggregationMode,
-            hasUserModifiedMenuBar: hasUserModifiedMenuBar
+            hasUserModifiedMenuBar: hasUserModifiedMenuBar,
+            deselectedPoolAccounts: deselectedPoolAccounts,
+            hiddenDropdownKeys: hiddenDropdownKeys
         )
     }
-    
+
     public init(repository: any MenuBarPreferencesRepository) {
         self.repository = repository
         let preferences = repository.load()
@@ -501,6 +582,8 @@ public final class MenuBarSettingsManager {
         self.totalUsageMode = preferences.totalUsageMode
         self.modelAggregationMode = preferences.modelAggregationMode
         self.hasUserModifiedMenuBar = preferences.hasUserModifiedMenuBar
+        self.deselectedPoolAccounts = preferences.deselectedPoolAccounts
+        self.hiddenDropdownKeys = preferences.hiddenDropdownKeys
     }
 
     public func setDidChangeHandler(_ handler: (@MainActor (MenuBarPreferences) -> Void)?) {
@@ -512,8 +595,10 @@ public final class MenuBarSettingsManager {
     }
     
     public func addItem(_ item: MenuBarQuotaItem) {
-        guard !selectedItems.contains(item) else { return }
-        guard selectedItems.count < menuBarMaxItems else { return }
+        // `isSelected` — not `contains` — so an account already covered by a legacy
+        // pool pin is never added a second time, which would render it twice.
+        guard !isSelected(item) else { return }
+        guard effectiveSelectedItemCount < menuBarMaxItems else { return }
         if !showQuotaInMenuBar {
             showQuotaInMenuBar = true
         }
@@ -529,21 +614,89 @@ public final class MenuBarSettingsManager {
         hasUserModifiedMenuBar = true
     }
 
-    /// Check if item is selected
+    /// Check if item is selected — either pinned in its own right, or covered by a
+    /// legacy pool pin for the same source and provider and not individually turned off.
     public func isSelected(_ item: MenuBarQuotaItem) -> Bool {
-        selectedItems.contains(item)
+        if selectedItems.contains(item) { return true }
+        guard isCoveredByPoolPin(item) else { return false }
+        return !deselectedPoolAccounts.contains(item.id)
+    }
+
+    /// Whether this per-account remote item is one a currently-pinned legacy pool item
+    /// expands into. Pool pins are scoped to one source + provider and cover whatever
+    /// accounts that source reports, so coverage is decided by those two fields alone.
+    /// A plan aggregate's own pin is deliberately excluded (`!item.isAggregate`) — the
+    /// legacy pool-expansion mechanism only ever expands into real accounts, and an
+    /// aggregate must never be mistaken for one of them just because both happen to be
+    /// unpinned items under the same source and provider.
+    public func isCoveredByPoolPin(_ item: MenuBarQuotaItem) -> Bool {
+        guard !item.isPool, !item.isAggregate, let sourceId = item.sourceConfigId else { return false }
+        return selectedItems.contains {
+            $0.isPool && $0.sourceConfigId == sourceId && $0.provider == item.provider
+        }
+    }
+
+    /// Whether `itemId` (an account row's own `menuBarItem.id`) is currently hidden from
+    /// the menu bar's per-provider dropdown account list.
+    public func isHiddenFromDropdown(_ itemId: String) -> Bool {
+        hiddenDropdownKeys.contains(itemId)
+    }
+
+    /// Toggles whether `itemId` shows up in the menu bar's per-provider dropdown account
+    /// list. Purely a display filter: it never touches `selectedItems`/pins and never
+    /// affects fetching, so a hidden account keeps refreshing and keeps its pin (if any)
+    /// working exactly as before.
+    public func toggleDropdownVisibility(_ itemId: String) {
+        if hiddenDropdownKeys.contains(itemId) {
+            hiddenDropdownKeys.remove(itemId)
+        } else {
+            hiddenDropdownKeys.insert(itemId)
+        }
+    }
+
+    /// Whether a legacy pool pin's dynamic expansion should include this account: it
+    /// must not have been individually turned off, and must not already be pinned in
+    /// its own right — otherwise the same account would render twice.
+    public func poolExpansionIncludes(_ item: MenuBarQuotaItem) -> Bool {
+        !deselectedPoolAccounts.contains(item.id) && !selectedItems.contains(item)
     }
 
     /// Toggle item selection (marks as user-modified to prevent auto-add)
     public func toggleItem(_ item: MenuBarQuotaItem) {
         hasUserModifiedMenuBar = true
-        if isSelected(item) {
+        if selectedItems.contains(item) {
             selectedItems.removeAll { $0.id == item.id }
-        } else {
-            addItem(item)
+            // A legacy state can have both an explicit pin and a covering pool pin for
+            // the same account at once. Removing only the explicit entry would leave the
+            // pool pin's dynamic expansion covering it again on the very next read, so the
+            // toggle would appear to do nothing. Record the exclusion too whenever the
+            // pool would otherwise immediately re-select this account.
+            if isCoveredByPoolPin(item) {
+                deselectedPoolAccounts.insert(item.id)
+            }
+            return
         }
+        // Covered by a legacy pool pin: there is no per-account entry to add or remove,
+        // so the choice is recorded as a persistent exclusion instead. That keeps the
+        // pool pin's "whatever this source currently has" coverage intact for every
+        // other account, including ones that appear later.
+        if isCoveredByPoolPin(item) {
+            if deselectedPoolAccounts.contains(item.id) {
+                // If the pool pin is currently empty, restoring this account is what
+                // makes it start occupying a slot again — apply the same capacity guard
+                // `addItem` uses so this can't push the effective count past the cap.
+                if toggleWouldOccupyNewSlot(item), effectiveSelectedItemCount >= menuBarMaxItems {
+                    return
+                }
+                deselectedPoolAccounts.remove(item.id)
+            } else {
+                deselectedPoolAccounts.insert(item.id)
+            }
+            return
+        }
+        addItem(item)
     }
-    
+
     /// Remove items that no longer exist in quota data
     public func pruneInvalidItems(validItems: [MenuBarQuotaItem]) {
         let validIds = Set(validItems.map(\.id))
@@ -558,17 +711,36 @@ public final class MenuBarSettingsManager {
         let existingIds = Set(selectedItems.map(\.id))
         let newItems = availableItems.filter { !existingIds.contains($0.id) }
 
-        let remainingSlots = menuBarMaxItems - selectedItems.count
+        let remainingSlots = menuBarMaxItems - effectiveSelectedItemCount
         if remainingSlots > 0 {
             let itemsToAdd = Array(newItems.prefix(remainingSlots))
             selectedItems.append(contentsOf: itemsToAdd)
         }
     }
 
+    /// Trims `selectedItems` down to `menuBarMaxItems` by *effective* occupancy, not raw
+    /// count: a legacy pool pin that currently covers no real account (see
+    /// `poolPinIsCurrentlyEmpty`) never counts against the cap and is never dropped here,
+    /// so it survives as a dead placeholder ready to reserve a slot again once its source
+    /// reports a real account. Trimming raw entries beyond the cap would otherwise
+    /// silently discard a newer pin (e.g. a freshly-added plan aggregate) whenever
+    /// earlier, currently-empty pool pins pad out the raw array past `menuBarMaxItems`
+    /// even though they occupy no slot.
     @discardableResult
     private func enforceMaxItems() -> Bool {
-        guard selectedItems.count > menuBarMaxItems else { return false }
-        selectedItems = Array(selectedItems.prefix(menuBarMaxItems))
+        guard effectiveSelectedItemCount > menuBarMaxItems else { return false }
+        var kept: [MenuBarQuotaItem] = []
+        var occupied = 0
+        for item in selectedItems {
+            let occupiesSlot = !item.isPool || !poolPinIsCurrentlyEmpty(item)
+            if occupiesSlot {
+                guard occupied < menuBarMaxItems else { continue }
+                occupied += 1
+            }
+            kept.append(item)
+        }
+        guard kept.count != selectedItems.count else { return false }
+        selectedItems = kept
         return true
     }
 

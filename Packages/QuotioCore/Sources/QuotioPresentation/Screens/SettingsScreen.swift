@@ -2859,16 +2859,9 @@ struct RemoteQuotaSourcesSection: View {
 private struct RemoteQuotaSourceRow: View {
     let source: RemoteQuotaSourceConfig
     @Environment(RemoteQuotaSourceScreenModel.self) private var model
-    @Environment(MenuBarSettingsManager.self) private var menuBarSettings
 
     private var status: RemoteQuotaSourceConnectionStatus {
         model.statuses[source.id] ?? .unknown
-    }
-
-    /// Providers this source currently has pooled quota data for — each gets its own
-    /// menu bar pin, since a source can expose Claude, Codex, and Grok pools at once.
-    private var pooledProviders: [QuotaProvider] {
-        (model.poolQuotas[source.id]?.keys).map { Array($0).sorted { $0.rawValue < $1.rawValue } } ?? []
     }
 
     var body: some View {
@@ -2893,22 +2886,6 @@ private struct RemoteQuotaSourceRow: View {
             Text(status.displayText)
                 .font(.caption)
                 .foregroundStyle(status.color)
-
-            ForEach(pooledProviders) { provider in
-                let item = MenuBarQuotaItem(
-                    provider: provider.rawValue,
-                    accountKey: RemoteQuotaPoolIdentity.accountKey,
-                    sourceConfigId: source.id
-                )
-                Button {
-                    menuBarSettings.toggleItem(item)
-                } label: {
-                    Image(systemName: menuBarSettings.isSelected(item) ? "pin.fill" : "pin")
-                        .foregroundStyle(menuBarSettings.isSelected(item) ? Color.accentColor : Color.secondary)
-                }
-                .buttonStyle(.plain)
-                .help(provider.displayName)
-            }
 
             Button {
                 Task { await model.refresh(sourceId: source.id) }

@@ -9240,6 +9240,35 @@
         }
       }
     },
+    "menubar.source.local" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Local"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Local"
+          }
+        },
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cục bộ"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "本地"
+          }
+        }
+      }
+    },
     "menubar.hint" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -12133,6 +12162,64 @@
         }
       }
     },
+    "providers.aggregate.planUnknown" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Unknown"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Inconnu"
+          }
+        },
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Không xác định"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未知"
+          }
+        }
+      }
+    },
+    "providers.aggregate.rowTitle" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ (Combined) · Accounts: %d"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ (Cumulé) · Comptes : %d"
+          }
+        },
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ (Tổng hợp) · Tài khoản: %d"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 综合 · 账户数：%d"
+          }
+        }
+      }
+    },
     "providers.disable" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -12187,6 +12274,64 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "已禁用"
+          }
+        }
+      }
+    },
+    "providers.dropdown.hide" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hide from Dropdown"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Masquer du menu déroulant"
+          }
+        },
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ẩn khỏi danh sách thả xuống"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "从下拉列表隐藏"
+          }
+        }
+      }
+    },
+    "providers.dropdown.show" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Show in Dropdown"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Afficher dans le menu déroulant"
+          }
+        },
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hiện trong danh sách thả xuống"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在下拉列表中显示"
           }
         }
       }
@@ -12721,6 +12866,10 @@
     "remote.quotaSource.error.noSupportedReadyFiles" : {"localizations" : {"en" : {"stringUnit" : {"state" : "translated", "value" : "No supported accounts are ready yet"}}, "fr" : {"stringUnit" : {"state" : "translated", "value" : "Aucun compte pris en charge n'est encore prêt"}}, "vi" : {"stringUnit" : {"state" : "translated", "value" : "Chưa có tài khoản được hỗ trợ nào sẵn sàng"}}, "zh-Hans" : {"stringUnit" : {"state" : "translated", "value" : "没有可用的受支持账户，请检查已就绪的账户"}}}},
     "remote.quotaSource.error.allRequestsFailed" : {"localizations" : {"en" : {"stringUnit" : {"state" : "translated", "value" : "All account requests failed"}}, "fr" : {"stringUnit" : {"state" : "translated", "value" : "Toutes les requêtes de compte ont échoué"}}, "vi" : {"stringUnit" : {"state" : "translated", "value" : "Tất cả yêu cầu tài khoản đều thất bại"}}, "zh-Hans" : {"stringUnit" : {"state" : "translated", "value" : "所有账户请求均失败"}}}},
     "remote.quotaSource.error.unknownFetchFailure" : {"localizations" : {"en" : {"stringUnit" : {"state" : "translated", "value" : "Refresh failed for an unknown reason"}}, "fr" : {"stringUnit" : {"state" : "translated", "value" : "Échec de l'actualisation pour une raison inconnue"}}, "vi" : {"stringUnit" : {"state" : "translated", "value" : "Làm mới thất bại không rõ lý do"}}, "zh-Hans" : {"stringUnit" : {"state" : "translated", "value" : "刷新失败，原因未知"}}}},
+    "providers.remoteSources.unavailable" : {"localizations" : {"en" : {"stringUnit" : {"state" : "translated", "value" : "Remote Sources Without Accounts"}}, "fr" : {"stringUnit" : {"state" : "translated", "value" : "Sources distantes sans comptes"}}, "vi" : {"stringUnit" : {"state" : "translated", "value" : "Nguồn từ xa không có tài khoản"}}, "zh-Hans" : {"stringUnit" : {"state" : "translated", "value" : "无账户的远端源"}}}},
+    "remote.quotaSource.unavailable.disabled" : {"localizations" : {"en" : {"stringUnit" : {"state" : "translated", "value" : "Disabled in settings"}}, "fr" : {"stringUnit" : {"state" : "translated", "value" : "Désactivée dans les réglages"}}, "vi" : {"stringUnit" : {"state" : "translated", "value" : "Đã tắt trong cài đặt"}}, "zh-Hans" : {"stringUnit" : {"state" : "translated", "value" : "已在设置中禁用"}}}},
+    "remote.quotaSource.unavailable.hidden" : {"localizations" : {"en" : {"stringUnit" : {"state" : "translated", "value" : "Hidden after repeated refresh failures"}}, "fr" : {"stringUnit" : {"state" : "translated", "value" : "Masquée après des échecs d'actualisation répétés"}}, "vi" : {"stringUnit" : {"state" : "translated", "value" : "Đã ẩn sau nhiều lần làm mới thất bại"}}, "zh-Hans" : {"stringUnit" : {"state" : "translated", "value" : "多次刷新失败后已隐藏"}}}},
+    "remote.quotaSource.unavailable.noAccounts" : {"localizations" : {"en" : {"stringUnit" : {"state" : "translated", "value" : "No accounts reported by this server"}}, "fr" : {"stringUnit" : {"state" : "translated", "value" : "Aucun compte signalé par ce serveur"}}, "vi" : {"stringUnit" : {"state" : "translated", "value" : "Máy chủ này không báo cáo tài khoản nào"}}, "zh-Hans" : {"stringUnit" : {"state" : "translated", "value" : "该服务器未报告任何账户"}}}},
     "Quotio" : {
       "comment" : "The main window of the application.",
       "isCommentAutoGenerated" : true

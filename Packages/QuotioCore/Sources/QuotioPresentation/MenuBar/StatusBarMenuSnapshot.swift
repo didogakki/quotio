@@ -2,6 +2,14 @@ import Foundation
 import QuotioApplication
 import QuotioDomain
 
+/// Where one menu bar account row's quota came from — a local, directly-fetched
+/// account, or one real account fetched from a configured remote quota source. Never
+/// represents an aggregated pool; each remote-origin snapshot is one real account.
+enum StatusBarMenuAccountOrigin: Equatable, Sendable {
+    case local
+    case remote(sourceId: String, sourceName: String)
+}
+
 struct StatusBarMenuAccountSnapshot: Equatable, Sendable {
     let id: QuotaAccountID
     let email: String
@@ -10,13 +18,35 @@ struct StatusBarMenuAccountSnapshot: Equatable, Sendable {
     let isActiveInIDE: Bool
     let isRefreshing: Bool
     let isRefreshBlocked: Bool
+    let origin: StatusBarMenuAccountOrigin
+}
+
+/// One source-of-truth grouping within a provider's account list — the local group (if
+/// any local accounts exist) followed by one group per remote source that currently has
+/// visible accounts for this provider. Grouping accounts this way (rather than one flat
+/// list) is what lets the menu keep local and remote accounts from different sources
+/// visually distinct even when a raw account key/email happens to repeat across them.
+struct StatusBarMenuAccountGroup: Equatable, Sendable, Identifiable {
+    let origin: StatusBarMenuAccountOrigin
+    let accounts: [StatusBarMenuAccountSnapshot]
+
+    var id: String {
+        switch origin {
+        case .local: "local"
+        case .remote(let sourceId, _): "remote:\(sourceId)"
+        }
+    }
 }
 
 struct StatusBarMenuProviderSnapshot: Equatable, Sendable {
     let provider: QuotaProvider
-    let accounts: [StatusBarMenuAccountSnapshot]
+    let groups: [StatusBarMenuAccountGroup]
     let isRefreshing: Bool
     let supportsScopedRefresh: Bool
+
+    /// Flattened view for callers that only need the raw account list (e.g. the empty
+    /// state check), irrespective of local/remote grouping.
+    var accounts: [StatusBarMenuAccountSnapshot] { groups.flatMap(\.accounts) }
 }
 
 struct StatusBarMenuDisplaySettings: Equatable, Sendable {
@@ -64,7 +94,10 @@ public enum StatusBarMenuSnapshotMapper {
         activeAntigravityEmail: String?,
         menuBarPreferences: MenuBarPreferences,
         appearanceMode: AppearanceMode,
-        language: AppLanguage
+        language: AppLanguage,
+        remoteSourceNames: [String: String] = [:],
+        isRemoteRefreshing: Bool = false,
+        hiddenDropdownKeys: Set<String> = []
     ) -> StatusBarMenuSnapshot {
         var availableProviders = directAuthProviders
         availableProviders.formUnion(quota.quotas.compactMap { provider, accounts in
@@ -79,26 +112,38 @@ public enum StatusBarMenuSnapshotMapper {
             isMonitorMode: mode == .monitor,
             installedAgents: installedAgents
         ).map { provider in
-            let accounts = orderedAccounts(
+            let groups = accountGroups(
                 quota.quotas[provider] ?? [:],
                 provider: provider,
-                activeAntigravityEmail: activeAntigravityEmail
-            ).map { account in
-                let accountID = QuotaAccountID(provider: provider, accountKey: account.accountKey)
-                return StatusBarMenuAccountSnapshot(
-                    id: accountID,
-                    email: account.email,
-                    quota: account.data,
-                    subscription: quota.subscriptions[provider]?[account.accountKey],
-                    isActiveInIDE: provider == .antigravity
-                        && emailsMatch(account.email, activeAntigravityEmail),
-                    isRefreshing: quota.refreshingProviders.contains(provider),
-                    isRefreshBlocked: quota.refreshingProviders.contains(provider)
+                activeAntigravityEmail: activeAntigravityEmail,
+                remoteSourceNames: remoteSourceNames,
+                hiddenDropdownKeys: hiddenDropdownKeys
+            ).map { group in
+                StatusBarMenuAccountGroup(
+                    origin: group.origin,
+                    accounts: group.accounts.map { account in
+                        let accountID = QuotaAccountID(provider: provider, accountKey: account.accountKey)
+                        return StatusBarMenuAccountSnapshot(
+                            id: accountID,
+                            email: account.email,
+                            quota: account.data,
+                            subscription: quota.subscriptions[provider]?[account.accountKey],
+                            isActiveInIDE: group.origin == .local && provider == .antigravity
+                                && emailsMatch(account.email, activeAntigravityEmail),
+                            isRefreshing: group.origin == .local
+                                ? quota.refreshingProviders.contains(provider)
+                                : isRemoteRefreshing,
+                            isRefreshBlocked: group.origin == .local
+                                ? quota.refreshingProviders.contains(provider)
+                                : isRemoteRefreshing,
+                            origin: group.origin
+                        )
+                    }
                 )
             }
             return StatusBarMenuProviderSnapshot(
                 provider: provider,
-                accounts: accounts,
+                groups: groups,
                 isRefreshing: quota.refreshingProviders.contains(provider),
                 supportsScopedRefresh: provider.supportsQuotaOnlyMode
             )
@@ -142,19 +187,76 @@ public enum StatusBarMenuSnapshotMapper {
         }
     }
 
-    nonisolated static func orderedAccounts(
+    /// Splits one provider's merged quota dictionary (local accounts and, in Monitor
+    /// mode, real accounts from every visible remote source, all merged by
+    /// `CompositionRoot`) into ordered groups: the local group first (if any local
+    /// accounts exist), then one group per remote source — sorted by that source's own
+    /// display name — each containing its real per-account entries sorted by email.
+    /// Detecting remote origin from the key itself (rather than a passed-in flag) keeps
+    /// this pure and testable without threading extra per-key metadata through.
+    ///
+    /// `hiddenDropdownKeys` drops individually-hidden real accounts — local or remote —
+    /// from this dropdown listing: a display-only filter that never reaches the quota
+    /// dictionary itself, so fetch/refresh and every other consumer of `quotas` are
+    /// unaffected. Entries are matched by `MenuBarQuotaItem.id` (built the same way the
+    /// dropdown's own toggle button builds it from an `AccountRowData`) rather than the
+    /// raw `key`, so a raw key/email that happens to repeat across providers or between
+    /// a local and a remote account can never cause an unrelated account to be hidden. A
+    /// remote source whose every account ends up hidden this way contributes no group at
+    /// all, rather than an empty one.
+    nonisolated static func accountGroups(
         _ quotas: [String: ProviderQuota],
         provider: QuotaProvider,
-        activeAntigravityEmail: String?
-    ) -> [(accountKey: String, email: String, data: ProviderQuota)] {
-        let sorted = quotas
-            .map { (accountKey: $0.key, email: $0.value.accountDisplayName ?? $0.key, data: $0.value) }
-            .sorted { $0.email < $1.email }
+        activeAntigravityEmail: String?,
+        remoteSourceNames: [String: String],
+        hiddenDropdownKeys: Set<String> = []
+    ) -> [(origin: StatusBarMenuAccountOrigin, accounts: [(accountKey: String, email: String, data: ProviderQuota)])] {
+        var localEntries: [(accountKey: String, email: String, data: ProviderQuota)] = []
+        var remoteEntriesBySource: [String: [(accountKey: String, email: String, data: ProviderQuota)]] = [:]
+        var remoteSourceOrder: [String] = []
 
-        guard provider == .antigravity else { return sorted }
-        return AccountSorting.prioritizingActive(sorted) {
-            emailsMatch($0.email, activeAntigravityEmail)
+        for (key, data) in quotas {
+            if let components = RemoteQuotaAccountIdentity.components(fromStorageKey: key) {
+                let itemId = MenuBarQuotaItem(
+                    provider: provider.rawValue,
+                    accountKey: key,
+                    sourceConfigId: components.sourceId
+                ).id
+                guard !hiddenDropdownKeys.contains(itemId) else { continue }
+                let entry = (accountKey: key, email: data.accountDisplayName ?? components.accountKey, data: data)
+                if remoteEntriesBySource[components.sourceId] == nil {
+                    remoteSourceOrder.append(components.sourceId)
+                }
+                remoteEntriesBySource[components.sourceId, default: []].append(entry)
+            } else {
+                let itemId = MenuBarQuotaItem(provider: provider.rawValue, accountKey: key, sourceConfigId: nil).id
+                guard !hiddenDropdownKeys.contains(itemId) else { continue }
+                localEntries.append((accountKey: key, email: data.accountDisplayName ?? key, data: data))
+            }
         }
+
+        func ordered(
+            _ entries: [(accountKey: String, email: String, data: ProviderQuota)]
+        ) -> [(accountKey: String, email: String, data: ProviderQuota)] {
+            let sorted = entries.sorted { $0.email < $1.email }
+            guard provider == .antigravity else { return sorted }
+            return AccountSorting.prioritizingActive(sorted) {
+                emailsMatch($0.email, activeAntigravityEmail)
+            }
+        }
+
+        var groups: [(origin: StatusBarMenuAccountOrigin, accounts: [(accountKey: String, email: String, data: ProviderQuota)])] = []
+        if !localEntries.isEmpty {
+            groups.append((origin: .local, accounts: ordered(localEntries)))
+        }
+        for sourceId in remoteSourceOrder.sorted(by: {
+            (remoteSourceNames[$0] ?? $0) < (remoteSourceNames[$1] ?? $1)
+        }) {
+            guard let entries = remoteEntriesBySource[sourceId] else { continue }
+            let sourceName = remoteSourceNames[sourceId] ?? sourceId
+            groups.append((origin: .remote(sourceId: sourceId, sourceName: sourceName), accounts: ordered(entries)))
+        }
+        return groups
     }
 
     nonisolated private static func emailsMatch(_ email: String, _ activeEmail: String?) -> Bool {

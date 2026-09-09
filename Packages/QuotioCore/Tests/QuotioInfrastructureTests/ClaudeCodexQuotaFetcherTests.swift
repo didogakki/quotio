@@ -31,6 +31,62 @@ final class ClaudeCodexQuotaFetcherTests: XCTestCase {
       requests.allSatisfy { $0.value(forHTTPHeaderField: "User-Agent") == "claude-code/2.1.69" })
   }
 
+  // MARK: - mapProfilePlan
+
+  func testMapProfilePlanReadsHasClaudeProFlag() {
+    let data = Data(#"{"account":{"has_claude_pro":true,"has_claude_max":false}}"#.utf8)
+
+    XCTAssertEqual(ClaudeQuotaFetcher.mapProfilePlan(data), "Pro")
+  }
+
+  /// An account mid-transition can carry both entitlement flags at once; Max must win.
+  func testMapProfilePlanPrefersMaxWhenBothFlagsAreSet() {
+    let data = Data(#"{"account":{"has_claude_pro":true,"has_claude_max":true}}"#.utf8)
+
+    XCTAssertEqual(ClaudeQuotaFetcher.mapProfilePlan(data), "Max")
+  }
+
+  /// A canceled *renewal* is not the same as losing the plan the account currently has —
+  /// `subscription_status` must never be read at all, so it can't downgrade an account
+  /// that still reports `has_claude_pro`. Uses the exact field set field-verified against
+  /// the real endpoint: `has_claude_pro: true`, `has_claude_max: false`,
+  /// `organization_type: "claude_pro"`, `subscription_status: "canceled"`.
+  func testMapProfilePlanKeepsProDespiteCanceledSubscriptionStatus() {
+    let data = Data(
+      #"""
+      {"account":{"has_claude_pro":true,"has_claude_max":false},"organization":{"organization_type":"claude_pro","subscription_status":"canceled","rate_limit_tier":"default_claude_ai","seat_tier":null}}
+      """#.utf8)
+
+    XCTAssertEqual(ClaudeQuotaFetcher.mapProfilePlan(data), "Pro")
+  }
+
+  /// Never guesses a numeric multiplier ("5x"/"20x") from `rate_limit_tier`, and never
+  /// falls back to a bare "Free" guess just because neither flag is set — only an
+  /// explicit, recognized `organization_type` may fill in for a non-individual seat.
+  func testMapProfilePlanReturnsNilWithoutGuessingWhenNoFlagOrRecognizedOrgTypeIsPresent() {
+    let data = Data(
+      #"{"account":{"has_claude_pro":false,"has_claude_max":false},"organization":{"rate_limit_tier":"default_claude_ai"}}"#
+        .utf8)
+
+    XCTAssertNil(ClaudeQuotaFetcher.mapProfilePlan(data))
+  }
+
+  /// The mapped result must be a clean label, never a pass-through of unrelated profile
+  /// fields (email, org display name) that would leak account details into the small
+  /// tier badge the UI renders from `planType`.
+  func testMapProfilePlanNeverLeaksUnrelatedProfileFields() {
+    let data = Data(
+      #"""
+      {"account":{"email":"user@example.com","full_name":"Jane Doe","has_claude_pro":true,"has_claude_max":false},"organization":{"name":"Jane's Org","organization_type":"claude_pro"}}
+      """#.utf8)
+
+    XCTAssertEqual(ClaudeQuotaFetcher.mapProfilePlan(data), "Pro")
+  }
+
+  func testMapProfilePlanReturnsNilForUnparsableData() {
+    XCTAssertNil(ClaudeQuotaFetcher.mapProfilePlan(Data("not json".utf8)))
+  }
+
   func testClaudeRetriesAuthenticationOnceAndThenEmitsForbidden() async throws {
     let session = RecordingQuotaSession(responses: [
       ("", 401),

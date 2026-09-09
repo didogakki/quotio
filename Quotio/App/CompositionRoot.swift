@@ -302,7 +302,8 @@ enum CompositionRoot {
                 clock: SystemDateProvider()
             ),
             refreshSettings: refreshSettings,
-            modeManager: modeManager
+            modeManager: modeManager,
+            menuBarSettings: menuBarSettings
         )
         let quotaController = QuotaFeatureController(
             quota: quotaScreenModel,
@@ -711,14 +712,35 @@ private final class ProductionAppRuntimeServices: AppRuntimeServices {
         let windowPresenter = AppKitWindowPresenter()
         let dispatcher = StatusBarCommandDispatcher(
             handlers: StatusBarCommandHandlers(
-                refreshAll: { [quotaController] in
-                    await quotaController.refreshAll(force: true)
+                refreshAll: { [quotaController, remoteQuotaSourceScreenModel, modeManager] in
+                    // Remote sources are fetched directly from their own Management
+                    // API (never through the local proxy), so including them here
+                    // must never toggle or depend on the local proxy's running state.
+                    async let local: Void = quotaController.refreshAll(force: true)
+                    async let remote: Void = modeManager.isMonitorMode
+                        ? remoteQuotaSourceScreenModel.refreshAll()
+                        : ()
+                    _ = await (local, remote)
                 },
-                refreshProvider: { [quotaController] provider in
-                    await quotaController.refresh(provider: provider)
+                refreshProvider: { [quotaController, remoteQuotaSourceScreenModel, modeManager] provider in
+                    // The menu shows this provider's local *and* remote accounts under
+                    // one header, so a provider-scoped refresh has to cover both —
+                    // otherwise the remote rows never update from the menu at all.
+                    async let local: Void = quotaController.refresh(provider: provider)
+                    async let remote: Void = modeManager.isMonitorMode
+                        ? remoteQuotaSourceScreenModel.refresh(provider: provider)
+                        : ()
+                    _ = await (local, remote)
                 },
-                refreshAccount: { [quotaController] account in
-                    await quotaController.refresh(account: account)
+                refreshAccount: { [quotaController, remoteQuotaSourceScreenModel] account in
+                    // A remote-origin account's key decodes to its source id; routing
+                    // there (never through the local registry) keeps refresh scoped to
+                    // that remote source and never triggers a local login/proxy call.
+                    if let components = RemoteQuotaAccountIdentity.components(fromStorageKey: account.accountKey) {
+                        await remoteQuotaSourceScreenModel.refresh(sourceId: components.sourceId)
+                    } else {
+                        await quotaController.refresh(account: account)
+                    }
                 },
                 toggleProxy: { [proxyManagement] in
                     await proxyManagement.toggleProxy()
@@ -866,13 +888,19 @@ private final class ProductionAppRuntimeServices: AppRuntimeServices {
             activeAntigravityEmail: antigravityAccountScreenModel.snapshot.activeAccount?.email,
             menuBarPreferences: menuBarSettings.preferences,
             appearanceMode: appearanceManager.appearanceMode,
-            language: languageManager.currentLanguage
+            language: languageManager.currentLanguage,
+            remoteSourceNames: Dictionary(
+                uniqueKeysWithValues: remoteQuotaSourceScreenModel.sources.map { ($0.id, $0.name) }
+            ),
+            isRemoteRefreshing: remoteQuotaSourceScreenModel.isRefreshing,
+            hiddenDropdownKeys: menuBarSettings.hiddenDropdownKeys
         )
     }
 
-    /// Local `QuotaScreenModel` quotas merged with visible remote quota-source pools.
-    /// Pool entries are stored under a `RemoteQuotaPoolIdentity` composite key, so they
-    /// can never collide with a real local account key or another source's pool.
+    /// Local `QuotaScreenModel` quotas merged with visible remote quota-source
+    /// accounts. Each remote entry is stored under a `RemoteQuotaAccountIdentity`
+    /// composite key, so it can never collide with a real local account key or
+    /// another remote source's account — and is never an aggregated pool.
     private var mergedProviderQuotas: [QuotaProvider: [String: ProviderQuota]] {
         guard modeManager.isMonitorMode else { return quotaScreenModel.providerQuotas }
         var merged = quotaScreenModel.providerQuotas
@@ -882,16 +910,28 @@ private final class ProductionAppRuntimeServices: AppRuntimeServices {
         return merged
     }
 
+    /// Same-source/provider/plan summary rows (`RemoteQuotaSourceScreenModel.planAggregates`),
+    /// reused only to resolve an aggregate's own pin here. Deliberately never merged into
+    /// `mergedProviderQuotas` — that dictionary also feeds fetch/refresh and the dropdown
+    /// account list, and an aggregate must never be mistaken for one more real account.
+    private var aggregateProviderQuotas: [QuotaProvider: [String: RemoteQuotaPlanAggregate]] {
+        guard modeManager.isMonitorMode else { return [:] }
+        return remoteQuotaSourceScreenModel.planAggregates(mode: menuBarSettings.modelAggregationMode)
+    }
+
     private var quotaItems: [MenuBarQuotaDisplayItem] {
         guard menuBarSettings.showQuotaInMenuBar else { return [] }
 
         let providerQuotas = mergedProviderQuotas
+        let aggregateQuotas = aggregateProviderQuotas
         let items = menuBarSettings.selectedItems.flatMap { selectedItem -> [MenuBarQuotaDisplayItem] in
             guard let provider = selectedItem.aiProvider else { return [] }
 
-            // A remote pool selection (`accountKey == "__pool__"`) deterministically
-            // expands into one item per plan group present for that source/provider,
-            // so multiple plans (Pro, Team, ...) never collapse into a single reading.
+            // A legacy remote pool selection (`accountKey == "__pool__"`) dynamically
+            // expands into one item per **real** remote account currently present for
+            // that source/provider, so it never collapses several accounts into a
+            // single synthetic reading. New pins target one real account's own storage
+            // key directly and fall through to the direct lookup below instead.
             if let sourceId = selectedItem.sourceConfigId, selectedItem.isPool {
                 return poolDisplayItems(
                     selectedItem: selectedItem,
@@ -901,33 +941,78 @@ private final class ProductionAppRuntimeServices: AppRuntimeServices {
                 )
             }
 
-            var displayPercent: Double = -1
-            var isForbidden = false
-            var quotaPair: MenuBarQuotaPair?
+            // A pinned plan aggregate resolves against its own derived dictionary,
+            // never the real-account one, and renders with the provider's own icon plus
+            // the plan label and percentage only — no source name, no email, matching
+            // how a pinned real account instead shows its own identity.
+            if selectedItem.isRemote, selectedItem.isAggregate,
+               let components = RemoteQuotaAggregateIdentity.components(fromStorageKey: selectedItem.accountKey) {
+                return aggregatePinDisplayItem(
+                    selectedItem: selectedItem,
+                    provider: provider,
+                    planKey: components.planKey,
+                    aggregates: aggregateQuotas[provider] ?? [:]
+                )
+            }
 
-            if let accountQuotas = providerQuotas[provider],
-               let quotaData = resolveQuotaData(
-                   for: selectedItem,
-                   provider: provider,
-                   accountQuotas: accountQuotas
-               ) {
-                isForbidden = quotaData.isForbidden
-                if !quotaData.models.isEmpty {
-                    let models = quotaData.models.map { (name: $0.name, percentage: $0.percentage) }
-                    displayPercent = menuBarSettings.totalUsagePercent(models: models)
-                    if menuBarSettings.stackPairedQuotaMetrics {
-                        quotaPair = MenuBarQuotaPair.resolve(for: provider, from: quotaData.models)
-                    }
+            var quotaData: ProviderQuota?
+            if let accountQuotas = providerQuotas[provider] {
+                quotaData = resolveQuotaData(
+                    for: selectedItem,
+                    provider: provider,
+                    accountQuotas: accountQuotas
+                )
+            }
+
+            guard let quotaData else {
+                // `selectedItem.accountKey` for a single-account remote pin is the internal
+                // `acct::sourceId::accountKey` storage key, never fit for display. When the
+                // source is disabled, deleted, or the account is hidden there is no quota to
+                // resolve it against, so skip rendering rather than leak that key — the pin
+                // itself stays persisted in `selectedItems` and reappears once quota is
+                // visible again. Local accounts have no such internal key, so they still
+                // render a placeholder row while their first fetch is pending.
+                if selectedItem.isRemote { return [] }
+                return [MenuBarQuotaDisplayItem(
+                    id: selectedItem.id,
+                    providerSymbol: provider.menuBarSymbol,
+                    accountShort: selectedItem.accountKey,
+                    percentage: -1,
+                    provider: provider,
+                    isForbidden: false,
+                    quotaPair: nil
+                )]
+            }
+
+            var displayPercent: Double = -1
+            var quotaPair: MenuBarQuotaPair?
+            if !quotaData.models.isEmpty {
+                let models = quotaData.models.map { (name: $0.name, percentage: $0.percentage) }
+                displayPercent = menuBarSettings.totalUsagePercent(models: models)
+                if menuBarSettings.stackPairedQuotaMetrics {
+                    quotaPair = MenuBarQuotaPair.resolve(for: provider, from: quotaData.models)
                 }
+            }
+
+            let accountShort: String
+            if let displayName = quotaData.accountDisplayName {
+                accountShort = displayName
+            } else if selectedItem.isRemote {
+                // Never fall back to the internal storage key here either — parse the raw
+                // remote account key back out, or fall back to the provider's own name.
+                accountShort = RemoteQuotaAccountIdentity.components(fromStorageKey: selectedItem.accountKey)?.accountKey
+                    ?? provider.displayName
+            } else {
+                accountShort = selectedItem.accountKey
             }
 
             return [MenuBarQuotaDisplayItem(
                 id: selectedItem.id,
                 providerSymbol: provider.menuBarSymbol,
-                accountShort: selectedItem.accountKey,
+                accountShort: accountShort,
                 percentage: displayPercent,
                 provider: provider,
-                isForbidden: isForbidden,
+                isForbidden: quotaData.isForbidden,
                 quotaPair: quotaPair
             )]
         }
@@ -936,39 +1021,77 @@ private final class ProductionAppRuntimeServices: AppRuntimeServices {
         return Array(items.prefix(menuBarSettings.menuBarMaxItems))
     }
 
-    /// Expands one selected pool `MenuBarQuotaItem` into one display item per plan
-    /// group found under `RemoteQuotaPoolIdentity` composite keys for this
-    /// source/provider, via the pure, unit-tested `RemoteQuotaPoolDisplayMapper`.
+    /// Expands one legacy selected pool `MenuBarQuotaItem` (persisted before per-account
+    /// remote pins existed) into one display item per **real** remote account currently
+    /// present under this source/provider, found under `RemoteQuotaAccountIdentity`
+    /// composite keys, via the pure, unit-tested `RemoteQuotaPoolDisplayMapper`. Never
+    /// synthesizes a plan-level aggregate — a legacy pin now dynamically tracks
+    /// whatever real accounts that source currently reports.
     private func poolDisplayItems(
         selectedItem: MenuBarQuotaItem,
         sourceId: String,
         provider: QuotaProvider,
         accountQuotas: [String: ProviderQuota]
     ) -> [MenuBarQuotaDisplayItem] {
-        let groups = accountQuotas.compactMap { key, quota -> RemoteQuotaPoolDisplayMapper.PlanGroup? in
-            guard let components = RemoteQuotaPoolIdentity.components(fromStorageKey: key),
+        let accounts = accountQuotas.compactMap { key, quota -> RemoteQuotaPoolDisplayMapper.AccountEntry? in
+            guard let components = RemoteQuotaAccountIdentity.components(fromStorageKey: key),
                   components.sourceId == sourceId else { return nil }
-            return RemoteQuotaPoolDisplayMapper.PlanGroup(planKey: components.planKey, quota: quota)
+            // An account the user individually turned off on the Providers page is
+            // excluded here — that is the only way to deselect one account out of a
+            // legacy pool pin, which has no per-account entry of its own to remove.
+            let accountItem = MenuBarQuotaItem(
+                provider: provider.rawValue,
+                accountKey: key,
+                sourceConfigId: sourceId
+            )
+            guard menuBarSettings.poolExpansionIncludes(accountItem) else { return nil }
+            return RemoteQuotaPoolDisplayMapper.AccountEntry(accountKey: components.accountKey, quota: quota)
         }
-        guard !groups.isEmpty else { return [] }
+        guard !accounts.isEmpty else { return [] }
 
         return RemoteQuotaPoolDisplayMapper.displayItems(
             itemId: selectedItem.id,
             provider: provider,
-            groups: groups,
+            accounts: accounts,
             stackPairedQuotaMetrics: menuBarSettings.stackPairedQuotaMetrics,
             totalUsagePercent: menuBarSettings.totalUsagePercent
         )
     }
 
-    /// Local-account lookup only — remote pool items (`selectedItem.isPool`) are always
-    /// intercepted earlier in `quotaItems` and resolved via `poolDisplayItems` instead.
+    /// Resolves one pinned plan aggregate against the derived `RemoteQuotaPlanAggregate`
+    /// dictionary. Skips rendering (rather than showing a placeholder) when the aggregate
+    /// is currently absent — same tolerance the real-account path already applies to a
+    /// disabled/deleted/hidden remote pin — since the aggregate's source may have been
+    /// removed/hidden or its last account may have left this plan entirely (an aggregate
+    /// exists for every group with at least one account, including a single account).
+    private func aggregatePinDisplayItem(
+        selectedItem: MenuBarQuotaItem,
+        provider: QuotaProvider,
+        planKey: String,
+        aggregates: [String: RemoteQuotaPlanAggregate]
+    ) -> [MenuBarQuotaDisplayItem] {
+        guard let aggregate = aggregates[selectedItem.accountKey] else { return [] }
+
+        return [RemoteQuotaAggregatePinDisplayMapper.displayItem(
+            itemId: selectedItem.id,
+            provider: provider,
+            planKey: planKey,
+            aggregate: aggregate,
+            totalUsagePercent: menuBarSettings.totalUsagePercent
+        )]
+    }
+
+    /// Direct dictionary lookup for both local accounts and single-account remote pins
+    /// (whose `accountKey` is the exact `RemoteQuotaAccountIdentity` storage key already
+    /// present in `accountQuotas`). Only legacy pool-style items (`selectedItem.isPool`)
+    /// skip this — those are always intercepted earlier in `quotaItems` and resolved via
+    /// `poolDisplayItems` instead, since they have no single storage key to look up.
     private func resolveQuotaData(
         for selectedItem: MenuBarQuotaItem,
         provider: QuotaProvider,
         accountQuotas: [String: ProviderQuota]
     ) -> ProviderQuota? {
-        if selectedItem.sourceConfigId != nil {
+        if selectedItem.isPool {
             return nil
         }
 

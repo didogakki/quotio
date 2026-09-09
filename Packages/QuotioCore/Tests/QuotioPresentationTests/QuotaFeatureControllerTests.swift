@@ -119,6 +119,36 @@ final class QuotaFeatureControllerTests: XCTestCase {
         await fixture.controller.shutdown()
     }
 
+    /// This controller has no visibility into remote quota sources, so it must never
+    /// treat a remote pin as invalid — an empty or failed remote snapshot (nothing
+    /// fetched yet, refresh failing, source temporarily hidden) would otherwise delete
+    /// the user's pins permanently on the very next local refresh.
+    func testEmptyRemoteSnapshotNeverPrunesRemotePins() async {
+        let account = Account.make(
+            providerID: AccountProviderID(rawValue: "codex"),
+            accountKey: "local@example.com",
+            source: .nativeCredential
+        )
+        let fixture = await makeFixture(account: account, provider: .codex)
+        let poolPin = MenuBarQuotaItem(
+            provider: "codex",
+            accountKey: RemoteQuotaPoolIdentity.accountKey,
+            sourceConfigId: "src-1"
+        )
+        let accountPin = MenuBarQuotaItem(
+            provider: "codex",
+            accountKey: RemoteQuotaAccountIdentity.storageKey(sourceId: "src-1", accountKey: "a"),
+            sourceConfigId: "src-1"
+        )
+        fixture.menuBar.selectedItems = [poolPin, accountPin]
+
+        fixture.controller.synchronizeMenuBarSelection()
+
+        XCTAssertTrue(fixture.menuBar.selectedItems.contains(poolPin))
+        XCTAssertTrue(fixture.menuBar.selectedItems.contains(accountPin))
+        await fixture.controller.shutdown()
+    }
+
     private func makeFixture(
         account: Account,
         provider: QuotaProvider,

@@ -356,42 +356,6 @@ public enum QuotaPolicy {
             ?? -1
     }
 
-    /// Aggregates several accounts' quotas from one remote quota-source pool into a
-    /// single `ProviderQuota`: per metric name, keeps the worst-case (lowest available)
-    /// reading, and picks the most common plan label so existing plan-badge UI just works.
-    public static func aggregatePool(_ quotas: [ProviderQuota]) -> ProviderQuota? {
-        guard !quotas.isEmpty else { return nil }
-
-        var order: [String] = []
-        var worstByName: [String: QuotaMetric] = [:]
-        for quota in quotas {
-            for metric in quota.models {
-                guard let existing = worstByName[metric.name] else {
-                    worstByName[metric.name] = metric
-                    order.append(metric.name)
-                    continue
-                }
-                let existingRank = existing.percentage >= 0 ? existing.percentage : .greatestFiniteMagnitude
-                let candidateRank = metric.percentage >= 0 ? metric.percentage : .greatestFiniteMagnitude
-                if candidateRank < existingRank {
-                    worstByName[metric.name] = metric
-                }
-            }
-        }
-
-        let planCounts = quotas.compactMap(\.planType).reduce(into: [String: Int]()) { counts, plan in
-            counts[plan, default: 0] += 1
-        }
-        let planType = planCounts.max { $0.value < $1.value }?.key
-
-        return ProviderQuota(
-            models: order.compactMap { worstByName[$0] },
-            lastUpdated: quotas.map(\.lastUpdated).max() ?? Date(),
-            isForbidden: quotas.allSatisfy(\.isForbidden),
-            planType: planType
-        )
-    }
-
     /// Buckets a raw `planType` string into a small, stable set of keys so accounts on
     /// equivalent plans (e.g. "Pro", "Pro 5x", "Pro 20x") group together instead of
     /// each raw label producing its own pool. Unrecognized labels fall back to a
@@ -442,6 +406,67 @@ public enum QuotaPolicy {
         case "free": return "Free"
         case "unknown": return "Unknown"
         default: return rawPlanType?.capitalized ?? planKey.capitalized
+        }
+    }
+
+    /// Derives a single read-only summary `ProviderQuota` from several real accounts'
+    /// readings — a **pure, on-the-fly** view, never persisted and never a replacement
+    /// for any of the underlying accounts. Callers are expected to have already grouped
+    /// `accounts` by source + provider + `normalizedPlanKey`; this function does not
+    /// re-check that they share a plan.
+    ///
+    /// Forbidden accounts never contribute fabricated "healthy" numbers: they are
+    /// excluded from the metric math entirely, and the result is itself forbidden (with
+    /// no models) only when every input account is forbidden. `lastUpdated` is the
+    /// earliest timestamp among the contributing accounts, so the summary never claims
+    /// to be fresher than its stalest input — mirroring the app's existing "keep the
+    /// last-known-good reading, never overstate it" refresh policy.
+    public static func aggregate(_ accounts: [ProviderQuota], mode: ModelAggregationMode) -> ProviderQuota {
+        let contributing = accounts.filter { !$0.isForbidden }
+        guard !contributing.isEmpty else {
+            return ProviderQuota(
+                models: [],
+                lastUpdated: accounts.map(\.lastUpdated).max() ?? Date(),
+                isForbidden: true,
+                planType: accounts.first(where: { $0.planType != nil })?.planType
+            )
+        }
+
+        var orderedNames: [String] = []
+        var percentagesByName: [String: [Double]] = [:]
+        var resetTimeByName: [String: String] = [:]
+        for account in contributing {
+            for metric in account.models {
+                if percentagesByName[metric.name] == nil {
+                    orderedNames.append(metric.name)
+                    resetTimeByName[metric.name] = metric.resetTime
+                }
+                percentagesByName[metric.name, default: []].append(metric.percentage)
+            }
+        }
+
+        let models = orderedNames.map { name in
+            QuotaMetric(
+                name: name,
+                percentage: aggregatePercentages(percentagesByName[name] ?? [], mode: mode),
+                resetTime: resetTimeByName[name] ?? ""
+            )
+        }
+
+        return ProviderQuota(
+            models: models,
+            lastUpdated: contributing.map(\.lastUpdated).min() ?? Date(),
+            isForbidden: false,
+            planType: contributing.first(where: { $0.planType != nil })?.planType
+        )
+    }
+
+    private static func aggregatePercentages(_ percentages: [Double], mode: ModelAggregationMode) -> Double {
+        let valid = percentages.filter { $0 >= 0 }
+        guard !valid.isEmpty else { return -1 }
+        switch mode {
+        case .lowest: return valid.min() ?? -1
+        case .average: return valid.reduce(0, +) / Double(valid.count)
         }
     }
 }

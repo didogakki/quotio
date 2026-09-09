@@ -67,7 +67,7 @@ final class RemoteQuotaSourceCoordinatorTests: XCTestCase {
         // Second round: only "pro" refreshes (with a partial-failure flag); "team" must
         // keep its last-known-good value instead of disappearing.
         await fetcher.enqueue(
-            .partial(quotasByProviderAndPlan: [.codex: ["pro": Self.quota(50)]]),
+            .partial(quotasByProviderAndAccount: [.codex: ["pro": Self.quota(50)]]),
             for: "s1"
         )
         await coordinator.refresh(sourceId: "s1", isAutomatic: true)
@@ -76,6 +76,238 @@ final class RemoteQuotaSourceCoordinatorTests: XCTestCase {
         XCTAssertEqual(state.poolQuotas["s1"]?[.codex]?["pro"]?.models.first?.percentage, 50)
         XCTAssertEqual(state.poolQuotas["s1"]?[.codex]?["team"]?.models.first?.percentage, 20)
         XCTAssertEqual(state.failureCounts["s1"], 1, "a partial failure must still count toward the hide threshold")
+    }
+
+    /// An account that drops out of the auth-file listing entirely (deleted or
+    /// disabled on the remote server) must be pruned from `poolQuotas` instead of
+    /// lingering forever, once the fetcher reports the current round's full
+    /// `knownAccountKeys` for that provider.
+    func testAccountRemovedFromListingIsPrunedFromPoolQuotas() async {
+        let fetcher = StubFetcher()
+        let coordinator = makeCoordinator(fetcher: fetcher)
+        let source = RemoteQuotaSourceConfig(id: "s1", name: "Pool", baseURL: "https://a.test")
+        await coordinator.addSource(source, managementKey: "k")
+        await fetcher.enqueue(
+            .result(RemoteQuotaPoolFetchResult(
+                quotasByProviderAndAccount: [.codex: ["a": Self.quota(70), "b": Self.quota(40)]],
+                outcome: .complete,
+                knownAccountKeys: [.codex: ["a", "b"]]
+            )),
+            for: "s1"
+        )
+        await coordinator.refresh(sourceId: "s1")
+
+        // Round two: "b" was deleted/disabled on the remote server, so it no longer
+        // appears in the listing at all — its stale reading must be pruned, not kept.
+        await fetcher.enqueue(
+            .result(RemoteQuotaPoolFetchResult(
+                quotasByProviderAndAccount: [.codex: ["a": Self.quota(60)]],
+                outcome: .complete,
+                knownAccountKeys: [.codex: ["a"]]
+            )),
+            for: "s1"
+        )
+        await coordinator.refresh(sourceId: "s1")
+
+        let state = await coordinator.state
+        XCTAssertEqual(state.poolQuotas["s1"]?[.codex]?["a"]?.models.first?.percentage, 60)
+        XCTAssertNil(state.poolQuotas["s1"]?[.codex]?["b"], "an account removed from the listing must be pruned")
+    }
+
+    /// An account that is still present in the auth-file listing but whose own quota
+    /// request merely failed this round must keep its last-known-good reading — this
+    /// is the counterpart to pruning: "known but failed" must never be treated the
+    /// same as "no longer known at all".
+    func testAccountStillListedButQuotaFetchFailedKeepsLastKnownGood() async {
+        let fetcher = StubFetcher()
+        let coordinator = makeCoordinator(fetcher: fetcher)
+        let source = RemoteQuotaSourceConfig(id: "s1", name: "Pool", baseURL: "https://a.test")
+        await coordinator.addSource(source, managementKey: "k")
+        await fetcher.enqueue(
+            .result(RemoteQuotaPoolFetchResult(
+                quotasByProviderAndAccount: [.codex: ["a": Self.quota(70), "b": Self.quota(40)]],
+                outcome: .complete,
+                knownAccountKeys: [.codex: ["a", "b"]]
+            )),
+            for: "s1"
+        )
+        await coordinator.refresh(sourceId: "s1")
+
+        // Round two: "b" is still a ready, supported auth file (still known), but its
+        // individual quota request failed this round — it must not disappear.
+        await fetcher.enqueue(
+            .result(RemoteQuotaPoolFetchResult(
+                quotasByProviderAndAccount: [.codex: ["a": Self.quota(55)]],
+                outcome: .partial,
+                knownAccountKeys: [.codex: ["a", "b"]]
+            )),
+            for: "s1"
+        )
+        await coordinator.refresh(sourceId: "s1", isAutomatic: true)
+
+        let state = await coordinator.state
+        XCTAssertEqual(state.poolQuotas["s1"]?[.codex]?["a"]?.models.first?.percentage, 55)
+        XCTAssertEqual(
+            state.poolQuotas["s1"]?[.codex]?["b"]?.models.first?.percentage, 40,
+            "an account still listed but merely failed this round's quota fetch must keep its last-known-good value"
+        )
+    }
+
+    /// Deleting a provider's **last** account must remove that provider outright.
+    /// Pruning only providers that still have a surviving account left the deleted
+    /// one's stale reading visible forever, which is why the listing has to report an
+    /// empty set for a provider rather than omitting it.
+    func testProviderWhoseLastAccountWasDeletedDisappearsEntirely() async {
+        let fetcher = StubFetcher()
+        let coordinator = makeCoordinator(fetcher: fetcher)
+        await coordinator.addSource(
+            RemoteQuotaSourceConfig(id: "s1", name: "Pool", baseURL: "https://a.test"),
+            managementKey: "k"
+        )
+        await fetcher.enqueue(
+            .result(RemoteQuotaPoolFetchResult(
+                quotasByProviderAndAccount: [.codex: ["a": Self.quota(70)], .claude: ["c": Self.quota(40)]],
+                outcome: .complete,
+                knownAccountKeys: [.codex: ["a"], .claude: ["c"], .grok: []]
+            )),
+            for: "s1"
+        )
+        await coordinator.refresh(sourceId: "s1")
+
+        // "c" — Claude's only account — was deleted remotely. Claude is still listed,
+        // now with no accounts at all.
+        await fetcher.enqueue(
+            .result(RemoteQuotaPoolFetchResult(
+                quotasByProviderAndAccount: [.codex: ["a": Self.quota(65)]],
+                outcome: .complete,
+                knownAccountKeys: [.codex: ["a"], .claude: [], .grok: []]
+            )),
+            for: "s1"
+        )
+        await coordinator.refresh(sourceId: "s1")
+
+        let state = await coordinator.state
+        XCTAssertEqual(state.poolQuotas["s1"]?[.codex]?["a"]?.models.first?.percentage, 65)
+        XCTAssertNil(
+            state.poolQuotas["s1"]?[.claude],
+            "a provider whose last account was deleted must disappear, not keep a stale reading"
+        )
+    }
+
+    /// An empty listing is authoritative, not an error: the source genuinely has no
+    /// supported ready account left, so every stale entry must go — while the source's
+    /// own configuration survives untouched and the round still counts as a failure.
+    func testEmptyAuthoritativeListingPrunesEverythingButKeepsTheSource() async {
+        let repository = MemoryRemoteQuotaSourceRepository()
+        let fetcher = StubFetcher()
+        let coordinator = makeCoordinator(repository: repository, fetcher: fetcher)
+        await coordinator.addSource(
+            RemoteQuotaSourceConfig(id: "s1", name: "Pool", baseURL: "https://a.test"),
+            managementKey: "k"
+        )
+        await fetcher.enqueue(
+            .result(RemoteQuotaPoolFetchResult(
+                quotasByProviderAndAccount: [.codex: ["a": Self.quota(70)]],
+                outcome: .complete,
+                knownAccountKeys: [.codex: ["a"], .claude: [], .grok: []]
+            )),
+            for: "s1"
+        )
+        await coordinator.refresh(sourceId: "s1")
+
+        await fetcher.enqueue(
+            .result(RemoteQuotaPoolFetchResult(
+                outcome: .noAccountsListed,
+                knownAccountKeys: [.codex: [], .claude: [], .grok: []]
+            )),
+            for: "s1"
+        )
+        await coordinator.refresh(sourceId: "s1", isAutomatic: true)
+
+        let state = await coordinator.state
+        XCTAssertEqual(
+            state.poolQuotas["s1"]?.isEmpty, true,
+            "an empty authoritative listing must clear every stale account"
+        )
+        XCTAssertEqual(repository.saved.map(\.id), ["s1"], "the source's own config must never be discarded")
+        XCTAssertEqual(state.failureCounts["s1"], 1)
+        guard case .error(let key) = state.statuses["s1"] else {
+            return XCTFail("expected an error status")
+        }
+        XCTAssertEqual(key, RemoteQuotaFetchError.noSupportedReadyFiles.localizationKey)
+    }
+
+    /// Every quota request failing says nothing about which accounts exist — the
+    /// listing that round still succeeded, so accounts that dropped out of it must be
+    /// pruned while accounts that are still listed keep their last-known-good reading.
+    func testEveryQuotaRequestFailingStillPrunesUsingTheListing() async {
+        let fetcher = StubFetcher()
+        let coordinator = makeCoordinator(fetcher: fetcher)
+        await coordinator.addSource(
+            RemoteQuotaSourceConfig(id: "s1", name: "Pool", baseURL: "https://a.test"),
+            managementKey: "k"
+        )
+        await fetcher.enqueue(
+            .result(RemoteQuotaPoolFetchResult(
+                quotasByProviderAndAccount: [.codex: ["a": Self.quota(70), "b": Self.quota(40)]],
+                outcome: .complete,
+                knownAccountKeys: [.codex: ["a", "b"], .claude: [], .grok: []]
+            )),
+            for: "s1"
+        )
+        await coordinator.refresh(sourceId: "s1")
+
+        await fetcher.enqueue(
+            .result(RemoteQuotaPoolFetchResult(
+                outcome: .allFailed,
+                knownAccountKeys: [.codex: ["a"], .claude: [], .grok: []]
+            )),
+            for: "s1"
+        )
+        await coordinator.refresh(sourceId: "s1", isAutomatic: true)
+
+        let state = await coordinator.state
+        XCTAssertEqual(
+            state.poolQuotas["s1"]?[.codex]?["a"]?.models.first?.percentage, 70,
+            "an account still listed keeps its last-known-good reading when its request fails"
+        )
+        XCTAssertNil(state.poolQuotas["s1"]?[.codex]?["b"], "an account no longer listed must still be pruned")
+        XCTAssertEqual(state.failureCounts["s1"], 1)
+        guard case .error(let key) = state.statuses["s1"] else {
+            return XCTFail("expected an error status")
+        }
+        XCTAssertEqual(key, RemoteQuotaFetchError.allRequestsFailed.localizationKey)
+    }
+
+    /// The opposite case: when the listing itself could not be obtained, nothing about
+    /// the account set is known, so nothing may be pruned — not even an account that a
+    /// later successful round would legitimately remove.
+    func testListingFailurePrunesNothing() async {
+        let fetcher = StubFetcher()
+        let coordinator = makeCoordinator(fetcher: fetcher)
+        await coordinator.addSource(
+            RemoteQuotaSourceConfig(id: "s1", name: "Pool", baseURL: "https://a.test"),
+            managementKey: "k"
+        )
+        await fetcher.enqueue(
+            .result(RemoteQuotaPoolFetchResult(
+                quotasByProviderAndAccount: [.codex: ["a": Self.quota(70), "b": Self.quota(40)]],
+                outcome: .complete,
+                knownAccountKeys: [.codex: ["a", "b"], .claude: [], .grok: []]
+            )),
+            for: "s1"
+        )
+        await coordinator.refresh(sourceId: "s1")
+
+        await fetcher.enqueue(.customFailure(RemoteQuotaFetchError.authFilesUnavailable), for: "s1")
+        await coordinator.refresh(sourceId: "s1", isAutomatic: true)
+
+        let state = await coordinator.state
+        XCTAssertEqual(state.poolQuotas["s1"]?[.codex]?["a"]?.models.first?.percentage, 70)
+        XCTAssertEqual(
+            state.poolQuotas["s1"]?[.codex]?["b"]?.models.first?.percentage, 40,
+            "a listing failure must never be treated as an authoritative empty list"
+        )
     }
 
     func testDisabledSourceIsNeverVisibleEvenWithAPriorSnapshot() async {
@@ -289,9 +521,12 @@ private final class MemorySnapshotStore: RemoteQuotaPoolSnapshotStoring, @unchec
 private actor StubFetcher: RemoteQuotaSourceFetching {
     enum Outcome {
         case success([QuotaProvider: [String: ProviderQuota]])
-        case partial(quotasByProviderAndPlan: [QuotaProvider: [String: ProviderQuota]])
+        case partial(quotasByProviderAndAccount: [QuotaProvider: [String: ProviderQuota]])
         case failure
         case customFailure(Error)
+        /// Full control over the result, including `knownAccountKeys`, for tests that
+        /// exercise pruning of accounts that dropped out of the auth-file listing.
+        case result(RemoteQuotaPoolFetchResult)
     }
 
     private var queues: [String: [Outcome]] = [:]
@@ -313,13 +548,15 @@ private actor StubFetcher: RemoteQuotaSourceFetching {
         queues[source.id] = queue
         switch outcome {
         case .success(let quotas):
-            return RemoteQuotaPoolFetchResult(quotasByProviderAndPlan: quotas, hasPartialFailure: false)
+            return RemoteQuotaPoolFetchResult(quotasByProviderAndAccount: quotas, outcome: .complete)
         case .partial(let quotas):
-            return RemoteQuotaPoolFetchResult(quotasByProviderAndPlan: quotas, hasPartialFailure: true)
+            return RemoteQuotaPoolFetchResult(quotasByProviderAndAccount: quotas, outcome: .partial)
         case .failure:
             throw StubFetcherError.simulatedFailure
         case .customFailure(let error):
             throw error
+        case .result(let result):
+            return result
         }
     }
 }

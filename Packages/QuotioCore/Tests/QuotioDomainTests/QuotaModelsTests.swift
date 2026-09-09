@@ -109,38 +109,6 @@ final class QuotaModelsTests: XCTestCase {
         )
     }
 
-    func testAggregatePoolReturnsNilForEmptyInput() {
-        XCTAssertNil(QuotaPolicy.aggregatePool([]))
-    }
-
-    func testAggregatePoolKeepsWorstCasePercentagePerMetricAndMajorityPlan() {
-        let depleted = ProviderQuota(
-            models: [QuotaMetric(name: "codex-session", percentage: 20, resetTime: "")],
-            planType: "plus"
-        )
-        let healthy = ProviderQuota(
-            models: [QuotaMetric(name: "codex-session", percentage: 90, resetTime: "")],
-            planType: "plus"
-        )
-        let differentPlan = ProviderQuota(
-            models: [QuotaMetric(name: "codex-session", percentage: 60, resetTime: "")],
-            planType: "business"
-        )
-
-        let aggregated = QuotaPolicy.aggregatePool([healthy, depleted, differentPlan])
-
-        XCTAssertEqual(aggregated?.models.first(where: { $0.name == "codex-session" })?.percentage, 20)
-        XCTAssertEqual(aggregated?.planType, "plus", "majority plan across the pool wins")
-    }
-
-    func testAggregatePoolIsForbiddenOnlyWhenEveryAccountIsForbidden() {
-        let forbidden = ProviderQuota(isForbidden: true)
-        let ok = ProviderQuota(models: [QuotaMetric(name: "m", percentage: 50, resetTime: "")])
-
-        XCTAssertFalse(QuotaPolicy.aggregatePool([forbidden, ok])?.isForbidden ?? true)
-        XCTAssertTrue(QuotaPolicy.aggregatePool([forbidden])?.isForbidden ?? false)
-    }
-
     func testNormalizedPlanKeyBucketsEquivalentRawLabels() {
         XCTAssertEqual(QuotaPolicy.normalizedPlanKey("Plus"), "plus")
         XCTAssertEqual(QuotaPolicy.normalizedPlanKey("Business"), "business")
@@ -217,5 +185,97 @@ final class QuotaModelsTests: XCTestCase {
             QuotaPolicy.planGroupDisplayLabel(provider: .codex, planKey: "pro_lite", rawPlanType: "Pro 5x"),
             "Pro 5x"
         )
+    }
+
+    // MARK: - QuotaPolicy.aggregate
+
+    func testAggregateLowestPicksTheWorstReadingPerMetric() {
+        let a = ProviderQuota(models: [QuotaMetric(name: "session", percentage: 70, resetTime: "")])
+        let b = ProviderQuota(models: [QuotaMetric(name: "session", percentage: 20, resetTime: "")])
+
+        let result = QuotaPolicy.aggregate([a, b], mode: .lowest)
+
+        XCTAssertEqual(result.models.first?.percentage, 20)
+        XCTAssertFalse(result.isForbidden)
+    }
+
+    func testAggregateAveragePicksTheMeanReadingPerMetric() {
+        let a = ProviderQuota(models: [QuotaMetric(name: "session", percentage: 80, resetTime: "")])
+        let b = ProviderQuota(models: [QuotaMetric(name: "session", percentage: 20, resetTime: "")])
+
+        let result = QuotaPolicy.aggregate([a, b], mode: .average)
+
+        XCTAssertEqual(result.models.first?.percentage, 50)
+    }
+
+    /// A forbidden account must never contribute a fabricated "healthy" number — its
+    /// metrics are excluded from the math entirely, not treated as 0% or -1%.
+    func testAggregateExcludesForbiddenAccountsFromTheMath() {
+        let healthy = ProviderQuota(models: [QuotaMetric(name: "session", percentage: 90, resetTime: "")])
+        let forbidden = ProviderQuota(
+            models: [QuotaMetric(name: "session", percentage: 1, resetTime: "")],
+            isForbidden: true
+        )
+
+        let result = QuotaPolicy.aggregate([healthy, forbidden], mode: .lowest)
+
+        XCTAssertEqual(result.models.first?.percentage, 90)
+        XCTAssertFalse(result.isForbidden)
+    }
+
+    /// When every contributing account is forbidden there is nothing usable to average —
+    /// the aggregate must report forbidden with no models, never a synthetic reading.
+    func testAggregateIsForbiddenOnlyWhenEveryAccountIsForbidden() {
+        let a = ProviderQuota(models: [QuotaMetric(name: "session", percentage: 1, resetTime: "")], isForbidden: true)
+        let b = ProviderQuota(models: [QuotaMetric(name: "session", percentage: 2, resetTime: "")], isForbidden: true)
+
+        let result = QuotaPolicy.aggregate([a, b], mode: .lowest)
+
+        XCTAssertTrue(result.isForbidden)
+        XCTAssertTrue(result.models.isEmpty)
+    }
+
+    /// The summary must never claim to be fresher than its stalest contributing account.
+    func testAggregateLastUpdatedIsTheEarliestContributingTimestamp() {
+        let stale = ProviderQuota(lastUpdated: Date(timeIntervalSince1970: 1_000))
+        let fresh = ProviderQuota(lastUpdated: Date(timeIntervalSince1970: 2_000))
+
+        let result = QuotaPolicy.aggregate([stale, fresh], mode: .lowest)
+
+        XCTAssertEqual(result.lastUpdated, stale.lastUpdated)
+    }
+
+    /// Accounts with no `planType` at all must bucket under "unknown" — the plan label
+    /// must never be guessed from something else (e.g. the provider or another
+    /// account's plan); it stays an explicit "Unknown", matching the existing
+    /// `planGroupDisplayLabel` contract for the legacy pool path.
+    func testAggregateOfAccountsWithUnknownPlanTypeStillAggregatesAndLabelsAsUnknown() {
+        let a = ProviderQuota(models: [QuotaMetric(name: "session", percentage: 60, resetTime: "")], planType: nil)
+        let b = ProviderQuota(models: [QuotaMetric(name: "session", percentage: 40, resetTime: "")], planType: nil)
+        XCTAssertEqual(QuotaPolicy.normalizedPlanKey(a.planType), "unknown")
+
+        let result = QuotaPolicy.aggregate([a, b], mode: .lowest)
+
+        XCTAssertNil(result.planType)
+        XCTAssertEqual(result.models.first?.percentage, 40)
+        XCTAssertEqual(
+            QuotaPolicy.planGroupDisplayLabel(provider: .claude, planKey: "unknown", rawPlanType: result.planType),
+            "Unknown"
+        )
+    }
+
+    /// A metric only some accounts report (e.g. one account is missing "extra-usage")
+    /// still aggregates using only the accounts that actually reported it.
+    func testAggregateHandlesMetricsPresentOnOnlySomeAccounts() {
+        let a = ProviderQuota(models: [
+            QuotaMetric(name: "session", percentage: 60, resetTime: ""),
+            QuotaMetric(name: "extra-usage", percentage: 10, resetTime: ""),
+        ])
+        let b = ProviderQuota(models: [QuotaMetric(name: "session", percentage: 40, resetTime: "")])
+
+        let result = QuotaPolicy.aggregate([a, b], mode: .average)
+
+        XCTAssertEqual(result.models.first { $0.name == "session" }?.percentage, 50)
+        XCTAssertEqual(result.models.first { $0.name == "extra-usage" }?.percentage, 10)
     }
 }

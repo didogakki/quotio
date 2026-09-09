@@ -62,6 +62,9 @@ public struct MenuBarQuotaItem: Codable, Identifiable, Hashable, Sendable {
 
     public var isRemote: Bool { sourceConfigId != nil }
     public var isPool: Bool { accountKey == RemoteQuotaPoolIdentity.accountKey }
+    /// Whether `accountKey` is a `RemoteQuotaAggregateIdentity` storage key — a pin
+    /// targeting a derived same-source/provider/plan summary row, never a real account.
+    public var isAggregate: Bool { RemoteQuotaAggregateIdentity.components(fromStorageKey: accountKey) != nil }
 }
 
 public enum MenuBarColorMode: String, Codable, CaseIterable, Identifiable, Sendable {
@@ -120,6 +123,25 @@ public struct MenuBarPreferences: Equatable, Sendable {
     public var totalUsageMode: TotalUsageMode
     public var modelAggregationMode: ModelAggregationMode
     public var hasUserModifiedMenuBar: Bool
+    /// `MenuBarQuotaItem.id`s of individual remote accounts the user turned off while
+    /// they were covered only by a legacy pool pin (`accountKey == "__pool__"`), which
+    /// expands dynamically and therefore has no per-account entry to remove. Kept apart
+    /// from `selectedItems` so it is never subject to `menuBarMaxItems` truncation — a
+    /// deselection must survive regardless of how many items fit in the menu bar.
+    public var deselectedPoolAccounts: Set<String>
+    /// `MenuBarQuotaItem.id`-shaped keys the user turned off from the menu bar's
+    /// per-provider dropdown account list. This is display-only: it never disables the
+    /// account, never affects fetching, and never touches `selectedItems`/pins — a
+    /// hidden account's own pin (if any) keeps working exactly as before. Applies to
+    /// every real account, local and remote alike — local sources (proxy, monitor,
+    /// direct) have a real disable mechanism of their own, but that only stops
+    /// fetching/usage; it says nothing about whether the account should still clutter
+    /// the dropdown, so this exists for them too. Keyed by `MenuBarQuotaItem.id` (which
+    /// already namespaces by provider and, for remote accounts, by source id) rather
+    /// than the raw account key, so a local and a remote account — or two local accounts
+    /// on different providers — that happen to share a raw key/email can never collide
+    /// in this set. Defaults to empty so pre-existing persisted state decodes unchanged.
+    public var hiddenDropdownKeys: Set<String>
 
     public init(
         showMenuBarIcon: Bool = true,
@@ -134,7 +156,9 @@ public struct MenuBarPreferences: Equatable, Sendable {
         hideSensitiveInfo: Bool = false,
         totalUsageMode: TotalUsageMode = .sessionOnly,
         modelAggregationMode: ModelAggregationMode = .lowest,
-        hasUserModifiedMenuBar: Bool = false
+        hasUserModifiedMenuBar: Bool = false,
+        deselectedPoolAccounts: Set<String> = [],
+        hiddenDropdownKeys: Set<String> = []
     ) {
         self.showMenuBarIcon = showMenuBarIcon
         self.showQuotaInMenuBar = showQuotaInMenuBar
@@ -149,6 +173,8 @@ public struct MenuBarPreferences: Equatable, Sendable {
         self.totalUsageMode = totalUsageMode
         self.modelAggregationMode = modelAggregationMode
         self.hasUserModifiedMenuBar = hasUserModifiedMenuBar
+        self.deselectedPoolAccounts = deselectedPoolAccounts
+        self.hiddenDropdownKeys = hiddenDropdownKeys
     }
 }
 

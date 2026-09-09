@@ -18,6 +18,72 @@ final class RemoteQuotaSourceTests: XCTestCase {
         XCTAssertNil(RemoteQuotaPoolIdentity.components(fromStorageKey: "__pool__"))
     }
 
+    // MARK: - RemoteQuotaAccountIdentity
+
+    func testAccountStorageKeyRoundTripsSourceIdAndAccountKey() {
+        let key = RemoteQuotaAccountIdentity.storageKey(sourceId: "src-1", accountKey: "claude-a")
+        let components = RemoteQuotaAccountIdentity.components(fromStorageKey: key)
+
+        XCTAssertEqual(components?.sourceId, "src-1")
+        XCTAssertEqual(components?.accountKey, "claude-a")
+    }
+
+    /// The raw account key may itself contain the `::` separator (e.g. an email-derived
+    /// key); only the first segment after the prefix must be treated as the source id.
+    func testAccountStorageKeyPreservesSeparatorInsideAccountKey() {
+        let key = RemoteQuotaAccountIdentity.storageKey(sourceId: "src-1", accountKey: "weird::key")
+        let components = RemoteQuotaAccountIdentity.components(fromStorageKey: key)
+
+        XCTAssertEqual(components?.sourceId, "src-1")
+        XCTAssertEqual(components?.accountKey, "weird::key")
+    }
+
+    /// Same raw account key from two different sources must never collide — this is the
+    /// exact "same email/name across sources" isolation the storage key exists to protect.
+    func testAccountStorageKeyIsolatesSameAccountKeyAcrossDifferentSources() {
+        let keyA = RemoteQuotaAccountIdentity.storageKey(sourceId: "src-a", accountKey: "same@example.com")
+        let keyB = RemoteQuotaAccountIdentity.storageKey(sourceId: "src-b", accountKey: "same@example.com")
+
+        XCTAssertNotEqual(keyA, keyB)
+        XCTAssertEqual(RemoteQuotaAccountIdentity.components(fromStorageKey: keyA)?.sourceId, "src-a")
+        XCTAssertEqual(RemoteQuotaAccountIdentity.components(fromStorageKey: keyB)?.sourceId, "src-b")
+    }
+
+    func testAccountComponentsReturnsNilForUnrelatedOrLegacyPoolKeys() {
+        XCTAssertNil(RemoteQuotaAccountIdentity.components(fromStorageKey: "some-local-account"))
+        XCTAssertNil(RemoteQuotaAccountIdentity.components(fromStorageKey: "__pool__::src-1::pro"))
+    }
+
+    // MARK: - RemoteQuotaAggregateIdentity
+
+    func testAggregateStorageKeyRoundTripsSourceIdAndPlanKey() {
+        let key = RemoteQuotaAggregateIdentity.storageKey(sourceId: "src-1", planKey: "pro")
+        let components = RemoteQuotaAggregateIdentity.components(fromStorageKey: key)
+
+        XCTAssertEqual(components?.sourceId, "src-1")
+        XCTAssertEqual(components?.planKey, "pro")
+    }
+
+    /// The whole point of the distinct `aggr::` prefix: an aggregate pin must never be
+    /// mistaken for a real account pin or a legacy pool pin, and vice versa.
+    func testAggregateStorageKeyNeverCollidesWithAccountOrPoolKeys() {
+        let aggregateKey = RemoteQuotaAggregateIdentity.storageKey(sourceId: "src-1", planKey: "pro")
+        let accountKey = RemoteQuotaAccountIdentity.storageKey(sourceId: "src-1", accountKey: "pro")
+        let poolKey = RemoteQuotaPoolIdentity.storageKey(sourceId: "src-1", planKey: "pro")
+
+        XCTAssertNotEqual(aggregateKey, accountKey)
+        XCTAssertNotEqual(aggregateKey, poolKey)
+        XCTAssertNil(RemoteQuotaAccountIdentity.components(fromStorageKey: aggregateKey))
+        XCTAssertNil(RemoteQuotaPoolIdentity.components(fromStorageKey: aggregateKey))
+        XCTAssertNil(RemoteQuotaAggregateIdentity.components(fromStorageKey: accountKey))
+        XCTAssertNil(RemoteQuotaAggregateIdentity.components(fromStorageKey: poolKey))
+    }
+
+    func testAggregateComponentsReturnsNilForUnrelatedKeys() {
+        XCTAssertNil(RemoteQuotaAggregateIdentity.components(fromStorageKey: "some-local-account"))
+        XCTAssertNil(RemoteQuotaAggregateIdentity.components(fromStorageKey: "__pool__"))
+    }
+
     // MARK: - RemoteQuotaSourceURLValidation
 
     func testValidatesAbsoluteHTTPAndHTTPSURLs() {

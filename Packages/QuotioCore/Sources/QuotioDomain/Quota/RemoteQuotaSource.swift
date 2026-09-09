@@ -31,10 +31,14 @@ public struct RemoteQuotaSourceConfig: Codable, Equatable, Identifiable, Sendabl
     }
 }
 
-/// Identifies menu bar / quota-snapshot entries that represent an aggregated pool
-/// of accounts fetched from a remote quota source, as opposed to a single local account.
+/// Legacy identity for menu bar / quota-snapshot entries that represented an
+/// **aggregated pool** of accounts fetched from a remote quota source (one entry per
+/// plan group, never a real account). Superseded by `RemoteQuotaAccountIdentity`, which
+/// keys per real remote account instead of per plan-level aggregate. Kept only so
+/// previously-persisted `MenuBarQuotaItem` pins (`accountKey == "__pool__"`) still decode
+/// and can be migrated/expanded — new code must never mint pool-style entries.
 public enum RemoteQuotaPoolIdentity {
-    /// The literal `accountKey` used on `MenuBarQuotaItem` for pool entries.
+    /// The literal `accountKey` used on `MenuBarQuotaItem` for legacy pool entries.
     public static let accountKey = "__pool__"
     private static let separator = "::"
 
@@ -49,6 +53,62 @@ public enum RemoteQuotaPoolIdentity {
         let prefix = "\(accountKey)\(separator)"
         guard key.hasPrefix(prefix) else { return nil }
         let rest = String(key.dropFirst(prefix.count))
+        let parts = rest.components(separatedBy: separator)
+        guard parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty else { return nil }
+        return (parts[0], parts[1])
+    }
+}
+
+/// Identifies menu bar / quota-snapshot entries that represent one real account fetched
+/// from a remote quota source — never a plan-level aggregate. `accountKey` is the raw
+/// per-account key the remote source's fetcher assigned (e.g. its auth-file index),
+/// carried unchanged so the same real account's identity survives from fetch through
+/// display.
+public enum RemoteQuotaAccountIdentity {
+    private static let prefix = "acct"
+    private static let separator = "::"
+
+    /// The composite key used inside quota snapshot dictionaries (`[String: ProviderQuota]`)
+    /// so real accounts from different remote sources — or a remote account and a local
+    /// account that happen to share a raw key/email — never collide. Only the first
+    /// `::`-delimited segment after the prefix is treated as the source id; the
+    /// remainder is the raw account key verbatim, so an account key that itself
+    /// contains `::` still round-trips.
+    public static func storageKey(sourceId: String, accountKey: String) -> String {
+        "\(prefix)\(separator)\(sourceId)\(separator)\(accountKey)"
+    }
+
+    public static func components(fromStorageKey key: String) -> (sourceId: String, accountKey: String)? {
+        let fullPrefix = "\(prefix)\(separator)"
+        guard key.hasPrefix(fullPrefix) else { return nil }
+        let rest = String(key.dropFirst(fullPrefix.count))
+        guard let range = rest.range(of: separator) else { return nil }
+        let sourceId = String(rest[rest.startIndex..<range.lowerBound])
+        let accountKey = String(rest[range.upperBound...])
+        guard !sourceId.isEmpty, !accountKey.isEmpty else { return nil }
+        return (sourceId, accountKey)
+    }
+}
+
+/// Identifies a **derived, read-only** summary row that combines every real remote
+/// account sharing one source + provider + normalized plan key (see
+/// `QuotaPolicy.normalizedPlanKey`) into a single display entry. Unlike
+/// `RemoteQuotaPoolIdentity`, this is not a legacy artifact and never appears inside a
+/// quota-snapshot dictionary that feeds fetch/refresh/local+remote merge — it exists only
+/// in presentation-layer, on-the-fly aggregation (`QuotaPolicy.aggregate`), so the prefix
+/// only needs to stay distinct from `acct::`/`__pool__` to be pinnable without collision.
+public enum RemoteQuotaAggregateIdentity {
+    private static let prefix = "aggr"
+    private static let separator = "::"
+
+    public static func storageKey(sourceId: String, planKey: String) -> String {
+        "\(prefix)\(separator)\(sourceId)\(separator)\(planKey)"
+    }
+
+    public static func components(fromStorageKey key: String) -> (sourceId: String, planKey: String)? {
+        let fullPrefix = "\(prefix)\(separator)"
+        guard key.hasPrefix(fullPrefix) else { return nil }
+        let rest = String(key.dropFirst(fullPrefix.count))
         let parts = rest.components(separatedBy: separator)
         guard parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty else { return nil }
         return (parts[0], parts[1])

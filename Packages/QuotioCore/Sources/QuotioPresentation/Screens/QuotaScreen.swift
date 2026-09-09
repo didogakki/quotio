@@ -13,46 +13,64 @@ struct QuotaScreen: View {
     @Environment(AccountsScreenModel.self) private var accounts
     @Environment(QuotaFeatureController.self) private var quotaController
     @Environment(OperatingModeManager.self) private var modeManager
+    @Environment(RemoteQuotaSourceScreenModel.self) private var remoteQuotaSources
 
     @State private var selectedProvider: QuotaProvider?
     @Environment(MenuBarSettingsManager.self) private var settings
-    
+
     // MARK: - Data Sources
-    
+
+    /// Local + (in Monitor mode) visible remote per-account quotas for one provider,
+    /// merged by dictionary union — remote entries are keyed by their own
+    /// `RemoteQuotaAccountIdentity` storage key, so they can never collide with a local
+    /// account key. This is the single place the two are combined for display; nothing
+    /// here aggregates several accounts into one reading.
+    private func mergedQuotaData(for provider: QuotaProvider) -> [String: ProviderQuota] {
+        var merged = quota.providerQuotas[provider] ?? [:]
+        guard modeManager.isMonitorMode else { return merged }
+        merged.merge(remoteQuotaSources.visibleProviderQuotas[provider] ?? [:]) { local, _ in local }
+        return merged
+    }
+
     /// All providers with quota data (unified from both proxy and direct sources)
     private var availableProviders: [QuotaProvider] {
         var providers = Set<QuotaProvider>()
-        
+
         // From proxy auth files
         for file in proxyManagement.authFiles {
             if let provider = file.providerID {
                 providers.insert(provider)
             }
         }
-        
+
         // From direct quota data
         for provider in quota.providerQuotas.keys {
             providers.insert(provider)
         }
-        
+
+        if modeManager.isMonitorMode {
+            providers.formUnion(remoteQuotaSources.visibleProviderQuotas.keys)
+        }
+
         return providers.sorted { $0.displayName < $1.displayName }
     }
-    
+
     /// Get account count for a provider
     private func accountCount(for provider: QuotaProvider) -> Int {
         AccountInfo.merged(
             provider: provider,
             authFiles: proxyManagement.authFiles.filter { $0.providerID == provider },
-            quotaData: quota.providerQuotas[provider] ?? [:],
+            quotaData: mergedQuotaData(for: provider),
             subscriptionInfos: quota.subscriptionInfos[provider] ?? [:],
             directAccounts: accounts.accounts,
             aliases: quota.state.accountAliases[provider] ?? [:]
         ).count
     }
-    
+
     private func lowestQuotaPercent(for provider: QuotaProvider) -> Double? {
-        guard let accounts = quota.providerQuotas[provider] else { return nil }
-        
+        let accounts = mergedQuotaData(for: provider)
+        guard !accounts.isEmpty else { return nil }
+
         var allTotals: [Double] = []
         for (_, quotaData) in accounts {
             let models = quotaData.models.map { (name: $0.name, percentage: $0.percentage) }
@@ -61,14 +79,33 @@ struct QuotaScreen: View {
                 allTotals.append(total)
             }
         }
-        
+
         return allTotals.min()
     }
-    
+
+    /// Whether a provider-scoped refresh can do anything at all: either the local side
+    /// supports it, or this provider has remote accounts, which are always refreshable
+    /// through their own source's Management API.
+    private func canRefresh(provider: QuotaProvider) -> Bool {
+        quota.supportsScopedRefresh(for: provider)
+            || (modeManager.isMonitorMode && remoteQuotaSources.hasVisibleAccounts(provider: provider))
+    }
+
+    /// Provider-scoped refresh across both origins. The remote half goes straight to
+    /// each source's own Management API, so it never depends on the local proxy.
+    private func refresh(provider: QuotaProvider) async {
+        async let local: Void = quotaController.refresh(provider: provider)
+        async let remote: Void = modeManager.isMonitorMode
+            ? remoteQuotaSources.refresh(provider: provider)
+            : ()
+        _ = await (local, remote)
+    }
+
     /// Check if we have any data to show
     private var hasAnyData: Bool {
         if modeManager.isMonitorMode {
             return !quota.providerQuotas.isEmpty || !accounts.accounts.isEmpty
+                || !remoteQuotaSources.visibleProviderQuotas.isEmpty
         }
         return !proxyManagement.authFiles.isEmpty || !quota.providerQuotas.isEmpty
     }
@@ -127,7 +164,7 @@ struct QuotaScreen: View {
                     Menu {
                         if let provider = selectedProvider ?? availableProviders.first {
                             Button {
-                                Task { await quotaController.refresh(provider: provider) }
+                                Task { await refresh(provider: provider) }
                             } label: {
                                 Label(
                                     provider.displayName + " — " + "action.refreshQuota".localized(),
@@ -136,18 +173,28 @@ struct QuotaScreen: View {
                             }
                             .disabled(
                                 quota.isRefreshing(provider: provider)
-                                    || !quota.supportsScopedRefresh(for: provider)
+                                    || !canRefresh(provider: provider)
                             )
 
                             Divider()
                         }
 
                         Button {
-                            Task { await quotaController.refreshAll(force: true) }
+                            Task {
+                                // Remote sources are fetched directly from their own
+                                // Management API (never through the local proxy), so
+                                // including them here must never toggle or depend on
+                                // the local proxy's running state.
+                                async let local: Void = quotaController.refreshAll(force: true)
+                                async let remote: Void = modeManager.isMonitorMode
+                                    ? remoteQuotaSources.refreshAll()
+                                    : ()
+                                _ = await (local, remote)
+                            }
                         } label: {
                             Label("action.refresh".localized(), systemImage: "arrow.triangle.2.circlepath")
                         }
-                        .disabled(quota.isLoadingQuotas)
+                        .disabled(quota.isLoadingQuotas || remoteQuotaSources.isRefreshing)
                     } label: {
                         if let provider = selectedProvider ?? availableProviders.first,
                            quota.isRefreshing(provider: provider) {
@@ -190,10 +237,13 @@ struct QuotaScreen: View {
                     ProviderQuotaView(
                         provider: provider,
                         authFiles: proxyManagement.authFiles.filter { $0.providerID == provider },
-                        quotaData: quota.providerQuotas[provider] ?? [:],
+                        quotaData: mergedQuotaData(for: provider),
                         subscriptionInfos: quota.subscriptionInfos[provider] ?? [:],
                         aliases: quota.state.accountAliases[provider] ?? [:],
-                        isLoading: quota.refreshingProviders.contains(provider)
+                        isLoading: quota.refreshingProviders.contains(provider),
+                        remoteSourceNames: Dictionary(
+                            uniqueKeysWithValues: remoteQuotaSources.sources.map { ($0.id, $0.name) }
+                        )
                     )
                     .padding(.horizontal, 24)
                     .padding(.vertical, 16)
@@ -377,9 +427,12 @@ private struct ProviderQuotaView: View {
     let subscriptionInfos: [String: QuotaSubscriptionInfo]
     let aliases: [String: String]
     let isLoading: Bool
-    
-    /// Get all accounts (from auth files or quota data keys)
-    private var allAccounts: [AccountInfo] {
+    /// sourceId -> display name, for remote section headers only.
+    let remoteSourceNames: [String: String]
+
+    /// Get all accounts (from auth files or quota data keys), ordered and floated
+    /// exactly as before local/remote grouping existed.
+    private var orderedAccounts: [AccountInfo] {
         let accounts = AccountInfo.merged(
             provider: provider,
             authFiles: authFiles,
@@ -397,25 +450,55 @@ private struct ProviderQuotaView: View {
             antigravityAccounts.isActive(email: $0.email)
         }
     }
-    
+
+    /// Local accounts only, in display order.
+    private var localAccounts: [AccountInfo] {
+        orderedAccounts.filter { !$0.isRemote }
+    }
+
+    /// Remote accounts grouped by their source, sorted by that source's own name — the
+    /// same "filter by provider, group by local/remote source, then per-account" shape
+    /// used by the menu bar dropdown.
+    private var remoteGroups: [(sourceId: String, sourceName: String, accounts: [AccountInfo])] {
+        let remote = orderedAccounts.filter(\.isRemote)
+        guard !remote.isEmpty else { return [] }
+        let bySource = Dictionary(grouping: remote) { $0.remoteSourceId ?? "" }
+        return bySource.keys
+            .sorted { (remoteSourceNames[$0] ?? $0) < (remoteSourceNames[$1] ?? $1) }
+            .compactMap { sourceId in
+                guard let accounts = bySource[sourceId] else { return nil }
+                return (sourceId, remoteSourceNames[sourceId] ?? sourceId, accounts)
+            }
+    }
+
     var body: some View {
         VStack(spacing: 16) {
-            if allAccounts.isEmpty && isLoading {
+            if orderedAccounts.isEmpty && isLoading {
                 QuotaLoadingView()
-            } else if allAccounts.isEmpty {
+            } else if orderedAccounts.isEmpty {
                 emptyState
             } else {
-                ForEach(allAccounts, id: \.key) { account in
+                ForEach(localAccounts, id: \.key) { account in
                     AccountQuotaCardV2(
                         provider: provider,
                         account: account,
                         isLoading: isLoading && account.quotaData == nil
                     )
                 }
+                ForEach(remoteGroups, id: \.sourceId) { group in
+                    RemoteQuotaSourceSectionHeader(name: group.sourceName)
+                    ForEach(group.accounts, id: \.key) { account in
+                        AccountQuotaCardV2(
+                            provider: provider,
+                            account: account,
+                            isLoading: false
+                        )
+                    }
+                }
             }
         }
     }
-    
+
     private var emptyState: some View {
         VStack(spacing: 12) {
             Image(systemName: "chart.bar.xaxis")
@@ -474,14 +557,22 @@ struct AccountInfo {
             : [:]
         for (key, data) in quotaData {
             if !existingKeys.contains(key) {
+                let remoteComponents = RemoteQuotaAccountIdentity.components(fromStorageKey: key)
+                // A remote account with no display name falls back to its own raw
+                // account key, never to the `acct::<sourceId>::…` composite storage
+                // key — that is an internal identifier and must never reach the UI.
                 accounts.append(AccountInfo(
                     key: key,
-                    email: data.accountDisplayName ?? directAuthEmailsByKey[key] ?? key,
+                    email: data.accountDisplayName
+                        ?? remoteComponents?.accountKey
+                        ?? directAuthEmailsByKey[key]
+                        ?? key,
                     status: "active",
                     statusColor: .green,
                     authFile: nil,
                     quotaData: data,
-                    subscriptionInfo: subscriptionInfos[key]
+                    subscriptionInfo: subscriptionInfos[key],
+                    remoteSourceId: remoteComponents?.sourceId
                 ))
             }
         }
@@ -497,6 +588,54 @@ struct AccountInfo {
     let authFile: ManagedAuthFile?
     let quotaData: ProviderQuota?
     let subscriptionInfo: QuotaSubscriptionInfo?
+    /// The `RemoteQuotaSourceConfig.id` this account's quota came from — `nil` for every
+    /// local account. Never set by decoding an auth file; only a
+    /// `RemoteQuotaAccountIdentity` storage key produces one.
+    var remoteSourceId: String?
+    var isRemote: Bool { remoteSourceId != nil }
+
+    init(
+        key: String,
+        email: String,
+        status: String,
+        statusColor: Color,
+        authFile: ManagedAuthFile?,
+        quotaData: ProviderQuota?,
+        subscriptionInfo: QuotaSubscriptionInfo?,
+        remoteSourceId: String? = nil
+    ) {
+        self.key = key
+        self.email = email
+        self.status = status
+        self.statusColor = statusColor
+        self.authFile = authFile
+        self.quotaData = quotaData
+        self.subscriptionInfo = subscriptionInfo
+        self.remoteSourceId = remoteSourceId
+    }
+}
+
+// MARK: - Remote Quota Source Section Header
+
+/// Labels a group of per-account cards as coming from one configured remote quota
+/// source, reusing the same card style below it — never a second table/card design.
+private struct RemoteQuotaSourceSectionHeader: View {
+    let name: String
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "network")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text(name)
+                .font(.caption)
+                .fontWeight(.semibold)
+                .foregroundStyle(.secondary)
+            Rectangle()
+                .fill(Color.primary.opacity(0.08))
+                .frame(height: 1)
+        }
+    }
 }
 
 // MARK: - Account Quota Card V2
@@ -507,7 +646,8 @@ private struct AccountQuotaCardV2: View {
     @Environment(WarmupScreenModel.self) private var warmup
     @Environment(AntigravityAccountScreenModel.self) private var antigravityAccounts
     @Environment(PlatformActionScreenModel.self) private var platformActions
-    
+    @Environment(RemoteQuotaSourceScreenModel.self) private var remoteQuotaSources
+
     @Environment(MenuBarSettingsManager.self) private var settings
     let provider: QuotaProvider
     let account: AccountInfo
@@ -521,7 +661,7 @@ private struct AccountQuotaCardV2: View {
     }
 
     private var isRefreshing: Bool {
-        quota.isRefreshing(account: accountID)
+        account.isRemote ? remoteQuotaSources.isRefreshing : quota.isRefreshing(account: accountID)
     }
 
     /// Check if OAuth is in progress for this provider
@@ -732,7 +872,14 @@ private struct AccountQuotaCardV2: View {
                 
                 Button {
                     Task {
-                        await quotaController.refresh(account: accountID)
+                        // A remote account's refresh must route to its own remote
+                        // source (never a local proxy/registry call) — the same
+                        // routing the menu bar dropdown uses.
+                        if let sourceId = account.remoteSourceId {
+                            await remoteQuotaSources.refresh(sourceId: sourceId)
+                        } else {
+                            await quotaController.refresh(account: accountID)
+                        }
                     }
                 } label: {
                     if isRefreshing || isLoading {
@@ -757,13 +904,18 @@ private struct AccountQuotaCardV2: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(
-                    quota.isRefreshBlocked(for: accountID)
-                        || !quota.supportsScopedRefresh(for: provider)
+                    account.isRemote
+                        ? remoteQuotaSources.isRefreshing
+                        : quota.isRefreshBlocked(for: accountID) || !quota.supportsScopedRefresh(for: provider)
                 )
                 .help("action.refreshQuota".localized())
-                
+
                 if let data = account.quotaData, data.isForbidden {
-                    if provider == .claude {
+                    // A remote-origin Claude account's forbidden state must never
+                    // trigger a *local* OAuth flow — that account's credentials live
+                    // entirely on the remote server. Fall through to the generic
+                    // "limit reached" indicator instead.
+                    if provider == .claude && !account.isRemote {
                         // When reauthenticating with authURL available, show "Open Link" button
                         if isReauthenticating, let url = reauthURL {
                             Button {

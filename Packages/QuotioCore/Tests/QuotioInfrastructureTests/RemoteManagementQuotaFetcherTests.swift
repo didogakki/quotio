@@ -48,13 +48,16 @@ final class RemoteManagementQuotaFetcherTests: XCTestCase {
     let source = RemoteQuotaSourceConfig(id: "src-1", name: "Plus Pool", baseURL: "https://proxy.test:8317")
 
     let result = try await fetcher.fetchPool(source, managementKey: "admin-key")
-    let pool = result.quotasByProviderAndPlan
+    let pool = result.quotasByProviderAndAccount
 
-    XCTAssertFalse(result.hasPartialFailure)
-    XCTAssertEqual(pool[.claude]?["unknown"]?.models.first(where: { $0.name == "five-hour-session" })?.percentage, 60)
-    XCTAssertEqual(pool[.codex]?["plus"]?.models.first(where: { $0.name == "codex-session" })?.percentage, 75)
-    XCTAssertEqual(pool[.codex]?["plus"]?.planType, "plus")
-    XCTAssertEqual(pool[.grok]?["unknown"]?.models.first(where: { $0.name == "grok-weekly" })?.percentage, 90)
+    XCTAssertEqual(result.outcome, .complete)
+    // Each ready, supported auth file surfaces as its own account under its own
+    // `authIndex` key — never merged with any other account's reading.
+    XCTAssertEqual(pool[.claude]?["claude-a"]?.models.first(where: { $0.name == "five-hour-session" })?.percentage, 60)
+    XCTAssertEqual(pool[.claude]?["claude-a"]?.accountDisplayName, "a@example.com")
+    XCTAssertEqual(pool[.codex]?["codex-b"]?.models.first(where: { $0.name == "codex-session" })?.percentage, 75)
+    XCTAssertEqual(pool[.codex]?["codex-b"]?.planType, "plus")
+    XCTAssertEqual(pool[.grok]?["grok-c"]?.models.first(where: { $0.name == "grok-weekly" })?.percentage, 90)
     XCTAssertNil(pool[.copilot])
 
     // Every apiCall request must use the $TOKEN$ placeholder — the remote server
@@ -85,13 +88,16 @@ final class RemoteManagementQuotaFetcherTests: XCTestCase {
     let source = RemoteQuotaSourceConfig(id: "src-1", name: "Plus Pool", baseURL: "https://proxy.test:8317")
 
     let result = try await fetcher.fetchPool(source, managementKey: "admin-key")
-    let pool = result.quotasByProviderAndPlan
+    let pool = result.quotasByProviderAndAccount
 
-    XCTAssertFalse(result.hasPartialFailure)
-    XCTAssertEqual(pool[.grok]?["unknown"]?.models.first(where: { $0.name == "grok-weekly" })?.percentage, 90)
+    XCTAssertEqual(result.outcome, .complete)
+    XCTAssertEqual(pool[.grok]?["xai-a"]?.models.first(where: { $0.name == "grok-weekly" })?.percentage, 90)
   }
 
-  func testFetchPoolAggregatesMultipleAccountsToWorstCase() async throws {
+  /// Regression: two distinct accounts under one source must never be merged/aggregated
+  /// into a single worst-case reading — each keeps its own independent quota, keyed by
+  /// its own `authIndex`, so neither account's real data is lost or overwritten.
+  func testFetchPoolNeverAggregatesMultipleAccountsTogether() async throws {
     let files = [
       ManagedAuthFile(
         id: "1", name: "claude-a.json", provider: "claude", status: "ready", disabled: false,
@@ -112,8 +118,10 @@ final class RemoteManagementQuotaFetcherTests: XCTestCase {
 
     let result = try await fetcher.fetchPool(source, managementKey: "k")
 
-    // Worst-case (lowest remaining) percentage across the pool wins: 100-80=20.
-    XCTAssertEqual(result.quotasByProviderAndPlan[.claude]?["unknown"]?.models.first?.percentage, 20)
+    let pool = result.quotasByProviderAndAccount[.claude]
+    XCTAssertEqual(pool?.count, 2, "each account must surface as its own independent entry")
+    XCTAssertEqual(pool?["claude-a"]?.models.first?.percentage, 90)
+    XCTAssertEqual(pool?["claude-b"]?.models.first?.percentage, 20)
   }
 
   func testFetchPoolThrowsWhenAuthFilesUnavailable() async {
@@ -210,7 +218,10 @@ final class RemoteManagementQuotaFetcherTests: XCTestCase {
     }
   }
 
-  func testFetchPoolThrowsWhenNoSupportedReadyFiles() async {
+  /// "Nothing supported and ready" is a real answer from a listing that succeeded, so
+  /// it must be reported as an authoritative empty list rather than thrown — otherwise
+  /// the coordinator can never learn that the source's accounts are all gone.
+  func testFetchPoolReportsEmptyAuthoritativeListingInsteadOfThrowing() async throws {
     let files = [
       ManagedAuthFile(
         id: "1", name: "copilot-a.json", provider: "github-copilot", status: "ready",
@@ -220,17 +231,22 @@ final class RemoteManagementQuotaFetcherTests: XCTestCase {
     let fetcher = RemoteManagementQuotaFetcher(apiFactory: StubProxyManagementAPIFactory(api: api))
     let source = RemoteQuotaSourceConfig(name: "Pool", baseURL: "https://proxy.test")
 
-    do {
-      _ = try await fetcher.fetchPool(source, managementKey: "k")
-      XCTFail("expected noSupportedReadyFiles")
-    } catch let error as RemoteQuotaFetchError {
-      XCTAssertEqual(error, .noSupportedReadyFiles)
-    } catch {
-      XCTFail("unexpected error: \(error)")
-    }
+    let result = try await fetcher.fetchPool(source, managementKey: "k")
+
+    XCTAssertEqual(result.outcome, .noAccountsListed)
+    XCTAssertTrue(result.isFailure, "an empty listing must still count as a failed round")
+    XCTAssertEqual(
+      result.failureLocalizationKey, RemoteQuotaFetchError.noSupportedReadyFiles.localizationKey)
+    XCTAssertEqual(
+      Set(result.knownAccountKeys.keys), RemoteManagementQuotaFetcher.supportedProviders,
+      "every supported provider must be reported, so each can be pruned to nothing")
+    XCTAssertTrue(result.knownAccountKeys.values.allSatisfy(\.isEmpty))
   }
 
-  func testFetchPoolThrowsWhenEveryRequestFails() async {
+  /// Every quota request failing says nothing about which accounts exist. The listing
+  /// still succeeded, so it must come back intact — marked as a failed round, but with
+  /// an authoritative account list the coordinator can prune against.
+  func testFetchPoolKeepsListingAuthoritativeWhenEveryRequestFails() async throws {
     let files = [
       ManagedAuthFile(
         id: "1", name: "claude-a.json", provider: "claude", status: "ready", disabled: false,
@@ -241,14 +257,37 @@ final class RemoteManagementQuotaFetcherTests: XCTestCase {
     let fetcher = RemoteManagementQuotaFetcher(apiFactory: StubProxyManagementAPIFactory(api: api))
     let source = RemoteQuotaSourceConfig(name: "Pool", baseURL: "https://proxy.test")
 
-    do {
-      _ = try await fetcher.fetchPool(source, managementKey: "k")
-      XCTFail("expected allRequestsFailed")
-    } catch let error as RemoteQuotaFetchError {
-      XCTAssertEqual(error, .allRequestsFailed)
-    } catch {
-      XCTFail("unexpected error: \(error)")
-    }
+    let result = try await fetcher.fetchPool(source, managementKey: "k")
+
+    XCTAssertEqual(result.outcome, .allFailed)
+    XCTAssertTrue(result.isFailure)
+    XCTAssertEqual(
+      result.failureLocalizationKey, RemoteQuotaFetchError.allRequestsFailed.localizationKey)
+    XCTAssertTrue(result.quotasByProviderAndAccount.isEmpty)
+    XCTAssertEqual(result.knownAccountKeys[.claude], ["claude-a"])
+  }
+
+  /// A provider whose accounts were all removed remotely must come back as an empty
+  /// set, not be omitted — omission means "the listing said nothing", which the
+  /// coordinator deliberately treats as "leave the previous accounts alone".
+  func testFetchPoolReportsEmptySetForSupportedProvidersWithNoAccounts() async throws {
+    let files = [
+      ManagedAuthFile(
+        id: "1", name: "claude-a.json", provider: "claude", status: "ready", disabled: false,
+        unavailable: false, authIndex: "claude-a")
+    ]
+    let api = StubProxyManagementAPI(
+      authFiles: files,
+      responses: ["claude-a": (200, #"{"five_hour":{"utilization":10}}"#)]
+    )
+    let fetcher = RemoteManagementQuotaFetcher(apiFactory: StubProxyManagementAPIFactory(api: api))
+    let source = RemoteQuotaSourceConfig(name: "Pool", baseURL: "https://proxy.test")
+
+    let result = try await fetcher.fetchPool(source, managementKey: "k")
+
+    XCTAssertEqual(result.knownAccountKeys[.claude], ["claude-a"])
+    XCTAssertEqual(result.knownAccountKeys[.codex], [])
+    XCTAssertEqual(result.knownAccountKeys[.grok], [])
   }
 
   func testFetchPoolReportsPartialFailureWhenSomeAccountsFail() async throws {
@@ -270,11 +309,42 @@ final class RemoteManagementQuotaFetcherTests: XCTestCase {
 
     let result = try await fetcher.fetchPool(source, managementKey: "k")
 
-    XCTAssertTrue(result.hasPartialFailure)
-    XCTAssertEqual(result.quotasByProviderAndPlan[.claude]?["unknown"]?.models.first?.percentage, 90)
+    XCTAssertEqual(result.outcome, .partial)
+    XCTAssertEqual(result.quotasByProviderAndAccount[.claude]?["claude-a"]?.models.first?.percentage, 90)
+    // "claude-b" is still a ready, supported auth file — its own quota request merely
+    // failed — so it must still be reported as known, letting the coordinator keep its
+    // last-known-good reading instead of treating it as removed from the source.
+    XCTAssertEqual(result.knownAccountKeys[.claude], ["claude-a", "claude-b"])
   }
 
-  func testFetchPoolGroupsSeparatePlansWithinTheSamePool() async throws {
+  /// An auth file that's no longer ready (e.g. deleted or disabled on the remote
+  /// server) must never appear in `knownAccountKeys` — that's what lets the
+  /// coordinator distinguish "still exists but its quota fetch failed" from "no
+  /// longer exists at all" and prune only the latter.
+  func testFetchPoolExcludesNonReadyFilesFromKnownAccountKeys() async throws {
+    let files = [
+      ManagedAuthFile(
+        id: "1", name: "claude-a.json", provider: "claude", status: "ready", disabled: false,
+        unavailable: false, authIndex: "claude-a"),
+      ManagedAuthFile(
+        id: "2", name: "claude-b.json", provider: "claude", status: "disabled", disabled: true,
+        unavailable: false, authIndex: "claude-b"),
+    ]
+    let api = StubProxyManagementAPI(
+      authFiles: files,
+      responses: ["claude-a": (200, #"{"five_hour":{"utilization":10}}"#)]
+    )
+    let fetcher = RemoteManagementQuotaFetcher(apiFactory: StubProxyManagementAPIFactory(api: api))
+    let source = RemoteQuotaSourceConfig(name: "Pool", baseURL: "https://proxy.test")
+
+    let result = try await fetcher.fetchPool(source, managementKey: "k")
+
+    XCTAssertEqual(result.knownAccountKeys[.claude], ["claude-a"])
+  }
+
+  /// Two accounts on different plans under the same source must each keep their own
+  /// plan and quota, keyed by their own `authIndex` — never merged into a plan bucket.
+  func testFetchPoolKeepsDifferentPlanAccountsAsSeparateEntries() async throws {
     let files = [
       ManagedAuthFile(
         id: "1", name: "codex-a.json", provider: "codex", status: "ready", disabled: false,
@@ -295,9 +365,231 @@ final class RemoteManagementQuotaFetcherTests: XCTestCase {
 
     let result = try await fetcher.fetchPool(source, managementKey: "k")
 
-    XCTAssertFalse(result.hasPartialFailure)
-    XCTAssertEqual(result.quotasByProviderAndPlan[.codex]?["pro"]?.models.first?.percentage, 75)
-    XCTAssertEqual(result.quotasByProviderAndPlan[.codex]?["team"]?.models.first?.percentage, 60)
+    XCTAssertEqual(result.outcome, .complete)
+    XCTAssertEqual(result.quotasByProviderAndAccount[.codex]?["codex-a"]?.models.first?.percentage, 75)
+    XCTAssertEqual(result.quotasByProviderAndAccount[.codex]?["codex-a"]?.planType, "pro")
+    XCTAssertEqual(result.quotasByProviderAndAccount[.codex]?["codex-b"]?.models.first?.percentage, 60)
+    XCTAssertEqual(result.quotasByProviderAndAccount[.codex]?["codex-b"]?.planType, "team")
+  }
+
+  /// Fix for the menu bar showing "Claude Unknown": the remote branch used to have no
+  /// `file.accountType` fallback for Claude at all, so a remote Claude account's plan
+  /// was always nil even when the management API reported one via `account_type`.
+  func testFetchPoolUsesAccountTypeAsClaudePlanFallback() async throws {
+    let files = [
+      ManagedAuthFile(
+        id: "1", name: "claude-a.json", provider: "claude", status: "ready", disabled: false,
+        unavailable: false, accountType: "max", authIndex: "claude-a"),
+    ]
+    let api = StubProxyManagementAPI(
+      authFiles: files,
+      responses: ["claude-a": (200, #"{"five_hour":{"utilization":10}}"#)]
+    )
+    let fetcher = RemoteManagementQuotaFetcher(apiFactory: StubProxyManagementAPIFactory(api: api))
+    let source = RemoteQuotaSourceConfig(name: "Pool", baseURL: "https://proxy.test")
+
+    let result = try await fetcher.fetchPool(source, managementKey: "k")
+
+    XCTAssertEqual(result.quotasByProviderAndAccount[.claude]?["claude-a"]?.planType, "max")
+  }
+
+  /// Regression: Claude only ever authenticates via OAuth, so a real remote server can
+  /// report `account_type: "oauth"` for a genuinely paid account — that value describes
+  /// *how* the account authenticates, never *what plan* it is on. Passing it straight
+  /// through as the plan fallback made the tier badge read the literal word "oauth"
+  /// instead of the account's real plan (or nothing). It must be filtered out, not
+  /// displayed, and never replaced with a guessed plan like "Pro".
+  func testFetchPoolFiltersOAuthAccountTypeFromClaudePlanFallback() async throws {
+    let files = [
+      ManagedAuthFile(
+        id: "1", name: "claude-a.json", provider: "claude", status: "ready", disabled: false,
+        unavailable: false, accountType: "oauth", authIndex: "claude-a"),
+    ]
+    let api = StubProxyManagementAPI(
+      authFiles: files,
+      responses: ["claude-a": (200, #"{"five_hour":{"utilization":10}}"#)]
+    )
+    let fetcher = RemoteManagementQuotaFetcher(apiFactory: StubProxyManagementAPIFactory(api: api))
+    let source = RemoteQuotaSourceConfig(name: "Pool", baseURL: "https://proxy.test")
+
+    let result = try await fetcher.fetchPool(source, managementKey: "k")
+
+    XCTAssertNil(result.quotasByProviderAndAccount[.claude]?["claude-a"]?.planType)
+  }
+
+  /// The `api_key` auth-mechanism label must be filtered the same way `oauth` is,
+  /// regardless of casing/hyphenation, since it is never a plan name either.
+  func testFetchPoolFiltersApiKeyAccountTypeFromClaudePlanFallback() async throws {
+    let files = [
+      ManagedAuthFile(
+        id: "1", name: "claude-a.json", provider: "claude", status: "ready", disabled: false,
+        unavailable: false, accountType: "API_KEY", authIndex: "claude-a"),
+    ]
+    let api = StubProxyManagementAPI(
+      authFiles: files,
+      responses: ["claude-a": (200, #"{"five_hour":{"utilization":10}}"#)]
+    )
+    let fetcher = RemoteManagementQuotaFetcher(apiFactory: StubProxyManagementAPIFactory(api: api))
+    let source = RemoteQuotaSourceConfig(name: "Pool", baseURL: "https://proxy.test")
+
+    let result = try await fetcher.fetchPool(source, managementKey: "k")
+
+    XCTAssertNil(result.quotasByProviderAndAccount[.claude]?["claude-a"]?.planType)
+  }
+
+  /// When the management API reports no `account_type` at all, the plan must stay nil
+  /// (no guessed "Pro"/plan) rather than defaulting to some non-nil placeholder.
+  func testFetchPoolLeavesClaudePlanNilWhenAccountTypeIsMissing() async throws {
+    let files = [
+      ManagedAuthFile(
+        id: "1", name: "claude-a.json", provider: "claude", status: "ready", disabled: false,
+        unavailable: false, authIndex: "claude-a"),
+    ]
+    let api = StubProxyManagementAPI(
+      authFiles: files,
+      responses: ["claude-a": (200, #"{"five_hour":{"utilization":10}}"#)]
+    )
+    let fetcher = RemoteManagementQuotaFetcher(apiFactory: StubProxyManagementAPIFactory(api: api))
+    let source = RemoteQuotaSourceConfig(name: "Pool", baseURL: "https://proxy.test")
+
+    let result = try await fetcher.fetchPool(source, managementKey: "k")
+
+    XCTAssertNil(result.quotasByProviderAndAccount[.claude]?["claude-a"]?.planType)
+  }
+
+  // MARK: - Claude OAuth profile plan supplement
+
+  /// Claude only ever authenticates via OAuth, so a real remote server's `account_type`
+  /// never carries the real plan (see `testFetchPoolFiltersOAuthAccountTypeFromClaudePlanFallback`).
+  /// The OAuth profile endpoint is the only trusted source in that case — fetched via the
+  /// same `apiCall`/`$TOKEN$` pass-through as usage, keyed by a distinct URL so the stub
+  /// can answer the two requests differently.
+  func testFetchPoolSupplementsClaudePlanFromOAuthProfileWhenAccountTypeIsUntrusted() async throws {
+    let files = [
+      ManagedAuthFile(
+        id: "1", name: "claude-a.json", provider: "claude", status: "ready", disabled: false,
+        unavailable: false, accountType: "oauth", authIndex: "claude-a"),
+    ]
+    let profileBody =
+      #"{"account":{"has_claude_pro":true,"has_claude_max":false},"organization":{"organization_type":"claude_pro"}}"#
+    let api = StubProxyManagementAPI(
+      authFiles: files,
+      responses: [:],
+      urlResponses: [
+        ClaudeQuotaFetcher.usageURL.absoluteString: (200, #"{"five_hour":{"utilization":10}}"#),
+        ClaudeQuotaFetcher.profileURL.absoluteString: (200, profileBody),
+      ]
+    )
+    let fetcher = RemoteManagementQuotaFetcher(apiFactory: StubProxyManagementAPIFactory(api: api))
+    let source = RemoteQuotaSourceConfig(name: "Pool", baseURL: "https://proxy.test")
+
+    let result = try await fetcher.fetchPool(source, managementKey: "k")
+
+    XCTAssertEqual(result.quotasByProviderAndAccount[.claude]?["claude-a"]?.planType, "Pro")
+    XCTAssertEqual(result.quotasByProviderAndAccount[.claude]?["claude-a"]?.models.first?.percentage, 90)
+  }
+
+  /// An account mid-transition can report both entitlement flags at once; Max must win.
+  func testFetchPoolPrefersMaxOverProWhenBothProfileFlagsAreSet() async throws {
+    let files = [
+      ManagedAuthFile(
+        id: "1", name: "claude-a.json", provider: "claude", status: "ready", disabled: false,
+        unavailable: false, authIndex: "claude-a"),
+    ]
+    let profileBody = #"{"account":{"has_claude_pro":true,"has_claude_max":true}}"#
+    let api = StubProxyManagementAPI(
+      authFiles: files,
+      responses: [:],
+      urlResponses: [
+        ClaudeQuotaFetcher.usageURL.absoluteString: (200, #"{"five_hour":{"utilization":10}}"#),
+        ClaudeQuotaFetcher.profileURL.absoluteString: (200, profileBody),
+      ]
+    )
+    let fetcher = RemoteManagementQuotaFetcher(apiFactory: StubProxyManagementAPIFactory(api: api))
+    let source = RemoteQuotaSourceConfig(name: "Pool", baseURL: "https://proxy.test")
+
+    let result = try await fetcher.fetchPool(source, managementKey: "k")
+
+    XCTAssertEqual(result.quotasByProviderAndAccount[.claude]?["claude-a"]?.planType, "Max")
+  }
+
+  /// A failed/unparsable profile response must never discard a usage fetch that already
+  /// succeeded — it only leaves the plan unset, exactly as if the profile call had never
+  /// been made.
+  func testFetchPoolKeepsUsageQuotaWhenProfileRequestFails() async throws {
+    let files = [
+      ManagedAuthFile(
+        id: "1", name: "claude-a.json", provider: "claude", status: "ready", disabled: false,
+        unavailable: false, authIndex: "claude-a"),
+    ]
+    let api = StubProxyManagementAPI(
+      authFiles: files,
+      responses: [:],
+      urlResponses: [
+        ClaudeQuotaFetcher.usageURL.absoluteString: (200, #"{"five_hour":{"utilization":10}}"#),
+        ClaudeQuotaFetcher.profileURL.absoluteString: (500, "internal error"),
+      ]
+    )
+    let fetcher = RemoteManagementQuotaFetcher(apiFactory: StubProxyManagementAPIFactory(api: api))
+    let source = RemoteQuotaSourceConfig(name: "Pool", baseURL: "https://proxy.test")
+
+    let result = try await fetcher.fetchPool(source, managementKey: "k")
+
+    XCTAssertEqual(result.quotasByProviderAndAccount[.claude]?["claude-a"]?.models.first?.percentage, 90)
+    XCTAssertNil(result.quotasByProviderAndAccount[.claude]?["claude-a"]?.planType)
+  }
+
+  /// A canceled renewal must never downgrade an account that still reports
+  /// `has_claude_pro` — losing a future renewal is not the same as losing the plan the
+  /// account currently has. Uses the exact field-verified real-endpoint response shape.
+  func testFetchPoolKeepsProPlanEvenWhenSubscriptionStatusIsCanceled() async throws {
+    let files = [
+      ManagedAuthFile(
+        id: "1", name: "claude-a.json", provider: "claude", status: "ready", disabled: false,
+        unavailable: false, authIndex: "claude-a"),
+    ]
+    let profileBody =
+      #"{"account":{"has_claude_pro":true,"has_claude_max":false},"organization":{"organization_type":"claude_pro","subscription_status":"canceled","rate_limit_tier":"default_claude_ai","seat_tier":null}}"#
+    let api = StubProxyManagementAPI(
+      authFiles: files,
+      responses: [:],
+      urlResponses: [
+        ClaudeQuotaFetcher.usageURL.absoluteString: (200, #"{"five_hour":{"utilization":10}}"#),
+        ClaudeQuotaFetcher.profileURL.absoluteString: (200, profileBody),
+      ]
+    )
+    let fetcher = RemoteManagementQuotaFetcher(apiFactory: StubProxyManagementAPIFactory(api: api))
+    let source = RemoteQuotaSourceConfig(name: "Pool", baseURL: "https://proxy.test")
+
+    let result = try await fetcher.fetchPool(source, managementKey: "k")
+
+    XCTAssertEqual(result.quotasByProviderAndAccount[.claude]?["claude-a"]?.planType, "Pro")
+  }
+
+  /// Once the auth-file listing already has a trusted plan, the profile endpoint must
+  /// not be requested at all — supplementing only applies when usage/metadata provided
+  /// no trustworthy plan.
+  func testFetchPoolSkipsProfileRequestWhenAccountTypeIsAlreadyTrusted() async throws {
+    let files = [
+      ManagedAuthFile(
+        id: "1", name: "claude-a.json", provider: "claude", status: "ready", disabled: false,
+        unavailable: false, accountType: "max", authIndex: "claude-a"),
+    ]
+    let api = StubProxyManagementAPI(
+      authFiles: files,
+      responses: [:],
+      urlResponses: [
+        ClaudeQuotaFetcher.usageURL.absoluteString: (200, #"{"five_hour":{"utilization":10}}"#),
+      ]
+    )
+    let fetcher = RemoteManagementQuotaFetcher(apiFactory: StubProxyManagementAPIFactory(api: api))
+    let source = RemoteQuotaSourceConfig(name: "Pool", baseURL: "https://proxy.test")
+
+    let result = try await fetcher.fetchPool(source, managementKey: "k")
+
+    XCTAssertEqual(result.quotasByProviderAndAccount[.claude]?["claude-a"]?.planType, "max")
+    let profileCalls = await api.recordedCalls.filter { $0.url == ClaudeQuotaFetcher.profileURL.absoluteString }
+    XCTAssertTrue(profileCalls.isEmpty, "profile must not be requested once a trusted plan is already known")
   }
 
   func testIsRespondingDelegatesToManagementAPI() async {
@@ -324,6 +616,11 @@ private struct StubProxyManagementAPIFactory: ProxyManagementAPIFactory {
 private actor StubProxyManagementAPI: ProxyManagementAPI {
   private let authFilesToReturn: [ManagedAuthFile]
   private let responses: [String: (statusCode: Int, body: String)]
+  /// Keyed by the exact request URL (not `authIndex`) — needed once a single account
+  /// makes more than one distinct API call (e.g. Claude's usage + profile requests share
+  /// one `authIndex` but hit different URLs), since `responses` alone can't distinguish
+  /// them. Checked first; falls back to `responses` when a URL has no explicit entry.
+  private let urlResponses: [String: (statusCode: Int, body: String)]
   private let responding: Bool
   private let authFilesError: Bool
   private let authFilesFailure: Error?
@@ -332,12 +629,14 @@ private actor StubProxyManagementAPI: ProxyManagementAPI {
   init(
     authFiles: [ManagedAuthFile],
     responses: [String: (statusCode: Int, body: String)],
+    urlResponses: [String: (statusCode: Int, body: String)] = [:],
     responding: Bool = true,
     authFilesError: Bool = false,
     authFilesFailure: Error? = nil
   ) {
     self.authFilesToReturn = authFiles
     self.responses = responses
+    self.urlResponses = urlResponses
     self.responding = responding
     self.authFilesError = authFilesError
     self.authFilesFailure = authFilesFailure
@@ -355,6 +654,9 @@ private actor StubProxyManagementAPI: ProxyManagementAPI {
 
   func apiCall(_ request: ProxyAPICall) async throws -> ProxyAPICallResult {
     recordedCalls.append(request)
+    if let response = urlResponses[request.url] {
+      return Self.makeResult(statusCode: response.statusCode, body: response.body)
+    }
     guard let authIndex = request.authIndex, let response = responses[authIndex] else {
       return Self.makeResult(statusCode: 404, body: nil)
     }
