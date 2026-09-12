@@ -105,6 +105,33 @@ final class UserDefaultsPreferenceRepositoriesTests: XCTestCase {
         XCTAssertEqual(loaded.deselectedPoolAccounts, ["turned-off-account"])
     }
 
+    /// A pre-existing install that persisted every other menu bar preference before
+    /// `sourceGroupOrder` existed must decode it as "no custom order" (empty), falling
+    /// back to the pre-existing sort, rather than crashing or defaulting incorrectly.
+    func testMissingSourceGroupOrderDefaultsToEmptyOnAPreExistingInstall() {
+        defaults.set(true, forKey: "showMenuBarIcon")
+        defaults.set(true, forKey: "menuBarShowQuota")
+        defaults.set(3, forKey: "menuBarMaxItems")
+        // Deliberately not setting "menuBarSourceGroupOrder".
+
+        let loaded = UserDefaultsMenuBarPreferencesRepository(defaults: defaults).load()
+
+        XCTAssertTrue(loaded.sourceGroupOrder.isEmpty)
+    }
+
+    /// `sourceGroupOrder` must round-trip its exact order (not just membership) across
+    /// a save/load cycle, since position — not presence — is what the array encodes.
+    func testSourceGroupOrderRoundTripsExactOrder() {
+        var preferences = MenuBarPreferences()
+        preferences.sourceGroupOrder = ["business::codex", "plus::codex", "plus::claude"]
+        let repository = UserDefaultsMenuBarPreferencesRepository(defaults: defaults)
+
+        repository.save(preferences)
+        let reloaded = repository.load()
+
+        XCTAssertEqual(reloaded.sourceGroupOrder, ["business::codex", "plus::codex", "plus::claude"])
+    }
+
     /// Regression: raw storage must never truncate `selectedItems` to `menuBarMaxItems`
     /// on either `save` or `load` — only *effective* occupancy is capacity-limited, and
     /// the repository has no visibility into which legacy pool pins currently cover a

@@ -93,7 +93,11 @@ public final class UserDefaultsMenuBarPreferencesRepository: MenuBarPreferencesR
             // Also not truncated: it hides entries from the dropdown regardless of how
             // many items fit in the menu bar, and pre-existing installs have no such key
             // yet, so an absent value must decode to "nothing hidden".
-            hiddenDropdownKeys: Set(defaults.stringArray(forKey: "menuBarHiddenDropdownKeys") ?? [])
+            hiddenDropdownKeys: Set(defaults.stringArray(forKey: "menuBarHiddenDropdownKeys") ?? []),
+            // Order (not membership), so unlike the two sets above this must stay an
+            // array — `stringArray(forKey:)` preserves insertion order the same way
+            // `set(_:forKey:)` below writes it.
+            sourceGroupOrder: defaults.stringArray(forKey: "menuBarSourceGroupOrder") ?? []
         )
     }
 
@@ -113,6 +117,7 @@ public final class UserDefaultsMenuBarPreferencesRepository: MenuBarPreferencesR
         defaults.set(preferences.hasUserModifiedMenuBar, forKey: "hasUserModifiedMenuBar")
         defaults.set(preferences.deselectedPoolAccounts.sorted(), forKey: "menuBarDeselectedPoolAccounts")
         defaults.set(preferences.hiddenDropdownKeys.sorted(), forKey: "menuBarHiddenDropdownKeys")
+        defaults.set(preferences.sourceGroupOrder, forKey: "menuBarSourceGroupOrder")
         // Not truncated by `maximum` — see the matching note in `load()`.
         if let data = try? JSONEncoder().encode(preferences.selectedItems) {
             defaults.set(data, forKey: "menuBarSelectedQuotaItems")

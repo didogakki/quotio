@@ -406,11 +406,12 @@ public actor CodexQuotaFetcher: QuotaFetching {
     var quota = try Self.mapUsage(
       data, planFallback: LocalCodexQuotaCredentialLoader.claims(credential.idToken)["plan"],
       now: updatedAt)
-    if let analytics = try? await CodexResetCreditInventoryFetcher(
+    if let result = try? await CodexResetCreditInventoryFetcher(
       session: session,
       now: { updatedAt }
     ).fetch(accessToken: token, accountID: credential.accountID) {
-      quota.analytics = CodexResetCreditInventoryFetcher.merge(analytics, into: quota.analytics)
+      quota.analytics = CodexResetCreditInventoryFetcher.merge(result.analytics, into: quota.analytics)
+      quota.codexResetCreditSummary = result.summary
     }
     if let analytics = try? await CodexProfileAnalyticsFetcher(
       session: session,

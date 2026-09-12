@@ -51,6 +51,20 @@ struct ProviderDisclosureGroup: View {
         return AccountSorting.prioritizingActive(accounts, isActive: isAccountActive)
     }
 
+    /// Every remote-source group key currently visible under this provider — the scope
+    /// `MenuBarSettingsManager.moveSourceGroup` moves a source's rank within, so "move
+    /// up/down" only ever reorders relative to sources actually shown here right now.
+    private var sourceGroupSiblingKeys: [String] {
+        var seen = Set<String>()
+        var keys: [String] = []
+        for account in accounts {
+            guard let sourceConfigId = account.sourceConfigId else { continue }
+            let key = RemoteQuotaSourceGroupIdentity.key(sourceId: sourceConfigId, provider: provider)
+            if seen.insert(key).inserted { keys.append(key) }
+        }
+        return keys
+    }
+
     var body: some View {
         DisclosureGroup(isExpanded: $isExpanded) {
             ForEach(displayedAccounts) { account in
@@ -63,7 +77,8 @@ struct ProviderDisclosureGroup: View {
                     onDownload: account.canDownloadAuthFile && onDownloadAccount != nil
                         ? { onDownloadAccount?(account) }
                         : nil,
-                    isActiveInIDE: isAccountActive?(account) ?? false
+                    isActiveInIDE: isAccountActive?(account) ?? false,
+                    sourceGroupSiblingKeys: sourceGroupSiblingKeys
                 )
                 // A plan-aggregate row stays at the group's base indent, like a
                 // sub-header; the real remote accounts it summarizes sit one step

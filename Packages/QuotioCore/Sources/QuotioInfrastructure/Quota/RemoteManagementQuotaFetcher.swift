@@ -89,7 +89,7 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
             guard let provider = file.providerID else { continue }
             let accountKey = file.authIndex ?? file.name
             knownAccountKeys[provider, default: []].insert(accountKey)
-            guard var quota = try? await fetchQuota(provider: provider, file: file, api: api) else {
+            guard var quota = try? await fetchQuota(provider: provider, file: file, source: source, api: api) else {
                 continue
             }
             succeededCount += 1
@@ -119,6 +119,32 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
         )
     }
 
+    private static let grokAPIHeaders = [
+        "Authorization": "Bearer $TOKEN$",
+        "X-XAI-Token-Auth": "xai-grok-cli",
+        "Accept": "application/json",
+        "User-Agent": "Quotio",
+    ]
+
+    /// Fetches `GET /v1/settings` through the same `$TOKEN$` pass-through as billing
+    /// and reads `subscription_tier_display` — mirroring `GrokQuotaFetcher`'s local
+    /// path. Best-effort supplement: swallows every failure into `nil`, exactly like
+    /// `fetchClaudeProfilePlan`, so a failed/unparsable settings response never blocks
+    /// the billing quota that already succeeded.
+    private func fetchGrokSettingsPlan(authIndex: String, api: any ProxyManagementAPI) async -> String? {
+        guard let result = try? await api.apiCall(ProxyAPICall(
+            authIndex: authIndex,
+            method: "GET",
+            url: "https://cli-chat-proxy.grok.com/v1/settings",
+            header: Self.grokAPIHeaders,
+            data: nil
+        )), let data = bodyData(result),
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        let value = (json["subscription_tier_display"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (value?.isEmpty ?? true) ? nil : value
+    }
+
     private static let claudeAPIHeaders = [
         "Authorization": "Bearer $TOKEN$",
         "Accept": "application/json",
@@ -142,6 +168,33 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
         return ClaudeQuotaFetcher.mapProfilePlan(data)
     }
 
+    /// Fetches `GET wham/rate-limit-reset-credits` through the same `$TOKEN$`
+    /// pass-through as the usage call — the remote CLIProxyAPI server substitutes the
+    /// real access token server-side, so it never reaches Quotio, matching every other
+    /// remote quota request. Best-effort supplement to a usage fetch that already
+    /// succeeded: swallows every failure into `nil`, exactly like
+    /// `fetchClaudeProfilePlan`, so a reset-credit fetch failure never discards the
+    /// quota usage reading that already succeeded. This function has no memory of a
+    /// previous round by itself, so a failure here means the `ProviderQuota` returned
+    /// this round simply has no reset-credit data of its own — it is
+    /// `RemoteQuotaSourceCoordinator.refresh` (via `QuotaPolicy.mergingCodexResetCredits`)
+    /// that re-attaches the previous round's `codexResetCreditSummary`/analytics rows
+    /// when merging, so the account doesn't visibly lose them for one failed round.
+    private func fetchCodexResetCredits(
+        authIndex: String,
+        accountId: String?,
+        api: any ProxyManagementAPI
+    ) async -> (analytics: QuotaAnalytics, summary: CodexResetCreditSummary)? {
+        guard let result = try? await api.apiCall(ProxyAPICall(
+            authIndex: authIndex,
+            method: "GET",
+            url: CodexResetCreditInventoryFetcher.inventoryURL.absoluteString,
+            header: CodexResetCreditInventoryFetcher.headers(accessToken: "$TOKEN$", accountID: accountId),
+            data: nil
+        )), let data = bodyData(result) else { return nil }
+        return try? CodexResetCreditInventoryFetcher.parse(data, now: now())
+    }
+
     private func makeAPI(
         _ source: RemoteQuotaSourceConfig,
         managementKey: String
@@ -154,6 +207,7 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
     private func fetchQuota(
         provider: QuotaProvider,
         file: ManagedAuthFile,
+        source: RemoteQuotaSourceConfig,
         api: any ProxyManagementAPI
     ) async throws -> ProviderQuota? {
         let authIndex = file.authIndex ?? file.name
@@ -195,24 +249,37 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
                 data: nil
             ))
             guard let data = bodyData(result) else { return nil }
-            return try? CodexQuotaFetcher.mapUsage(data, planFallback: trustedPlanFallback(file), now: now())
+            guard var quota = try? CodexQuotaFetcher.mapUsage(data, planFallback: trustedPlanFallback(file), now: now()) else {
+                return nil
+            }
+            if let resetCredits = await fetchCodexResetCredits(authIndex: authIndex, accountId: file.account, api: api) {
+                quota.analytics = CodexResetCreditInventoryFetcher.merge(resetCredits.analytics, into: quota.analytics)
+                quota.codexResetCreditSummary = resetCredits.summary
+            }
+            return quota
 
         case .grok:
             let result = try await api.apiCall(ProxyAPICall(
                 authIndex: authIndex,
                 method: "GET",
                 url: "https://cli-chat-proxy.grok.com/v1/billing?format=credits",
-                header: [
-                    "Authorization": "Bearer $TOKEN$",
-                    "X-XAI-Token-Auth": "xai-grok-cli",
-                    "Accept": "application/json",
-                    "User-Agent": "Quotio",
-                ],
+                header: Self.grokAPIHeaders,
                 data: nil
             ))
             guard let data = bodyData(result) else { return nil }
             let displayName = file.email?.nilIfBlank ?? file.name
-            return GrokQuotaFetcher.mapBilling(data, plan: trustedPlanFallback(file), displayName: displayName, now: now())
+            // Prefer real metadata: the auth-file listing carries no per-account Grok
+            // plan field, so `/v1/settings` (the same endpoint the local Grok fetcher
+            // uses) is the only trustworthy signal, tried through the same `$TOKEN$`
+            // pass-through as billing. This fetcher deliberately never guesses beyond
+            // that — the narrowly source-scoped "Premium" legacy default (see
+            // `QuotaPolicy.legacyGrokPlanDefault`) is applied downstream by
+            // `RemoteQuotaSourceCoordinator`, which is the layer that actually owns a
+            // source's stable `id` across renames; a fetch round here has no memory of
+            // that identity beyond the single `RemoteQuotaSourceConfig` it was called
+            // with.
+            let plan = await fetchGrokSettingsPlan(authIndex: authIndex, api: api) ?? trustedPlanFallback(file)
+            return GrokQuotaFetcher.mapBilling(data, plan: plan, displayName: displayName, now: now())
 
         default:
             return nil

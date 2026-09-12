@@ -208,6 +208,24 @@ public struct QuotaAnalyticsRow: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
+/// One Codex account's currently-available rate-limit reset credits, as last reported
+/// by the `wham/rate-limit-reset-credits` endpoint (see `CodexResetCreditInventoryFetcher`)
+/// — never from the local Codex CLI/app's own data. `availableCount` and
+/// `nearestExpiryAt` are computed from the same available-and-unexpired-at-fetch-time
+/// filter, so they always describe the same set of credits. `nil` on `ProviderQuota`
+/// means "no successful fetch yet" — never a synthetic zero.
+public struct CodexResetCreditSummary: Codable, Equatable, Sendable {
+    public let availableCount: Int
+    /// `nil` when `availableCount` is 0, or when every available credit happens to
+    /// carry no expiry at all — never a fabricated date.
+    public let nearestExpiryAt: Date?
+
+    public init(availableCount: Int, nearestExpiryAt: Date?) {
+        self.availableCount = availableCount
+        self.nearestExpiryAt = nearestExpiryAt
+    }
+}
+
 public struct ProviderQuota: Codable, Equatable, Sendable {
     public var models: [QuotaMetric]
     public var lastUpdated: Date
@@ -216,6 +234,7 @@ public struct ProviderQuota: Codable, Equatable, Sendable {
     public var tokenExpiresAt: Date?
     public var analytics: QuotaAnalytics?
     public var accountDisplayName: String?
+    public var codexResetCreditSummary: CodexResetCreditSummary?
 
     public init(
         models: [QuotaMetric] = [],
@@ -224,7 +243,8 @@ public struct ProviderQuota: Codable, Equatable, Sendable {
         planType: String? = nil,
         tokenExpiresAt: Date? = nil,
         analytics: QuotaAnalytics? = nil,
-        accountDisplayName: String? = nil
+        accountDisplayName: String? = nil,
+        codexResetCreditSummary: CodexResetCreditSummary? = nil
     ) {
         self.models = models
         self.lastUpdated = lastUpdated
@@ -233,6 +253,7 @@ public struct ProviderQuota: Codable, Equatable, Sendable {
         self.tokenExpiresAt = tokenExpiresAt
         self.analytics = analytics
         self.accountDisplayName = accountDisplayName
+        self.codexResetCreditSummary = codexResetCreditSummary
     }
 }
 
@@ -388,6 +409,80 @@ public enum QuotaPolicy {
         return result.isEmpty ? "unknown" : result
     }
 
+    /// One-time default for a specific, already-existing remote source — confirmed by
+    /// the user (2026-09-09) to have its Grok/xAI account on the "Premium" plan — whose
+    /// CLIProxyAPI management API reports no plan metadata for that account at all.
+    /// Unlike Claude/Codex, the remote Grok fetch path has no per-account plan field on
+    /// the auth-file listing; `/v1/settings`'s `subscription_tier_display` (tried first,
+    /// mirroring the local Grok fetcher) is the only real metadata signal, and this
+    /// default is only ever consulted when that comes back empty too.
+    ///
+    /// Scoped by `sourceId` — `RemoteQuotaSourceConfig.id`, never its user-editable
+    /// `name` — so it survives that one source being renamed, and a different,
+    /// unrelated source that merely shares a display name with it never qualifies.
+    /// `knownLegacySourceId` is the caller's already-resolved stable identity for that
+    /// one confirmed source (see `RemoteQuotaSourceCoordinator`, which captures it once
+    /// by name and remembers it by id from then on) — never a blanket "every unknown
+    /// Grok account, or every unknown provider, is Premium" default. Real metadata, once
+    /// available (now or in the future), always wins over this default; blank/whitespace
+    /// metadata is normalized to "missing" rather than displayed verbatim.
+    public static func legacyGrokPlanDefault(
+        sourceId: String,
+        knownLegacySourceId: String?,
+        rawPlanType: String?
+    ) -> String? {
+        let isBlank = rawPlanType?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true
+        guard isBlank else { return rawPlanType }
+        guard sourceId == knownLegacySourceId else { return nil }
+        return "Premium"
+    }
+
+    /// Well-known ids of the Codex reset-credit analytics rows produced by
+    /// `CodexResetCreditInventoryFetcher` — the summary row plus one row per available
+    /// credit. Exposed here (rather than only as private literals in Infrastructure/
+    /// Presentation) so `mergingCodexResetCredits` can identify them without owning the
+    /// full row-building logic itself.
+    private static let codexResetCreditSummaryRowID = "codex-rate-limit-resets"
+    private static let codexResetCreditRowIDPrefix = "codex-rate-limit-reset-"
+
+    /// Merges one refresh round's freshly-fetched reading (`new`) on top of the last
+    /// successful reading for the *same* account (`old`) — intended for a
+    /// `Dictionary.merge(_:uniquingKeysWith:)` combine closure, which only ever runs on
+    /// key collisions, so this can never mix data across different accounts or sources.
+    ///
+    /// Codex's reset-credit inventory is fetched by a separate, best-effort request
+    /// that can fail even when the round's main usage fetch succeeds (see
+    /// `RemoteManagementQuotaFetcher`'s Codex path); when that happens, `new` carries no
+    /// reset-credit data of its own (`codexResetCreditSummary == nil`). Without this,
+    /// the account would visibly lose its reset-credit summary and analytics rows for
+    /// one failed round even though nothing about the account actually changed. A `new`
+    /// summary that is non-nil — including a genuine zero reading — always wins, since
+    /// that is a real fresh result, never a failure.
+    public static func mergingCodexResetCredits(old: ProviderQuota?, new: ProviderQuota) -> ProviderQuota {
+        guard new.codexResetCreditSummary == nil,
+              let old, let oldSummary = old.codexResetCreditSummary else {
+            return new
+        }
+
+        var merged = new
+        merged.codexResetCreditSummary = oldSummary
+
+        let staleResetRows = old.analytics?.rows.filter {
+            $0.id == codexResetCreditSummaryRowID || $0.id.hasPrefix(codexResetCreditRowIDPrefix)
+        } ?? []
+        guard !staleResetRows.isEmpty else { return merged }
+
+        var rows = merged.analytics?.rows ?? []
+        let existingIDs = Set(rows.map(\.id))
+        rows.append(contentsOf: staleResetRows.filter { !existingIDs.contains($0.id) })
+        merged.analytics = QuotaAnalytics(
+            trend: merged.analytics?.trend ?? [],
+            rows: rows,
+            note: merged.analytics?.note
+        )
+        return merged
+    }
+
     /// User-facing label for a normalized plan key. Claude's "Plus" plan has always
     /// displayed as "Pro" in this app's UI, so that one mapping is provider-specific.
     public static func planGroupDisplayLabel(
@@ -395,7 +490,11 @@ public enum QuotaPolicy {
         planKey: String,
         rawPlanType: String?
     ) -> String {
-        if provider == .claude, planKey == "plus" { return "Pro" }
+        // Claude has no "Pro 5x"/"Pro 20x" tiering — that naming is Codex-specific. Its
+        // own "Pro" plan (and the older "Plus" label some cached data still carries)
+        // must never fall through to the generic `pro`/`plus` cases below, which are
+        // written for Codex's tiered plan names.
+        if provider == .claude, planKey == "plus" || planKey == "pro" { return "Pro" }
         switch planKey {
         case "plus": return "Plus"
         case "business": return "Business"

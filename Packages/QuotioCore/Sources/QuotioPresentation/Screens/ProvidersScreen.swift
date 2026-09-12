@@ -199,8 +199,19 @@ struct ProvidersScreen: View {
                 }
             }
 
+            let sourceGroupOrder = menuBarSettings.sourceGroupOrder
             for (provider, entries) in remoteRowsByProvider {
                 let sorted = entries.sorted { lhs, rhs in
+                    let lhsKey = lhs.row.sourceConfigId.map {
+                        RemoteQuotaSourceGroupIdentity.key(sourceId: $0, provider: provider)
+                    }
+                    let rhsKey = rhs.row.sourceConfigId.map {
+                        RemoteQuotaSourceGroupIdentity.key(sourceId: $0, provider: provider)
+                    }
+                    if let lhsKey, let rhsKey,
+                       let ranked = RemoteQuotaSourceGroupOrdering.precedes(lhsKey, rhsKey, order: sourceGroupOrder) {
+                        return ranked
+                    }
                     let lhsSource = lhs.row.source.remoteSourceName ?? ""
                     let rhsSource = rhs.row.source.remoteSourceName ?? ""
                     if lhsSource != rhsSource { return lhsSource < rhsSource }

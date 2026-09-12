@@ -142,6 +142,15 @@ public struct MenuBarPreferences: Equatable, Sendable {
     /// on different providers — that happen to share a raw key/email can never collide
     /// in this set. Defaults to empty so pre-existing persisted state decodes unchanged.
     public var hiddenDropdownKeys: Set<String>
+    /// User-customized display order for `RemoteQuotaSourceGroupIdentity` keys — one
+    /// entry per configured remote source's accounts under one provider. Position in the
+    /// array is the rank; a key absent from this list has no persisted rank and falls
+    /// back to the pre-existing (alphabetical) sort. Drives the Accounts page's
+    /// source/provider group order and, from the same persisted state, the menu bar
+    /// dropdown's group order — never reordered automatically from live quota data.
+    /// Defaults to empty so pre-existing installs keep today's alphabetical order until
+    /// the user explicitly reorders something.
+    public var sourceGroupOrder: [String]
 
     public init(
         showMenuBarIcon: Bool = true,
@@ -158,7 +167,8 @@ public struct MenuBarPreferences: Equatable, Sendable {
         modelAggregationMode: ModelAggregationMode = .lowest,
         hasUserModifiedMenuBar: Bool = false,
         deselectedPoolAccounts: Set<String> = [],
-        hiddenDropdownKeys: Set<String> = []
+        hiddenDropdownKeys: Set<String> = [],
+        sourceGroupOrder: [String] = []
     ) {
         self.showMenuBarIcon = showMenuBarIcon
         self.showQuotaInMenuBar = showQuotaInMenuBar
@@ -175,6 +185,7 @@ public struct MenuBarPreferences: Equatable, Sendable {
         self.hasUserModifiedMenuBar = hasUserModifiedMenuBar
         self.deselectedPoolAccounts = deselectedPoolAccounts
         self.hiddenDropdownKeys = hiddenDropdownKeys
+        self.sourceGroupOrder = sourceGroupOrder
     }
 }
 

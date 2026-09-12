@@ -17,27 +17,47 @@ nonisolated struct CodexResetCreditInventoryFetcher: Sendable {
     self.now = now
   }
 
-  func fetch(accessToken: String, accountID: String?) async throws -> QuotaAnalytics? {
+  func fetch(accessToken: String, accountID: String?) async throws
+    -> (analytics: QuotaAnalytics, summary: CodexResetCreditSummary)?
+  {
     var request = URLRequest(url: Self.inventoryURL, timeoutInterval: 4)
-    request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-    request.setValue("application/json", forHTTPHeaderField: "Accept")
-    request.setValue("codex-1", forHTTPHeaderField: "OpenAI-Beta")
-    request.setValue("Codex Desktop", forHTTPHeaderField: "originator")
-    if let accountID, !accountID.isEmpty {
-      request.setValue(accountID, forHTTPHeaderField: "ChatGPT-Account-Id")
+    for (field, value) in Self.headers(accessToken: accessToken, accountID: accountID) {
+      request.setValue(value, forHTTPHeaderField: field)
     }
 
     let (data, response) = try await session.data(for: request)
     guard let http = response as? HTTPURLResponse, 200...299 ~= http.statusCode else {
       return nil
     }
+    return try Self.parse(data, now: now())
+  }
 
+  /// Request headers shared between the local direct-`URLSession` path (`fetch`) and a
+  /// remote CLIProxyAPI's `$TOKEN$` pass-through, which sends this same header set
+  /// through the proxy without ever exposing `accessToken` to Quotio itself.
+  static func headers(accessToken: String, accountID: String?) -> [String: String] {
+    var header = [
+      "Authorization": "Bearer \(accessToken)",
+      "Accept": "application/json",
+      "OpenAI-Beta": "codex-1",
+      "originator": "Codex Desktop",
+    ]
+    if let accountID, !accountID.isEmpty {
+      header["ChatGPT-Account-Id"] = accountID
+    }
+    return header
+  }
+
+  /// Decodes and maps one `wham/rate-limit-reset-credits` response body — shared by the
+  /// local and remote fetch paths so both stay byte-for-byte consistent.
+  static func parse(_ data: Data, now updatedAt: Date) throws
+    -> (analytics: QuotaAnalytics, summary: CodexResetCreditSummary)?
+  {
     let decoder = JSONDecoder()
     decoder.dateDecodingStrategy = .custom(Self.decodeISO8601Date)
     let payload = try decoder.decode(Response.self, from: data)
     guard payload.availableCount >= 0 else { return nil }
 
-    let updatedAt = now()
     var rows = [
       QuotaAnalyticsRow(
         id: "codex-rate-limit-resets",
@@ -60,7 +80,14 @@ nonisolated struct CodexResetCreditInventoryFetcher: Sendable {
         title: Self.expiryDateLabel(credit.expiresAt),
         value: Self.expiryRelativeLabel(credit.expiresAt, from: updatedAt))
     })
-    return QuotaAnalytics(rows: rows)
+    let summary = CodexResetCreditSummary(
+      availableCount: availableCredits.count,
+      // Non-nil dates sort first (see the comparator above), so the first available
+      // credit that actually carries an expiry is the nearest one — falling through to
+      // `nil` only when every available credit has none.
+      nearestExpiryAt: availableCredits.first { $0.expiresAt != nil }?.expiresAt
+    )
+    return (QuotaAnalytics(rows: rows), summary)
   }
 
   static func merge(_ resetCredits: QuotaAnalytics, into analytics: QuotaAnalytics?)
@@ -79,12 +106,12 @@ nonisolated struct CodexResetCreditInventoryFetcher: Sendable {
       .joined()
   }
 
+  /// Fixed `Asia/Tokyo`/`en_US_POSIX` absolute datetime — matches every other
+  /// reset-credit/expiry display in the app (see `QuotaDateFormatting`) rather than
+  /// drifting to the device's own locale/timezone.
   private static func expiryDateLabel(_ date: Date?) -> String {
     guard let date else { return "No expiry" }
-    let formatter = DateFormatter()
-    formatter.locale = Locale(identifier: "en_US_POSIX")
-    formatter.dateFormat = "d MMM · HH:mm"
-    return formatter.string(from: date)
+    return QuotaDateFormatting.absoluteJST(date)
   }
 
   private static func expiryRelativeLabel(_ expiry: Date?, from date: Date) -> String {

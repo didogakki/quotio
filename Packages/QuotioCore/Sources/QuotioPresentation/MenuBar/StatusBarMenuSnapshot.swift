@@ -117,7 +117,8 @@ public enum StatusBarMenuSnapshotMapper {
                 provider: provider,
                 activeAntigravityEmail: activeAntigravityEmail,
                 remoteSourceNames: remoteSourceNames,
-                hiddenDropdownKeys: hiddenDropdownKeys
+                hiddenDropdownKeys: hiddenDropdownKeys,
+                sourceGroupOrder: menuBarPreferences.sourceGroupOrder
             ).map { group in
                 StatusBarMenuAccountGroup(
                     origin: group.origin,
@@ -204,12 +205,18 @@ public enum StatusBarMenuSnapshotMapper {
     /// a local and a remote account can never cause an unrelated account to be hidden. A
     /// remote source whose every account ends up hidden this way contributes no group at
     /// all, rather than an empty one.
+    ///
+    /// `sourceGroupOrder` (see `MenuBarPreferences.sourceGroupOrder`) ranks remote-source
+    /// subgroups when the user has customized their order; a source with no persisted
+    /// rank falls back to the pre-existing alphabetical-by-name sort, so an unranked
+    /// source never jumps ahead of one the user explicitly placed.
     nonisolated static func accountGroups(
         _ quotas: [String: ProviderQuota],
         provider: QuotaProvider,
         activeAntigravityEmail: String?,
         remoteSourceNames: [String: String],
-        hiddenDropdownKeys: Set<String> = []
+        hiddenDropdownKeys: Set<String> = [],
+        sourceGroupOrder: [String] = []
     ) -> [(origin: StatusBarMenuAccountOrigin, accounts: [(accountKey: String, email: String, data: ProviderQuota)])] {
         var localEntries: [(accountKey: String, email: String, data: ProviderQuota)] = []
         var remoteEntriesBySource: [String: [(accountKey: String, email: String, data: ProviderQuota)]] = [:]
@@ -249,8 +256,13 @@ public enum StatusBarMenuSnapshotMapper {
         if !localEntries.isEmpty {
             groups.append((origin: .local, accounts: ordered(localEntries)))
         }
-        for sourceId in remoteSourceOrder.sorted(by: {
-            (remoteSourceNames[$0] ?? $0) < (remoteSourceNames[$1] ?? $1)
+        for sourceId in remoteSourceOrder.sorted(by: { lhs, rhs in
+            let lhsKey = RemoteQuotaSourceGroupIdentity.key(sourceId: lhs, provider: provider)
+            let rhsKey = RemoteQuotaSourceGroupIdentity.key(sourceId: rhs, provider: provider)
+            if let ranked = RemoteQuotaSourceGroupOrdering.precedes(lhsKey, rhsKey, order: sourceGroupOrder) {
+                return ranked
+            }
+            return (remoteSourceNames[lhs] ?? lhs) < (remoteSourceNames[rhs] ?? rhs)
         }) {
             guard let entries = remoteEntriesBySource[sourceId] else { continue }
             let sourceName = remoteSourceNames[sourceId] ?? sourceId

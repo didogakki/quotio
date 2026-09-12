@@ -592,6 +592,132 @@ final class RemoteManagementQuotaFetcherTests: XCTestCase {
     XCTAssertTrue(profileCalls.isEmpty, "profile must not be requested once a trusted plan is already known")
   }
 
+  // MARK: - Codex reset-credit supplement (remote CPA accounts)
+
+  /// Every CPA Codex account must get its reset-credit summary the same way local
+  /// Codex accounts do — via the `$TOKEN$` pass-through, never a direct token.
+  func testFetchPoolSupplementsCodexResetCreditSummaryForRemoteAccounts() async throws {
+    let files = [
+      ManagedAuthFile(
+        id: "1", name: "codex-a.json", provider: "codex", status: "ready", disabled: false,
+        unavailable: false, account: "acct-a", authIndex: "codex-a"),
+    ]
+    let resetCreditsBody =
+      #"{"available_count":1,"credits":[{"id":"c1","status":"available","expires_at":"2026-09-21T07:22:00Z"}]}"#
+    let api = StubProxyManagementAPI(
+      authFiles: files,
+      responses: [:],
+      urlResponses: [
+        CodexQuotaFetcher.usageURL.absoluteString: (200, #"{"rate_limit":{"primary_window":{"used_percent":25}}}"#),
+        CodexResetCreditInventoryFetcher.inventoryURL.absoluteString: (200, resetCreditsBody),
+      ]
+    )
+    let fetcher = RemoteManagementQuotaFetcher(
+      apiFactory: StubProxyManagementAPIFactory(api: api),
+      now: { Date(timeIntervalSince1970: 1_700_000_000) }
+    )
+    let source = RemoteQuotaSourceConfig(name: "Pool", baseURL: "https://proxy.test")
+
+    let result = try await fetcher.fetchPool(source, managementKey: "k")
+
+    let summary = result.quotasByProviderAndAccount[.codex]?["codex-a"]?.codexResetCreditSummary
+    XCTAssertEqual(summary?.availableCount, 1)
+    XCTAssertEqual(summary?.nearestExpiryAt, ISO8601DateFormatter().date(from: "2026-09-21T07:22:00Z"))
+
+    let resetCreditsCall = await api.recordedCalls.first {
+      $0.url == CodexResetCreditInventoryFetcher.inventoryURL.absoluteString
+    }
+    XCTAssertEqual(resetCreditsCall?.header?["Authorization"], "Bearer $TOKEN$")
+    XCTAssertEqual(resetCreditsCall?.header?["ChatGPT-Account-Id"], "acct-a")
+  }
+
+  /// A failed/unparsable reset-credit response must never discard a usage fetch that
+  /// already succeeded — mirroring `testFetchPoolKeepsUsageQuotaWhenProfileRequestFails`
+  /// for Claude's profile supplement.
+  func testFetchPoolKeepsCodexUsageQuotaWhenResetCreditRequestFails() async throws {
+    let files = [
+      ManagedAuthFile(
+        id: "1", name: "codex-a.json", provider: "codex", status: "ready", disabled: false,
+        unavailable: false, authIndex: "codex-a"),
+    ]
+    let api = StubProxyManagementAPI(
+      authFiles: files,
+      responses: [:],
+      urlResponses: [
+        CodexQuotaFetcher.usageURL.absoluteString: (200, #"{"rate_limit":{"primary_window":{"used_percent":25}}}"#),
+        CodexResetCreditInventoryFetcher.inventoryURL.absoluteString: (500, "internal error"),
+      ]
+    )
+    let fetcher = RemoteManagementQuotaFetcher(apiFactory: StubProxyManagementAPIFactory(api: api))
+    let source = RemoteQuotaSourceConfig(name: "Pool", baseURL: "https://proxy.test")
+
+    let result = try await fetcher.fetchPool(source, managementKey: "k")
+
+    XCTAssertEqual(result.quotasByProviderAndAccount[.codex]?["codex-a"]?.models.first?.percentage, 75)
+    XCTAssertNil(result.quotasByProviderAndAccount[.codex]?["codex-a"]?.codexResetCreditSummary)
+  }
+
+  // MARK: - Grok plan resolution (remote CPA accounts)
+
+  /// Real `/v1/settings` metadata (mirroring the local Grok fetcher) must be preferred
+  /// over the narrowly source-scoped legacy default.
+  func testFetchPoolPrefersGrokSettingsPlanOverLegacyDefault() async throws {
+    let files = [
+      ManagedAuthFile(
+        id: "1", name: "grok-a.json", provider: "grok", status: "ready", disabled: false,
+        unavailable: false, authIndex: "grok-a"),
+    ]
+    let billingBody = """
+      {"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2026-01-01T00:00:00Z"},"creditUsagePercent":10,"onDemandCap":{"val":0}}}
+      """
+    let api = StubProxyManagementAPI(
+      authFiles: files,
+      responses: [:],
+      urlResponses: [
+        "https://cli-chat-proxy.grok.com/v1/billing?format=credits": (200, billingBody),
+        "https://cli-chat-proxy.grok.com/v1/settings": (200, #"{"subscription_tier_display":"Basic"}"#),
+      ]
+    )
+    let fetcher = RemoteManagementQuotaFetcher(apiFactory: StubProxyManagementAPIFactory(api: api))
+    // Named exactly like the source the legacy default targets — real metadata must
+    // still win over it.
+    let source = RemoteQuotaSourceConfig(name: "CLIProxyAPI Plus", baseURL: "https://proxy.test")
+
+    let result = try await fetcher.fetchPool(source, managementKey: "k")
+
+    XCTAssertEqual(result.quotasByProviderAndAccount[.grok]?["grok-a"]?.planType, "Basic")
+  }
+
+  /// The narrowly source-scoped "Premium" legacy default (see
+  /// `QuotaPolicy.legacyGrokPlanDefault`) is applied downstream by
+  /// `RemoteQuotaSourceCoordinator`, not this fetcher — a fetch round has no memory of
+  /// a source's identity across refreshes, so without real metadata the plan must stay
+  /// nil here, regardless of the source's display name.
+  func testFetchPoolNeverGuessesAPlanWithoutRealMetadata() async throws {
+    let files = [
+      ManagedAuthFile(
+        id: "1", name: "grok-a.json", provider: "grok", status: "ready", disabled: false,
+        unavailable: false, authIndex: "grok-a"),
+    ]
+    let billingBody = """
+      {"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2026-01-01T00:00:00Z"},"creditUsagePercent":10,"onDemandCap":{"val":0}}}
+      """
+    let api = StubProxyManagementAPI(
+      authFiles: files,
+      responses: [:],
+      urlResponses: [
+        "https://cli-chat-proxy.grok.com/v1/billing?format=credits": (200, billingBody),
+        // No settings entry -> settings fetch 404s -> no real metadata available.
+      ]
+    )
+    let fetcher = RemoteManagementQuotaFetcher(apiFactory: StubProxyManagementAPIFactory(api: api))
+
+    let source = RemoteQuotaSourceConfig(name: "CLIProxyAPI Plus", baseURL: "https://proxy.test")
+    let result = try await fetcher.fetchPool(source, managementKey: "k")
+
+    XCTAssertNil(result.quotasByProviderAndAccount[.grok]?["grok-a"]?.planType)
+  }
+
   func testIsRespondingDelegatesToManagementAPI() async {
     let api = StubProxyManagementAPI(authFiles: [], responses: [:], responding: true)
     let fetcher = RemoteManagementQuotaFetcher(apiFactory: StubProxyManagementAPIFactory(api: api))

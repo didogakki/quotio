@@ -8,17 +8,30 @@ public struct RemoteQuotaSourceConfig: Codable, Equatable, Identifiable, Sendabl
     public var name: String
     public var baseURL: String
     public var isEnabled: Bool
+    /// Set (and persisted, via `RemoteQuotaSourceRepository.save`) exactly once, on
+    /// whichever already-saved source is first resolved by
+    /// `RemoteQuotaSourceCoordinator` as the one confirmed to be the legacy Grok "Plus"
+    /// default's source (see `QuotaPolicy.legacyGrokPlanDefault`). Kept `nil`/absent for
+    /// every other source, including a different, unrelated source that merely shares
+    /// that one source's original display name. Once set, this — not the name — is the
+    /// stable, cold-relaunch-safe identity that survives that source being renamed;
+    /// `Optional` so a config persisted before this flag existed decodes with it simply
+    /// absent (never as `false`, which would be indistinguishable from "confirmed not
+    /// this source").
+    public var isLegacyGrokPlusSource: Bool?
 
     public init(
         id: String = UUID().uuidString,
         name: String,
         baseURL: String,
-        isEnabled: Bool = true
+        isEnabled: Bool = true,
+        isLegacyGrokPlusSource: Bool? = nil
     ) {
         self.id = id
         self.name = name
         self.baseURL = baseURL
         self.isEnabled = isEnabled
+        self.isLegacyGrokPlusSource = isLegacyGrokPlusSource
     }
 
     /// Normalizes the configured base URL to the CLIProxyAPI management root,

@@ -924,7 +924,7 @@ private final class ProductionAppRuntimeServices: AppRuntimeServices {
 
         let providerQuotas = mergedProviderQuotas
         let aggregateQuotas = aggregateProviderQuotas
-        let items = menuBarSettings.selectedItems.flatMap { selectedItem -> [MenuBarQuotaDisplayItem] in
+        let items = menuBarSettings.statusBarSelectedItems.flatMap { selectedItem -> [MenuBarQuotaDisplayItem] in
             guard let provider = selectedItem.aiProvider else { return [] }
 
             // A legacy remote pool selection (`accountKey == "__pool__"`) dynamically

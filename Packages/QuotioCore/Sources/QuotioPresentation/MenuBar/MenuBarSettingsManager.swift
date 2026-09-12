@@ -409,6 +409,10 @@ public final class MenuBarSettingsManager {
         didSet { persist() }
     }
 
+    /// Top-level status bar pins follow signal-toggle insertion order. Removing and
+    /// re-enabling a pin appends it; dropdown source-group ordering is independent.
+    public var statusBarSelectedItems: [MenuBarQuotaItem] { selectedItems }
+
     /// Provider used to filter account cards in the expanded menu.
     public private(set) var selectedProvider: QuotaProvider? {
         didSet { persist() }
@@ -470,6 +474,12 @@ public final class MenuBarSettingsManager {
     /// touches `selectedItems`, never disables fetching. See
     /// `MenuBarPreferences.hiddenDropdownKeys` for the full rationale.
     public private(set) var hiddenDropdownKeys: Set<String> {
+        didSet { persist() }
+    }
+
+    /// User-customized order for `RemoteQuotaSourceGroupIdentity` keys. See
+    /// `MenuBarPreferences.sourceGroupOrder` for the full contract.
+    public private(set) var sourceGroupOrder: [String] {
         didSet { persist() }
     }
 
@@ -562,7 +572,8 @@ public final class MenuBarSettingsManager {
             modelAggregationMode: modelAggregationMode,
             hasUserModifiedMenuBar: hasUserModifiedMenuBar,
             deselectedPoolAccounts: deselectedPoolAccounts,
-            hiddenDropdownKeys: hiddenDropdownKeys
+            hiddenDropdownKeys: hiddenDropdownKeys,
+            sourceGroupOrder: sourceGroupOrder
         )
     }
 
@@ -584,6 +595,7 @@ public final class MenuBarSettingsManager {
         self.hasUserModifiedMenuBar = preferences.hasUserModifiedMenuBar
         self.deselectedPoolAccounts = preferences.deselectedPoolAccounts
         self.hiddenDropdownKeys = preferences.hiddenDropdownKeys
+        self.sourceGroupOrder = preferences.sourceGroupOrder
     }
 
     public func setDidChangeHandler(_ handler: (@MainActor (MenuBarPreferences) -> Void)?) {
@@ -695,6 +707,25 @@ public final class MenuBarSettingsManager {
             return
         }
         addItem(item)
+    }
+
+    /// Moves one source's accounts under `provider` one step earlier/later relative to
+    /// `siblingKeys` — the other `RemoteQuotaSourceGroupIdentity` keys currently visible
+    /// under the same provider. No-ops at either end of the list. Never touches pins,
+    /// visibility, or any quota data — purely a persisted display-order change.
+    public func moveSourceGroup(
+        sourceId: String,
+        provider: QuotaProvider,
+        direction: RemoteQuotaSourceGroupOrdering.Direction,
+        siblingKeys: [String]
+    ) {
+        let key = RemoteQuotaSourceGroupIdentity.key(sourceId: sourceId, provider: provider)
+        sourceGroupOrder = RemoteQuotaSourceGroupOrdering.moved(
+            key: key,
+            direction: direction,
+            order: sourceGroupOrder,
+            siblingKeys: siblingKeys
+        )
     }
 
     /// Remove items that no longer exist in quota data

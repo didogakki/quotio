@@ -186,6 +186,13 @@ final class ClaudeCodexQuotaFetcherTests: XCTestCase {
     XCTAssertEqual(
       analytics.rows.filter { $0.id.hasPrefix("codex-rate-limit-reset-") }.count,
       1)
+    // The expired credit ("2029-12-31") must be excluded from the count/nearest-expiry
+    // summary even though the raw `available_count` field (2) includes it.
+    let summary = try XCTUnwrap(quota.codexResetCreditSummary)
+    XCTAssertEqual(summary.availableCount, 1)
+    let fractionalFormatter = ISO8601DateFormatter()
+    fractionalFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    XCTAssertEqual(summary.nearestExpiryAt, fractionalFormatter.date(from: "2030-01-02T00:00:00.500Z"))
     XCTAssertEqual(
       analytics.rows.first { $0.id == "codex-lifetime-tokens" }?.value,
       "4.2M tokens")

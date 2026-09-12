@@ -257,6 +257,48 @@ final class StatusBarMenuSnapshotMapperTests: XCTestCase {
         XCTAssertEqual(claude.groups[0].origin, .local)
     }
 
+    /// A custom `sourceGroupOrder` must reorder the dropdown's remote-source subgroups
+    /// within one provider — the same persisted order the status bar icon's own pinned
+    /// items use (`RemoteQuotaSourceGroupOrdering.orderedSelectedItems`), so both share
+    /// one arrangement instead of the dropdown staying stuck on alphabetical-by-name.
+    func testMonitorSnapshotOrdersRemoteSourceGroupsByPersistedOrder() throws {
+        let businessKey = RemoteQuotaAccountIdentity.storageKey(sourceId: "business", accountKey: "b")
+        let plusKey = RemoteQuotaAccountIdentity.storageKey(sourceId: "plus", accountKey: "a")
+        let quota = QuotaSnapshot(quotas: [
+            .codex: [
+                businessKey: ProviderQuota(accountDisplayName: "business@example.com"),
+                plusKey: ProviderQuota(accountDisplayName: "plus@example.com"),
+            ],
+        ])
+        // Alphabetically "Business" would sort before "Plus" — the persisted order must
+        // override that default.
+        let preferences = MenuBarPreferences(
+            sourceGroupOrder: [RemoteQuotaSourceGroupIdentity.key(sourceId: "plus", provider: .codex)]
+        )
+
+        let snapshot = StatusBarMenuSnapshotMapper.makeSnapshot(
+            mode: .monitor,
+            proxyPort: 8317,
+            isProxyRunning: false,
+            tunnel: CloudflareTunnelSnapshot(),
+            directAuthProviders: [.codex],
+            monitorAccounts: [],
+            quota: quota,
+            installedAgents: [],
+            activeAntigravityEmail: nil,
+            menuBarPreferences: preferences,
+            appearanceMode: .system,
+            language: .english,
+            remoteSourceNames: ["business": "Business", "plus": "Plus"]
+        )
+
+        let codex = try XCTUnwrap(snapshot.providers.first { $0.provider == .codex })
+        XCTAssertEqual(
+            codex.groups.map(\.origin),
+            [.remote(sourceId: "plus", sourceName: "Plus"), .remote(sourceId: "business", sourceName: "Business")]
+        )
+    }
+
     /// A raw account key/email that happens to also appear (verbatim, with no provider
     /// namespacing) in `hiddenDropdownKeys` must never accidentally match — entries only
     /// ever match by the full `MenuBarQuotaItem.id`, so a bare string collision is inert.

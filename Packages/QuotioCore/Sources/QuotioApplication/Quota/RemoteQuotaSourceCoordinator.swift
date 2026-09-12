@@ -50,6 +50,21 @@ public actor RemoteQuotaSourceCoordinator {
     private var continuations: [UUID: AsyncStream<State>.Continuation] = [:]
     public private(set) var state: State
 
+    /// The exact display name of the one, already-existing remote source
+    /// `QuotaPolicy.legacyGrokPlanDefault` applies to. Only ever consulted to *find* the
+    /// confirmed source the first time; once found, `RemoteQuotaSourceConfig.isLegacyGrokPlusSource`
+    /// is persisted on it and this name is never consulted again for that source.
+    private static let legacyGrokPlusSourceName = "CLIProxyAPI Plus"
+
+    /// Mirrors whichever saved source (if any) carries `isLegacyGrokPlusSource == true` —
+    /// kept in memory only as a fast lookup for `refresh(sourceId:isAutomatic:)`. The
+    /// actual confirmed identity lives on `RemoteQuotaSourceConfig.isLegacyGrokPlusSource`
+    /// itself, persisted via `repository.save`, so it survives a cold relaunch and any
+    /// later rename of that source — a rename can never cause a different, unrelated
+    /// source that happens to share the original name to take it over, since the flag is
+    /// only ever assigned to a source once, the first time it is resolved by name.
+    private var legacyGrokPlusSourceId: String?
+
     public init(
         repository: any RemoteQuotaSourceRepository,
         credentials: any RemoteQuotaSourceCredentialVault,
@@ -64,6 +79,50 @@ public actor RemoteQuotaSourceCoordinator {
         self.clock = clock
         let sources = repository.load()
         state = State(sources: sources, poolQuotas: snapshotStore.load().quotasBySource)
+        // Actor initializers run outside the actor's isolated context in Swift 6, so an
+        // `await`-free call into an actor-isolated instance method (like
+        // `captureLegacyGrokPlusSourceIdIfNeeded()`) does not type-check here — hence the
+        // logic is inlined via the static, non-isolated helper below instead.
+        if let match = Self.resolvingLegacyGrokPlusSource(in: sources) {
+            legacyGrokPlusSourceId = match.id
+            if match.sources != sources {
+                state.sources = match.sources
+                repository.save(match.sources)
+            }
+        }
+    }
+
+    /// Finds the confirmed legacy Grok "Plus" source among `sources` — a source already
+    /// flagged `isLegacyGrokPlusSource == true` wins unconditionally; only when none is
+    /// flagged yet does this fall back to a one-time resolution by exact display name,
+    /// which flags that source (returned in `.sources`) so the caller can persist it.
+    /// The by-name fallback only resolves when exactly one source carries that name —
+    /// two or more candidates means the name alone can't identify which one is the real
+    /// legacy source, so this returns `nil` rather than guessing via `firstIndex`, which
+    /// would arbitrarily (and permanently, once persisted) pick one.
+    /// `static` and non-isolated so it can be called from the actor's own `init`, where
+    /// isolated instance methods cannot be invoked synchronously.
+    private static func resolvingLegacyGrokPlusSource(
+        in sources: [RemoteQuotaSourceConfig]
+    ) -> (sources: [RemoteQuotaSourceConfig], id: String)? {
+        if let confirmed = sources.first(where: { $0.isLegacyGrokPlusSource == true }) {
+            return (sources, confirmed.id)
+        }
+        let candidates = sources.indices.filter { sources[$0].name == legacyGrokPlusSourceName }
+        guard candidates.count == 1, let index = candidates.first else {
+            return nil
+        }
+        var updated = sources
+        updated[index].isLegacyGrokPlusSource = true
+        return (updated, updated[index].id)
+    }
+
+    private func captureLegacyGrokPlusSourceIdIfNeeded() {
+        guard let match = Self.resolvingLegacyGrokPlusSource(in: state.sources) else { return }
+        legacyGrokPlusSourceId = match.id
+        guard match.sources != state.sources else { return }
+        state.sources = match.sources
+        repository.save(match.sources)
     }
 
     public func states() -> AsyncStream<State> {
@@ -88,10 +147,18 @@ public actor RemoteQuotaSourceCoordinator {
             return false
         }
         var sources = state.sources
+        var newSource = source
+        // Preserve the same confirmed identity as `updateSource` does, for the same
+        // reason, on the rare path where `addSource` is used to replace an
+        // already-existing id.
+        if let existingIndex = sources.firstIndex(where: { $0.id == source.id }) {
+            newSource.isLegacyGrokPlusSource = sources[existingIndex].isLegacyGrokPlusSource
+        }
         sources.removeAll { $0.id == source.id }
-        sources.append(source)
+        sources.append(newSource)
         state.sources = sources
         repository.save(sources)
+        captureLegacyGrokPlusSourceIdIfNeeded()
         publish()
         return true
     }
@@ -109,8 +176,16 @@ public actor RemoteQuotaSourceCoordinator {
                 return false
             }
         }
-        state.sources[index] = source
+        // `isLegacyGrokPlusSource` is an internal, coordinator-only confirmed identity —
+        // callers editing a source (e.g. renaming it in Settings) build `source` with no
+        // knowledge of it, so it must always be carried forward from the previously
+        // stored config rather than taken from the incoming value, or every edit to the
+        // confirmed source would silently erase its confirmation.
+        var updatedSource = source
+        updatedSource.isLegacyGrokPlusSource = state.sources[index].isLegacyGrokPlusSource
+        state.sources[index] = updatedSource
         repository.save(state.sources)
+        captureLegacyGrokPlusSourceIdIfNeeded()
         publish()
         return true
     }
@@ -165,12 +240,38 @@ public actor RemoteQuotaSourceCoordinator {
         publish()
         do {
             let result = try await fetcher.fetchPool(source, managementKey: key)
+
+            // Grok has no per-account plan field of its own on the remote listing; the
+            // narrowly source-scoped legacy default (see `QuotaPolicy.legacyGrokPlanDefault`)
+            // is applied here — by this source's own stable `id`, not its display name —
+            // rather than inside the fetcher, which has no memory of that identity across
+            // refreshes.
+            var freshQuotas = result.quotasByProviderAndAccount
+            if let grokAccounts = freshQuotas[.grok] {
+                freshQuotas[.grok] = grokAccounts.mapValues { quota in
+                    var updated = quota
+                    updated.planType = QuotaPolicy.legacyGrokPlanDefault(
+                        sourceId: sourceId,
+                        knownLegacySourceId: legacyGrokPlusSourceId,
+                        rawPlanType: quota.planType
+                    )
+                    return updated
+                }
+            }
+
             // Merge only the accounts that succeeded this round on top of the last-known-good
             // reading; a provider/account absent from `result` (because that account's
-            // fetch failed) keeps its previous value instead of disappearing.
+            // fetch failed) keeps its previous value instead of disappearing. Per account
+            // that refreshed successfully in both rounds, `mergingCodexResetCredits` also
+            // re-attaches a Codex account's previous `codexResetCreditSummary`/analytics
+            // rows when only that round's separate reset-credit request failed — usage
+            // still refreshes normally, it just doesn't blank out reset-credit data it
+            // simply failed to re-fetch this one time.
             var pools = state.poolQuotas[sourceId] ?? [:]
-            for (provider, accountQuotas) in result.quotasByProviderAndAccount {
-                pools[provider, default: [:]].merge(accountQuotas) { _, new in new }
+            for (provider, accountQuotas) in freshQuotas {
+                pools[provider, default: [:]].merge(accountQuotas) { old, new in
+                    QuotaPolicy.mergingCodexResetCredits(old: old, new: new)
+                }
             }
             // `knownAccountKeys` is this round's authoritative listing (a listing that
             // could not be obtained throws instead of returning a result), so every

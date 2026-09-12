@@ -795,12 +795,29 @@ private struct MenuAccountCardView: View {
         return groups.sorted { $0.percentage < $1.percentage }
     }
     
+    /// "N reset credits · next expiry yyyy-MM-dd HH:mm JST" for a CPA Codex account
+    /// whose most recent fetch reported reset-credit data — `nil` (never a fabricated
+    /// "0") when that data hasn't been fetched successfully yet. Per-account only,
+    /// reusing the same `ProviderQuota.codexResetCreditSummary` already carried by this
+    /// card's own `data` — never a separate card or badge.
+    private var codexResetCreditsText: String? {
+        guard provider == .codex else { return nil }
+        return data.codexResetCreditSummary?.formattedSummary
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             headerSection
-            
+
             quotaContentSection
-            
+
+            if let codexResetCreditsText {
+                Text(codexResetCreditsText)
+                    .font(.system(size: 10, design: .rounded))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+
             footerSection
         }
         .padding(12)
@@ -1842,6 +1859,15 @@ private struct ModelBadgeData: Identifiable {
             return "\(minutes)m"
         }
     }
+
+    /// Full absolute reset datetime (fixed Asia/Tokyo, 24-hour) shown below the mini
+    /// panel's progress bar, alongside — never instead of — `formattedResetTime`'s
+    /// relative countdown. `nil` (never a fabricated date) when `resetTime` is
+    /// missing/unparseable.
+    var formattedAbsoluteResetTime: String? {
+        guard let resetTime else { return nil }
+        return QuotaDateFormatting.absoluteJST(resetTime)
+    }
 }
 
 private struct AntigravityDisplayGroup: Identifiable {
@@ -2052,6 +2078,17 @@ private struct CardGridLayout: View {
                             height: 4,
                             displayMode: displayMode
                         )
+
+                        // Full absolute reset datetime, always JST — allowed to wrap to
+                        // a second line at the dropdown's native narrow width rather
+                        // than truncate, so the exact date/time is never cut off.
+                        if let absoluteReset = model.formattedAbsoluteResetTime {
+                            Text(absoluteReset)
+                                .font(.system(size: 8, design: .rounded))
+                                .foregroundStyle(.tertiary)
+                                .multilineTextAlignment(.leading)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
                 }
                 .padding(8)

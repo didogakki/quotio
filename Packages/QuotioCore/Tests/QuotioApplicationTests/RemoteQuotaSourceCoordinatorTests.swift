@@ -461,6 +461,184 @@ final class RemoteQuotaSourceCoordinatorTests: XCTestCase {
         XCTAssertNil(state.poolQuotas["s1"])
     }
 
+    // MARK: - Codex reset-credit preservation on partial failure
+
+    /// A reset-credit fetch failure this round (the fresh reading has no summary of its
+    /// own) must preserve the last successful summary — usage still refreshes normally.
+    func testResetCreditFailureThisRoundPreservesLastKnownGoodSummary() async {
+        let fetcher = StubFetcher()
+        let coordinator = makeCoordinator(fetcher: fetcher)
+        let source = RemoteQuotaSourceConfig(id: "s1", name: "Pool", baseURL: "https://a.test")
+        await coordinator.addSource(source, managementKey: "k")
+
+        var withCredits = Self.quota(70)
+        withCredits.codexResetCreditSummary = CodexResetCreditSummary(availableCount: 2, nearestExpiryAt: nil)
+        await fetcher.enqueue(.success([.codex: ["a": withCredits]]), for: "s1")
+        await coordinator.refresh(sourceId: "s1")
+
+        await fetcher.enqueue(.success([.codex: ["a": Self.quota(50)]]), for: "s1")
+        await coordinator.refresh(sourceId: "s1")
+
+        let state = await coordinator.state
+        XCTAssertEqual(state.poolQuotas["s1"]?[.codex]?["a"]?.models.first?.percentage, 50)
+        XCTAssertEqual(
+            state.poolQuotas["s1"]?[.codex]?["a"]?.codexResetCreditSummary?.availableCount, 2,
+            "a reset-credit fetch failure this round must not discard the last successful summary"
+        )
+    }
+
+    /// A genuine successful zero reading must replace an old positive value, never be
+    /// mistaken for a failure.
+    func testResetCreditValidZeroReplacesOldPositiveSummary() async {
+        let fetcher = StubFetcher()
+        let coordinator = makeCoordinator(fetcher: fetcher)
+        let source = RemoteQuotaSourceConfig(id: "s1", name: "Pool", baseURL: "https://a.test")
+        await coordinator.addSource(source, managementKey: "k")
+
+        var withCredits = Self.quota(70)
+        withCredits.codexResetCreditSummary = CodexResetCreditSummary(availableCount: 3, nearestExpiryAt: nil)
+        await fetcher.enqueue(.success([.codex: ["a": withCredits]]), for: "s1")
+        await coordinator.refresh(sourceId: "s1")
+
+        var zeroCredits = Self.quota(50)
+        zeroCredits.codexResetCreditSummary = CodexResetCreditSummary(availableCount: 0, nearestExpiryAt: nil)
+        await fetcher.enqueue(.success([.codex: ["a": zeroCredits]]), for: "s1")
+        await coordinator.refresh(sourceId: "s1")
+
+        let state = await coordinator.state
+        XCTAssertEqual(state.poolQuotas["s1"]?[.codex]?["a"]?.codexResetCreditSummary?.availableCount, 0)
+    }
+
+    /// An account removed from the listing must stay pruned even though reset-credit
+    /// preservation now also runs on every merge.
+    func testRemovedAccountStaysGoneDespiteResetCreditPreservation() async {
+        let fetcher = StubFetcher()
+        let coordinator = makeCoordinator(fetcher: fetcher)
+        let source = RemoteQuotaSourceConfig(id: "s1", name: "Pool", baseURL: "https://a.test")
+        await coordinator.addSource(source, managementKey: "k")
+
+        var withCredits = Self.quota(70)
+        withCredits.codexResetCreditSummary = CodexResetCreditSummary(availableCount: 2, nearestExpiryAt: nil)
+        await fetcher.enqueue(
+            .result(RemoteQuotaPoolFetchResult(
+                quotasByProviderAndAccount: [.codex: ["a": withCredits]],
+                outcome: .complete,
+                knownAccountKeys: [.codex: ["a"]]
+            )),
+            for: "s1"
+        )
+        await coordinator.refresh(sourceId: "s1")
+
+        await fetcher.enqueue(
+            .result(RemoteQuotaPoolFetchResult(
+                outcome: .noAccountsListed,
+                knownAccountKeys: [.codex: [], .claude: [], .grok: []]
+            )),
+            for: "s1"
+        )
+        await coordinator.refresh(sourceId: "s1")
+
+        let state = await coordinator.state
+        XCTAssertNil(state.poolQuotas["s1"]?[.codex]?["a"])
+    }
+
+    // MARK: - Legacy Grok "Premium" default (scoped by stable source id, not display name)
+
+    func testLegacyGrokPremiumDefaultAppliesToTheCapturedSourceAndSurvivesRename() async {
+        let fetcher = StubFetcher()
+        let coordinator = makeCoordinator(fetcher: fetcher)
+        var source = RemoteQuotaSourceConfig(id: "plus-1", name: "CLIProxyAPI Plus", baseURL: "https://a.test")
+        await coordinator.addSource(source, managementKey: "k")
+        await fetcher.enqueue(.success([.grok: ["a": Self.quota(70)]]), for: "plus-1")
+        await coordinator.refresh(sourceId: "plus-1")
+
+        var state = await coordinator.state
+        XCTAssertEqual(state.poolQuotas["plus-1"]?[.grok]?["a"]?.planType, "Premium")
+
+        // Rename the same source (same id) — the default must survive.
+        source.name = "Renamed Plus"
+        await coordinator.updateSource(source, managementKey: nil)
+        await fetcher.enqueue(.success([.grok: ["a": Self.quota(60)]]), for: "plus-1")
+        await coordinator.refresh(sourceId: "plus-1")
+
+        state = await coordinator.state
+        XCTAssertEqual(state.poolQuotas["plus-1"]?[.grok]?["a"]?.planType, "Premium")
+    }
+
+    func testLegacyGrokPremiumDefaultNeverAppliesToAnUnrelatedSourceWithTheSameName() async {
+        let fetcher = StubFetcher()
+        let coordinator = makeCoordinator(fetcher: fetcher)
+        let captured = RemoteQuotaSourceConfig(id: "plus-1", name: "CLIProxyAPI Plus", baseURL: "https://a.test")
+        let unrelated = RemoteQuotaSourceConfig(id: "plus-2", name: "CLIProxyAPI Plus", baseURL: "https://b.test")
+        await coordinator.addSource(captured, managementKey: "k1")
+        await coordinator.addSource(unrelated, managementKey: "k2")
+        await fetcher.enqueue(.success([.grok: ["a": Self.quota(70)]]), for: "plus-2")
+
+        await coordinator.refresh(sourceId: "plus-2")
+
+        let state = await coordinator.state
+        XCTAssertNil(
+            state.poolQuotas["plus-2"]?[.grok]?["a"]?.planType,
+            "an unrelated source sharing the display name must never get the legacy default"
+        )
+    }
+
+    /// The confirmed identity must survive a cold relaunch — a fresh coordinator built
+    /// on top of the same repository — even after the source was renamed and never
+    /// refreshed again in the session that renamed it. A second, unrelated source that
+    /// merely shares the original display name must still never qualify, even freshly
+    /// resolved from the same on-disk state.
+    func testLegacyGrokPremiumDefaultSurvivesColdRelaunchAfterRename() async {
+        let repository = MemoryRemoteQuotaSourceRepository()
+        let vault = MemoryCredentialVault()
+        let fetcher = StubFetcher()
+        let coordinator = makeCoordinator(repository: repository, vault: vault, fetcher: fetcher)
+        var source = RemoteQuotaSourceConfig(id: "plus-1", name: "CLIProxyAPI Plus", baseURL: "https://a.test")
+        await coordinator.addSource(source, managementKey: "k")
+
+        // Rename it, but never refresh again this session — the in-memory capture from
+        // `addSource` is gone once this coordinator is discarded below.
+        source.name = "Renamed Plus"
+        await coordinator.updateSource(source, managementKey: nil)
+
+        // A cold relaunch: a brand-new coordinator instance re-reading the same
+        // persisted repository and credential vault state, the way app startup does —
+        // only the coordinator's own in-memory state is discarded, not the keychain.
+        let relaunched = makeCoordinator(repository: repository, vault: vault, fetcher: fetcher)
+        let unrelated = RemoteQuotaSourceConfig(id: "plus-2", name: "CLIProxyAPI Plus", baseURL: "https://b.test")
+        await relaunched.addSource(unrelated, managementKey: "k2")
+
+        await fetcher.enqueue(.success([.grok: ["a": Self.quota(70)]]), for: "plus-1")
+        await fetcher.enqueue(.success([.grok: ["a": Self.quota(40)]]), for: "plus-2")
+        await relaunched.refresh(sourceId: "plus-1")
+        await relaunched.refresh(sourceId: "plus-2")
+
+        let state = await relaunched.state
+        XCTAssertEqual(
+            state.poolQuotas["plus-1"]?[.grok]?["a"]?.planType, "Premium",
+            "the renamed, previously-confirmed source must keep the default after a cold relaunch"
+        )
+        XCTAssertNil(
+            state.poolQuotas["plus-2"]?[.grok]?["a"]?.planType,
+            "an unrelated source that merely shares the original display name must stay unknown"
+        )
+    }
+
+    func testLegacyGrokPremiumDefaultNeverOverridesRealMetadata() async {
+        let fetcher = StubFetcher()
+        let coordinator = makeCoordinator(fetcher: fetcher)
+        let source = RemoteQuotaSourceConfig(id: "plus-1", name: "CLIProxyAPI Plus", baseURL: "https://a.test")
+        await coordinator.addSource(source, managementKey: "k")
+        var withPlan = Self.quota(70)
+        withPlan.planType = "Basic"
+        await fetcher.enqueue(.success([.grok: ["a": withPlan]]), for: "plus-1")
+
+        await coordinator.refresh(sourceId: "plus-1")
+
+        let state = await coordinator.state
+        XCTAssertEqual(state.poolQuotas["plus-1"]?[.grok]?["a"]?.planType, "Basic")
+    }
+
     // MARK: - Helpers
 
     private func makeCoordinator(

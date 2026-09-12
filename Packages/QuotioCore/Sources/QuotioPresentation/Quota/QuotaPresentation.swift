@@ -231,6 +231,13 @@ public extension QuotaMetric {
     var formattedResetTime: String {
         GroupedModelQuota.relativeResetTime(resetTime)
     }
+
+    /// Full absolute reset datetime, fixed `Asia/Tokyo`/`en_US_POSIX`/24-hour — shown
+    /// alongside (never instead of) `formattedResetTime`'s relative countdown. `nil`
+    /// when `resetTime` is empty/unparseable, never a fabricated date.
+    var formattedAbsoluteResetTime: String? {
+        QuotaDateFormatting.absoluteJST(resetTime)
+    }
 }
 
 @MainActor
@@ -238,10 +245,7 @@ public extension ProviderQuota {
     var formattedTokenExpiry: String? {
         guard let tokenExpiresAt else { return nil }
         guard tokenExpiresAt.timeIntervalSinceNow > 0 else { return "Expired" }
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm"
-        formatter.timeZone = .current
-        return "Token expires \(formatter.string(from: tokenExpiresAt))"
+        return "Token expires \(QuotaDateFormatting.absoluteJST(tokenExpiresAt))"
     }
 
     var planDisplayName: String? {
@@ -276,6 +280,23 @@ public extension ProviderQuota {
     }
 
     var hasGroupedModels: Bool { models.contains { $0.modelGroup != nil } }
+}
+
+@MainActor
+public extension CodexResetCreditSummary {
+    /// "N reset credits · next expiry yyyy-MM-dd HH:mm JST" for a CPA Codex account's
+    /// most recently successful reset-credit fetch. `availableCount == 0` is a genuine
+    /// successful reading, not missing data — it gets its own explicit "no reset
+    /// credits available" message rather than being formatted with a fallback "no
+    /// expiry" date, which only applies when credits exist but truly carry none.
+    var formattedSummary: String {
+        guard availableCount > 0 else {
+            return "providers.codex.resetCredits.none".localizedStatic()
+        }
+        let dateText = nearestExpiryAt.map { QuotaDateFormatting.absoluteJST($0) }
+            ?? "providers.codex.resetCredits.noExpiry".localizedStatic()
+        return String(format: "providers.codex.resetCredits".localizedStatic(), availableCount, dateText)
+    }
 }
 
 public extension QuotaSubscriptionInfo {

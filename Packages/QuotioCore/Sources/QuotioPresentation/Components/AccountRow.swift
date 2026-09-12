@@ -298,7 +298,11 @@ struct AccountRow: View {
     var onToggleDisabled: (() -> Void)?
     var onDownload: (() -> Void)?
     var isActiveInIDE: Bool = false
-    
+    /// Every remote-source group key visible alongside this row's provider, for the
+    /// aggregate row's "move source group up/down" context menu actions. Empty (the
+    /// default) for every non-aggregate row, which never shows those actions.
+    var sourceGroupSiblingKeys: [String] = []
+
     @Environment(MenuBarSettingsManager.self) private var settings
     @State private var showWarning = false
     @State private var showMaxItemsAlert = false
@@ -532,10 +536,39 @@ struct AccountRow: View {
                 }
             }
 
+            // Reorder this source's group relative to the provider's other remote
+            // sources — only meaningful on the aggregate row, which stands in for the
+            // whole source+plan group in this list.
+            if account.source.isAggregate, let sourceConfigId = account.sourceConfigId {
+                Divider()
+
+                Button {
+                    settings.moveSourceGroup(
+                        sourceId: sourceConfigId,
+                        provider: account.provider,
+                        direction: .up,
+                        siblingKeys: sourceGroupSiblingKeys
+                    )
+                } label: {
+                    Label("providers.sourceGroup.moveUp".localized(), systemImage: "arrow.up")
+                }
+
+                Button {
+                    settings.moveSourceGroup(
+                        sourceId: sourceConfigId,
+                        provider: account.provider,
+                        direction: .down,
+                        siblingKeys: sourceGroupSiblingKeys
+                    )
+                } label: {
+                    Label("providers.sourceGroup.moveDown".localized(), systemImage: "arrow.down")
+                }
+            }
+
             // Delete option (only for proxy accounts)
             if account.canDelete, onDelete != nil {
                 Divider()
-                
+
                 Button(role: .destructive) {
                     showDeleteConfirmation = true
                 } label: {

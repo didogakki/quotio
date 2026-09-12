@@ -29,6 +29,28 @@ final class QuotaModelsTests: XCTestCase {
         }
     }
 
+    /// A `ProviderQuota` cached before `codexResetCreditSummary` existed (no such key at
+    /// all in the JSON) must decode as `nil` — never crash, never a synthetic zero.
+    func testProviderQuotaDecodesWithoutCodexResetCreditSummaryKey() throws {
+        let data = Data(#"{"models":[],"lastUpdated":0,"isForbidden":false}"#.utf8)
+
+        let quota = try JSONDecoder().decode(ProviderQuota.self, from: data)
+
+        XCTAssertNil(quota.codexResetCreditSummary)
+    }
+
+    func testCodexResetCreditSummaryRoundTripsThroughCodableSchema() throws {
+        let summary = CodexResetCreditSummary(
+            availableCount: 2,
+            nearestExpiryAt: Date(timeIntervalSince1970: 1_789_975_320)
+        )
+
+        let encoded = try JSONEncoder().encode(summary)
+        let decoded = try JSONDecoder().decode(CodexResetCreditSummary.self, from: encoded)
+
+        XCTAssertEqual(decoded, summary)
+    }
+
     func testImportedIDEPolicyUpdatesOnlyExistingAccounts() {
         let old = ProviderQuota(models: [QuotaMetric(name: "usage", percentage: 10, resetTime: "")])
         let fresh = ProviderQuota(models: [QuotaMetric(name: "usage", percentage: 80, resetTime: "")])
@@ -176,6 +198,21 @@ final class QuotaModelsTests: XCTestCase {
         )
     }
 
+    /// Regression: Claude's real "Pro" plan (raw `planType == "Pro"`, normalized key
+    /// "pro") used to fall through to the Codex-specific "pro" case and display as
+    /// "Pro 20x" — a tier Claude doesn't have. Codex's own "Pro 20x"/"Pro 5x" labels
+    /// must be unaffected.
+    func testPlanGroupDisplayLabelShowsClaudeRealProAsPro() {
+        XCTAssertEqual(
+            QuotaPolicy.planGroupDisplayLabel(provider: .claude, planKey: "pro", rawPlanType: "Pro"),
+            "Pro"
+        )
+        XCTAssertEqual(
+            QuotaPolicy.planGroupDisplayLabel(provider: .codex, planKey: "pro", rawPlanType: "Pro 20x"),
+            "Pro 20x"
+        )
+    }
+
     func testPlanGroupDisplayLabelDistinguishesProTiers() {
         XCTAssertEqual(
             QuotaPolicy.planGroupDisplayLabel(provider: .codex, planKey: "pro", rawPlanType: "Pro 20x"),
@@ -184,6 +221,41 @@ final class QuotaModelsTests: XCTestCase {
         XCTAssertEqual(
             QuotaPolicy.planGroupDisplayLabel(provider: .codex, planKey: "pro_lite", rawPlanType: "Pro 5x"),
             "Pro 5x"
+        )
+    }
+
+    // MARK: - QuotaPolicy.legacyGrokPlanDefault
+
+    /// Scoped by the source's stable `id`, never its display name — matching only the
+    /// exact captured id an unrelated source (even one sharing the same id-less name)
+    /// must never qualify for.
+    func testLegacyGrokPlanDefaultAppliesOnlyToTheKnownSourceId() {
+        XCTAssertEqual(
+            QuotaPolicy.legacyGrokPlanDefault(sourceId: "src-1", knownLegacySourceId: "src-1", rawPlanType: nil),
+            "Premium"
+        )
+        XCTAssertNil(
+            QuotaPolicy.legacyGrokPlanDefault(sourceId: "src-2", knownLegacySourceId: "src-1", rawPlanType: nil)
+        )
+        XCTAssertNil(
+            QuotaPolicy.legacyGrokPlanDefault(sourceId: "src-1", knownLegacySourceId: nil, rawPlanType: nil)
+        )
+    }
+
+    /// Real metadata always wins — the default is only ever a last resort.
+    func testLegacyGrokPlanDefaultNeverOverridesRealMetadata() {
+        XCTAssertEqual(
+            QuotaPolicy.legacyGrokPlanDefault(sourceId: "src-1", knownLegacySourceId: "src-1", rawPlanType: "Basic"),
+            "Basic"
+        )
+    }
+
+    /// Blank/whitespace-only metadata must be treated the same as genuinely missing
+    /// metadata, never displayed verbatim as an empty tier badge.
+    func testLegacyGrokPlanDefaultNormalizesBlankMetadataAsMissing() {
+        XCTAssertEqual(
+            QuotaPolicy.legacyGrokPlanDefault(sourceId: "src-1", knownLegacySourceId: "src-1", rawPlanType: "   "),
+            "Premium"
         )
     }
 
@@ -262,6 +334,49 @@ final class QuotaModelsTests: XCTestCase {
             QuotaPolicy.planGroupDisplayLabel(provider: .claude, planKey: "unknown", rawPlanType: result.planType),
             "Unknown"
         )
+    }
+
+    // MARK: - QuotaPolicy.mergingCodexResetCredits
+
+    /// A reset-credit fetch failure this round (fresh reading has no summary of its
+    /// own) must not discard the last successful summary.
+    func testMergingCodexResetCreditsPreservesLastSuccessOnThisRoundsFailure() {
+        var old = ProviderQuota(models: [QuotaMetric(name: "usage", percentage: 60, resetTime: "")])
+        old.codexResetCreditSummary = CodexResetCreditSummary(availableCount: 2, nearestExpiryAt: nil)
+        old.analytics = QuotaAnalytics(rows: [
+            QuotaAnalyticsRow(id: "codex-rate-limit-resets", title: "Rate Limit Resets", value: "2 available"),
+            QuotaAnalyticsRow(id: "codex-rate-limit-reset-abc", title: "Expiry", value: "in 2 days"),
+        ])
+        let new = ProviderQuota(models: [QuotaMetric(name: "usage", percentage: 40, resetTime: "")])
+
+        let merged = QuotaPolicy.mergingCodexResetCredits(old: old, new: new)
+
+        XCTAssertEqual(merged.models.first?.percentage, 40, "usage must still reflect this round's fresh reading")
+        XCTAssertEqual(merged.codexResetCreditSummary?.availableCount, 2)
+        XCTAssertEqual(merged.analytics?.rows.map(\.id).sorted(), ["codex-rate-limit-reset-abc", "codex-rate-limit-resets"])
+    }
+
+    /// A genuine successful zero reading is a real result, not a failure — it must
+    /// replace an old positive summary rather than being preserved-over.
+    func testMergingCodexResetCreditsLetsAValidZeroReplaceAnOldPositiveSummary() {
+        var old = ProviderQuota()
+        old.codexResetCreditSummary = CodexResetCreditSummary(availableCount: 3, nearestExpiryAt: nil)
+        var new = ProviderQuota()
+        new.codexResetCreditSummary = CodexResetCreditSummary(availableCount: 0, nearestExpiryAt: nil)
+
+        let merged = QuotaPolicy.mergingCodexResetCredits(old: old, new: new)
+
+        XCTAssertEqual(merged.codexResetCreditSummary?.availableCount, 0)
+    }
+
+    /// With no previous summary to preserve, a failed fetch just stays nil — never a
+    /// fabricated reading.
+    func testMergingCodexResetCreditsStaysNilWithoutAPreviousSummary() {
+        let new = ProviderQuota()
+
+        let merged = QuotaPolicy.mergingCodexResetCredits(old: nil, new: new)
+
+        XCTAssertNil(merged.codexResetCreditSummary)
     }
 
     /// A metric only some accounts report (e.g. one account is missing "extra-usage")
