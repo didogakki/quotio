@@ -58,10 +58,11 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
             throw RemoteQuotaFetchError.authFilesUnavailable
         }
 
-        // A frozen account (cooling after a rate limit, flagged unavailable) is still an
+        // An account carrying the server's aggregated `unavailable` flag is still an
         // account: `isQuotaTrackable` keeps it here so it stays in `knownAccountKeys` and
         // survives the coordinator's prune, instead of being mistaken for one that was
-        // deleted from the server. Only an explicitly disabled file is left out.
+        // deleted from the server. A status-only model error remains usable here; only an
+        // explicitly disabled file is left out.
         let candidates = files.filter { file in
             file.isQuotaTrackable && file.providerID.map(Self.supportedProviders.contains) == true
         }

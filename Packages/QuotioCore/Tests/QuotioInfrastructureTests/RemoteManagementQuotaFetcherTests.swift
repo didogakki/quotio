@@ -67,19 +67,19 @@ final class RemoteManagementQuotaFetcherTests: XCTestCase {
     }
   }
 
-  /// A frozen account — cooling after a rate limit, or flagged unavailable — is still a
-  /// real account on the server. It must stay in `knownAccountKeys`, which is exactly
-  /// what the coordinator prunes against, instead of being mistaken for one that was
-  /// deleted; only an explicitly disabled file is left out.
+  /// An account carrying the server's aggregated `unavailable` flag is still a real
+  /// account. It must stay in `knownAccountKeys`, which is exactly what the coordinator
+  /// prunes against, instead of being mistaken for one that was deleted; only an
+  /// explicitly disabled file is left out.
   func testFrozenAccountsStayListedAndAreReportedSeparately() async throws {
     let files = [
       ManagedAuthFile(
         id: "1", name: "claude-a.json", provider: "claude", status: "ready", disabled: false,
         unavailable: false, email: "a@example.com", authIndex: "claude-a"),
-      // Cooling and silent — the case that used to make the account vanish.
+      // Aggregated unavailable and silent — the case that used to make the account vanish.
       ManagedAuthFile(
-        id: "2", name: "claude-b.json", provider: "claude", status: "cooling", disabled: false,
-        unavailable: false, email: "b@example.com", authIndex: "claude-b"),
+        id: "2", name: "claude-b.json", provider: "claude", status: "error", disabled: false,
+        unavailable: true, email: "b@example.com", authIndex: "claude-b"),
       // Flagged unavailable but still answering: frozen accounts are always attempted,
       // and a real reading always beats a stand-in.
       ManagedAuthFile(
@@ -123,14 +123,36 @@ final class RemoteManagementQuotaFetcherTests: XCTestCase {
     XCTAssertNil(result.placeholderQuotas[.claude]?["claude-d"])
   }
 
+  /// CLIProxyAPI sets the auth file's top-level status to `error` when one model fails,
+  /// even if another model remains routable. The aggregated `unavailable` flag — not
+  /// the status string — is therefore the authority for account-level cooldown.
+  func testModelLevelErrorDoesNotMarkRoutableAccountAsFrozen() async throws {
+    let files = [
+      ManagedAuthFile(
+        id: "1", name: "codex-a.json", provider: "codex", status: "error", disabled: false,
+        unavailable: false, email: "a@example.com", authIndex: "codex-a"),
+    ]
+    let codexBody = #"{"plan_type":"team","rate_limit":{"primary_window":{"used_percent":60}}}"#
+    let api = StubProxyManagementAPI(authFiles: files, responses: ["codex-a": (200, codexBody)])
+    let fetcher = RemoteManagementQuotaFetcher(apiFactory: StubProxyManagementAPIFactory(api: api))
+    let source = RemoteQuotaSourceConfig(id: "src-1", name: "Pool", baseURL: "https://proxy.test:8317")
+
+    let result = try await fetcher.fetchPool(source, managementKey: "admin-key")
+
+    XCTAssertEqual(result.outcome, .complete)
+    XCTAssertEqual(result.temporarilyUnavailableAccountKeys[.codex], [])
+    XCTAssertNil(result.placeholderQuotas[.codex]?["codex-a"])
+    XCTAssertEqual(result.quotasByProviderAndAccount[.codex]?["codex-a"]?.planType, "team")
+  }
+
   /// Every account frozen at once must not read as a failing round: three of those in a
   /// row would trip the coordinator's hide threshold and take the whole source out of
   /// the menu bar — the same disappearance the frozen-account handling exists to prevent.
   func testSourceWithOnlyFrozenAccountsIsNotReportedAsFailing() async throws {
     let files = [
       ManagedAuthFile(
-        id: "1", name: "claude-a.json", provider: "claude", status: "cooling", disabled: false,
-        unavailable: false, email: "a@example.com", authIndex: "claude-a"),
+        id: "1", name: "claude-a.json", provider: "claude", status: "error", disabled: false,
+        unavailable: true, email: "a@example.com", authIndex: "claude-a"),
       ManagedAuthFile(
         id: "2", name: "codex-b.json", provider: "codex", status: "ready", disabled: false,
         unavailable: true, email: "b@example.com", authIndex: "codex-b"),
@@ -158,9 +180,9 @@ final class RemoteManagementQuotaFetcherTests: XCTestCase {
   func testFrozenAccountPlaceholderCarriesTheAuthFileListingsOwnRecoveryTime() async throws {
     let files = [
       ManagedAuthFile(
-        id: "1", name: "claude-a.json", provider: "claude", status: "cooling", disabled: false,
-        unavailable: false, email: "a@example.com", authIndex: "claude-a",
-        unfreezeAt: .absolute("2027-01-15T06:00:00Z")),
+        id: "1", name: "claude-a.json", provider: "claude", status: "error", disabled: false,
+        unavailable: true, email: "a@example.com", authIndex: "claude-a",
+        nextRetryAfter: .absolute("2027-01-15T06:00:00Z")),
     ]
     let api = StubProxyManagementAPI(authFiles: files, responses: [:])
     let fetcher = RemoteManagementQuotaFetcher(
@@ -183,8 +205,8 @@ final class RemoteManagementQuotaFetcherTests: XCTestCase {
   func testFrozenAccountFallsBackToRetryAfterHeaderWhenListingHasNoRecoveryField() async throws {
     let files = [
       ManagedAuthFile(
-        id: "1", name: "claude-a.json", provider: "claude", status: "cooling", disabled: false,
-        unavailable: false, email: "a@example.com", authIndex: "claude-a"),
+        id: "1", name: "claude-a.json", provider: "claude", status: "error", disabled: false,
+        unavailable: true, email: "a@example.com", authIndex: "claude-a"),
     ]
     let api = StubProxyManagementAPI(
       authFiles: files,
@@ -212,8 +234,8 @@ final class RemoteManagementQuotaFetcherTests: XCTestCase {
   func testFrozenAccountPlaceholderHasNoRecoveryDateWhenNoRealSignalExists() async throws {
     let files = [
       ManagedAuthFile(
-        id: "1", name: "claude-a.json", provider: "claude", status: "cooling", disabled: false,
-        unavailable: false, email: "a@example.com", authIndex: "claude-a"),
+        id: "1", name: "claude-a.json", provider: "claude", status: "error", disabled: false,
+        unavailable: true, email: "a@example.com", authIndex: "claude-a"),
     ]
     let api = StubProxyManagementAPI(authFiles: files, responses: [:])
     let fetcher = RemoteManagementQuotaFetcher(
@@ -233,8 +255,8 @@ final class RemoteManagementQuotaFetcherTests: XCTestCase {
   func testFrozenAccountNeverFallsBackToXRateLimitResetHeader() async throws {
     let files = [
       ManagedAuthFile(
-        id: "1", name: "claude-a.json", provider: "claude", status: "cooling", disabled: false,
-        unavailable: false, email: "a@example.com", authIndex: "claude-a"),
+        id: "1", name: "claude-a.json", provider: "claude", status: "error", disabled: false,
+        unavailable: true, email: "a@example.com", authIndex: "claude-a"),
     ]
     let claudeBody = #"{"five_hour":{"utilization":40,"resets_at":"2026-01-01T00:00:00Z"}}"#
     let api = StubProxyManagementAPI(
@@ -259,8 +281,8 @@ final class RemoteManagementQuotaFetcherTests: XCTestCase {
   func testRetryAfterHeaderIsIgnoredOnANonRateLimitedResponse() async throws {
     let files = [
       ManagedAuthFile(
-        id: "1", name: "claude-a.json", provider: "claude", status: "cooling", disabled: false,
-        unavailable: false, email: "a@example.com", authIndex: "claude-a"),
+        id: "1", name: "claude-a.json", provider: "claude", status: "error", disabled: false,
+        unavailable: true, email: "a@example.com", authIndex: "claude-a"),
     ]
     let claudeBody = #"{"five_hour":{"utilization":40,"resets_at":"2026-01-01T00:00:00Z"}}"#
     let api = StubProxyManagementAPI(
@@ -286,8 +308,8 @@ final class RemoteManagementQuotaFetcherTests: XCTestCase {
   func testAvailabilityRecoveryDatesReportsEveryFrozenAccountIncludingThoseWithARealReading() async throws {
     let files = [
       ManagedAuthFile(
-        id: "1", name: "claude-a.json", provider: "claude", status: "cooling", disabled: false,
-        unavailable: false, email: "a@example.com", authIndex: "claude-a",
+        id: "1", name: "claude-a.json", provider: "claude", status: "error", disabled: false,
+        unavailable: true, email: "a@example.com", authIndex: "claude-a",
         unfreezeAt: .absolute("2027-01-15T06:00:00Z")),
     ]
     let claudeBody = #"{"five_hour":{"utilization":40,"resets_at":"2026-01-01T00:00:00Z"}}"#

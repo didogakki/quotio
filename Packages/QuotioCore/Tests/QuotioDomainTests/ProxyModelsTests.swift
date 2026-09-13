@@ -65,10 +65,10 @@ final class ProxyModelsTests: XCTestCase {
         XCTAssertTrue(file.isReady)
     }
 
-    /// Trackability is about existence, not usability: a cooling or unavailable account
-    /// is still there and must keep being tracked, while an explicitly disabled one is a
-    /// deliberate server-side user action and stays excluded.
-    func testManagedAuthFileTrackabilitySeparatesExistenceFromUsability() {
+    /// Trackability is about existence, not usability: status-only errors are still
+    /// real accounts, while only the server's aggregated `unavailable` flag represents
+    /// account-level cooldown. An explicitly disabled account stays excluded.
+    func testManagedAuthFileTrackabilitySeparatesExistenceFromAccountAvailability() {
         let ready = ManagedAuthFile(
             id: "1", name: "codex-a", provider: "codex",
             status: "active", disabled: false, unavailable: false
@@ -97,9 +97,9 @@ final class ProxyModelsTests: XCTestCase {
         XCTAssertFalse(disabled.isQuotaTrackable)
 
         XCTAssertFalse(ready.isTemporarilyUnavailable)
-        XCTAssertTrue(cooling.isTemporarilyUnavailable)
+        XCTAssertFalse(cooling.isTemporarilyUnavailable, "status alone is not an account cooldown signal")
         XCTAssertTrue(unavailable.isTemporarilyUnavailable)
-        XCTAssertTrue(errored.isTemporarilyUnavailable)
+        XCTAssertFalse(errored.isTemporarilyUnavailable, "a model-scoped error can leave the account routable")
         // A disabled file isn't tracked at all, so it is never "temporarily" anything.
         XCTAssertFalse(disabled.isTemporarilyUnavailable)
     }
@@ -135,6 +135,29 @@ final class ProxyModelsTests: XCTestCase {
     // MARK: - recoveryDate(fetchedAt:)
 
     private static let fetchedAt = Date(timeIntervalSince1970: 1_800_000_000)
+
+    func testManagedAuthFileDecodesCurrentAccountCooldownShape() throws {
+        let payload = Data(#"""
+        {
+            "id":"1",
+            "name":"codex-a.json",
+            "provider":"codex",
+            "status":"error",
+            "disabled":false,
+            "unavailable":true,
+            "next_retry_after":"2027-01-15T06:00:00Z"
+        }
+        """#.utf8)
+
+        let file = try JSONDecoder().decode(ManagedAuthFile.self, from: payload)
+
+        XCTAssertTrue(file.isTemporarilyUnavailable)
+        XCTAssertEqual(file.nextRetryAfter, .absolute("2027-01-15T06:00:00Z"))
+        XCTAssertEqual(
+            file.recoveryDate(fetchedAt: Self.fetchedAt),
+            ISO8601DateFormatter().date(from: "2027-01-15T06:00:00Z")
+        )
+    }
 
     func testRecoveryDateResolvesAnExplicitUnfreezeAtField() {
         let file = ManagedAuthFile(

@@ -239,12 +239,13 @@ public struct ManagedAuthFile: Codable, Identifiable, Hashable, Sendable {
     /// existing "not tracked at all" behavior.
     public var isQuotaTrackable: Bool { !disabled }
 
-    /// Exists (see `isQuotaTrackable`) but the server currently reports it as not
-    /// usable — cooling after a rate limit, an errored refresh, or flagged unavailable.
-    /// Purely a display/bookkeeping state: an account in it is still listed, still
-    /// keeps whatever quota reading it already had, and clears the state by itself as
-    /// soon as the server reports it ready again.
-    public var isTemporarilyUnavailable: Bool { isQuotaTrackable && !isReady }
+    /// Exists (see `isQuotaTrackable`) but the server currently reports the whole
+    /// account as unavailable. CLIProxyAPI may set `status == "error"` when only one
+    /// model has failed while the account remains routable; only its aggregated
+    /// `unavailable` flag is authoritative for account-level cooldown. Keeping this
+    /// independent from `isReady` prevents a model-scoped error from turning the whole
+    /// account into a fake "cooling / recovery time unknown" state.
+    public var isTemporarilyUnavailable: Bool { isQuotaTrackable && unavailable }
 
     public func hash(into hasher: inout Hasher) {
         hasher.combine(id)
