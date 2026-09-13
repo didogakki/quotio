@@ -240,6 +240,53 @@ public extension QuotaMetric {
     }
 }
 
+/// Whether an account currently reads as unusable, for the menu bar's status marker.
+/// `frozen` (the account's own credential was rejected) is distinct from `cooling` (a
+/// remote source's own listing reports the account temporarily unavailable, e.g. a
+/// rate-limit cooldown) — see `ProviderQuota.availabilityStatus`.
+public enum QuotaAccountAvailabilityStatus: Equatable, Sendable {
+    case frozen
+    case cooling
+}
+
+public extension ProviderQuota {
+    /// `frozen` when `isForbidden` (the account's own credential was rejected),
+    /// `cooling` when a remote source reports it `isTemporarilyUnavailable` (cooling
+    /// after a rate limit, or otherwise flagged unavailable), `nil` for a normal,
+    /// currently-usable account. `frozen` takes priority when both are set, since a
+    /// rejected credential is the more severe condition.
+    var availabilityStatus: QuotaAccountAvailabilityStatus? {
+        if isForbidden { return .frozen }
+        if isTemporarilyUnavailable == true { return .cooling }
+        return nil
+    }
+
+    /// `availabilityRecoveryDate` when it is still in the future, `nil` otherwise —
+    /// deliberately never falls back to any `QuotaMetric.resetTime`: that is a distinct,
+    /// unrelated concept (the provider's own usage-window reset, e.g. Claude's 5-hour
+    /// session window), and using it here would misrepresent an account's freeze/cooldown
+    /// recovery as its next quota reset. `nil` means "no real, still-upcoming recovery
+    /// time is known" — never a fabricated estimate.
+    var upcomingAvailabilityRecoveryDate: Date? {
+        guard let date = availabilityRecoveryDate, date.timeIntervalSinceNow > 0 else { return nil }
+        return date
+    }
+
+    /// Compact "3h32m" countdown to `upcomingAvailabilityRecoveryDate`, matching the
+    /// reset-time style already shown next to each quota meter in this same menu. `nil`
+    /// when there is no known, still-upcoming real recovery time to count down to.
+    var formattedAvailabilityCountdown: String? {
+        upcomingAvailabilityRecoveryDate.map { QuotaDateFormatting.relativeCompact(to: $0) }
+    }
+
+    /// Full absolute recovery datetime, fixed Asia/Tokyo/24-hour — the weaker auxiliary
+    /// detail shown alongside `formattedAvailabilityCountdown`, never instead of it.
+    /// `nil` under the same condition.
+    var formattedAvailabilityAbsolute: String? {
+        upcomingAvailabilityRecoveryDate.map(QuotaDateFormatting.absoluteJST)
+    }
+}
+
 @MainActor
 public extension ProviderQuota {
     var formattedTokenExpiry: String? {

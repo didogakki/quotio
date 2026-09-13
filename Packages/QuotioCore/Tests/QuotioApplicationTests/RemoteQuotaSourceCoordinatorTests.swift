@@ -78,6 +78,168 @@ final class RemoteQuotaSourceCoordinatorTests: XCTestCase {
         XCTAssertEqual(state.failureCounts["s1"], 1, "a partial failure must still count toward the hide threshold")
     }
 
+    /// The counterpart to pruning: an account the source still lists but currently
+    /// reports as frozen must keep both its row and its last-known-good reading. Being
+    /// temporarily unusable is a state, never an absence — treating it as one is what
+    /// used to make a merely-cooling account disappear from the menu bar.
+    func testFrozenAccountKeepsItsLastKnownReadingAndIsNeverPruned() async {
+        let fetcher = StubFetcher()
+        let coordinator = makeCoordinator(fetcher: fetcher)
+        let source = RemoteQuotaSourceConfig(id: "s1", name: "Pool", baseURL: "https://a.test")
+        await coordinator.addSource(source, managementKey: "k")
+        await fetcher.enqueue(
+            .result(RemoteQuotaPoolFetchResult(
+                quotasByProviderAndAccount: [.codex: ["a": Self.quota(70), "b": Self.quota(20)]],
+                outcome: .complete,
+                knownAccountKeys: [.codex: ["a", "b"]],
+                temporarilyUnavailableAccountKeys: [.codex: []]
+            )),
+            for: "s1"
+        )
+        await coordinator.refresh(sourceId: "s1")
+
+        // Round two: "b" froze and reported nothing, so the fetcher offers a stand-in.
+        await fetcher.enqueue(
+            .result(RemoteQuotaPoolFetchResult(
+                quotasByProviderAndAccount: [.codex: ["a": Self.quota(60)]],
+                outcome: .complete,
+                knownAccountKeys: [.codex: ["a", "b"]],
+                temporarilyUnavailableAccountKeys: [.codex: ["b"]],
+                placeholderQuotas: [.codex: ["b": Self.placeholder(name: "b@example.com")]]
+            )),
+            for: "s1"
+        )
+        await coordinator.refresh(sourceId: "s1", isAutomatic: true)
+
+        var state = await coordinator.state
+        XCTAssertEqual(
+            state.poolQuotas["s1"]?[.codex]?["b"]?.models.first?.percentage, 20,
+            "a stand-in must never displace a reading the pool already holds")
+        XCTAssertEqual(state.poolQuotas["s1"]?[.codex]?["b"]?.isTemporarilyUnavailable, true)
+        XCTAssertNil(state.poolQuotas["s1"]?[.codex]?["a"]?.isTemporarilyUnavailable)
+        XCTAssertEqual(state.failureCounts["s1"], 0, "a frozen account is not a source failure")
+
+        // Round three: "b" recovered. The state must clear itself off the account even
+        // though its own quota request is what proves it — the listing is the authority.
+        await fetcher.enqueue(
+            .result(RemoteQuotaPoolFetchResult(
+                quotasByProviderAndAccount: [.codex: ["a": Self.quota(60), "b": Self.quota(30)]],
+                outcome: .complete,
+                knownAccountKeys: [.codex: ["a", "b"]],
+                temporarilyUnavailableAccountKeys: [.codex: []]
+            )),
+            for: "s1"
+        )
+        await coordinator.refresh(sourceId: "s1", isAutomatic: true)
+
+        state = await coordinator.state
+        XCTAssertEqual(state.poolQuotas["s1"]?[.codex]?["b"]?.models.first?.percentage, 30)
+        XCTAssertNil(state.poolQuotas["s1"]?[.codex]?["b"]?.isTemporarilyUnavailable)
+    }
+
+    /// Regression: an account that already has a real reading in the pool must still get
+    /// its `availabilityRecoveryDate` refreshed every round it's reported frozen — not
+    /// just the round it first freezes. Before this fix, the coordinator only ever wrote
+    /// `availabilityRecoveryDate` via `placeholderQuotas`, which is skipped once *any*
+    /// reading already exists for the account — so a stale recovery time from an earlier
+    /// round would linger forever instead of tracking this round's own authoritative
+    /// estimate, and would never clear once the account actually recovered.
+    func testAvailabilityRecoveryDateIsRefreshedEachRoundForAnAccountWithAnExistingReading() async {
+        let fetcher = StubFetcher()
+        let coordinator = makeCoordinator(fetcher: fetcher)
+        let source = RemoteQuotaSourceConfig(id: "s1", name: "Pool", baseURL: "https://a.test")
+        await coordinator.addSource(source, managementKey: "k")
+        let firstRecovery = Date(timeIntervalSince1970: 1_800_003_600)
+        let secondRecovery = Date(timeIntervalSince1970: 1_800_007_200)
+
+        // Round one: "a" is already frozen but still answers with a real reading.
+        await fetcher.enqueue(
+            .result(RemoteQuotaPoolFetchResult(
+                quotasByProviderAndAccount: [.codex: ["a": Self.quota(70)]],
+                outcome: .complete,
+                knownAccountKeys: [.codex: ["a"]],
+                temporarilyUnavailableAccountKeys: [.codex: ["a"]],
+                availabilityRecoveryDates: [.codex: ["a": firstRecovery]]
+            )),
+            for: "s1"
+        )
+        await coordinator.refresh(sourceId: "s1")
+
+        var state = await coordinator.state
+        XCTAssertEqual(state.poolQuotas["s1"]?[.codex]?["a"]?.availabilityRecoveryDate, firstRecovery)
+
+        // Round two: "a" is still frozen, its own quota request failed this round (no
+        // fresh reading), but the source reports a new recovery estimate — since the pool
+        // already holds a reading, no placeholder is offered, so the fix must be what
+        // actually updates the stale estimate.
+        await fetcher.enqueue(
+            .result(RemoteQuotaPoolFetchResult(
+                outcome: .allFailed,
+                knownAccountKeys: [.codex: ["a"]],
+                temporarilyUnavailableAccountKeys: [.codex: ["a"]],
+                availabilityRecoveryDates: [.codex: ["a": secondRecovery]]
+            )),
+            for: "s1"
+        )
+        await coordinator.refresh(sourceId: "s1", isAutomatic: true)
+
+        state = await coordinator.state
+        XCTAssertEqual(
+            state.poolQuotas["s1"]?[.codex]?["a"]?.availabilityRecoveryDate, secondRecovery,
+            "a fresh round's recovery estimate must replace a stale one, even with no new quota reading"
+        )
+        XCTAssertEqual(
+            state.poolQuotas["s1"]?[.codex]?["a"]?.models.first?.percentage, 70,
+            "the last-known-good metrics must survive untouched"
+        )
+
+        // Round three: "a" recovered — no longer frozen at all.
+        await fetcher.enqueue(
+            .result(RemoteQuotaPoolFetchResult(
+                quotasByProviderAndAccount: [.codex: ["a": Self.quota(80)]],
+                outcome: .complete,
+                knownAccountKeys: [.codex: ["a"]],
+                temporarilyUnavailableAccountKeys: [.codex: []]
+            )),
+            for: "s1"
+        )
+        await coordinator.refresh(sourceId: "s1")
+
+        state = await coordinator.state
+        XCTAssertNil(
+            state.poolQuotas["s1"]?[.codex]?["a"]?.availabilityRecoveryDate,
+            "a recovered account must clear its recovery time, never keep the last estimate"
+        )
+    }
+
+    /// An account that froze before it was ever read successfully has no reading to fall
+    /// back on, so without the stand-in it would still not exist as far as the UI is
+    /// concerned — the same disappearance, just for a newer account.
+    func testFrozenAccountNeverReadBeforeStillSurfacesAsAPlaceholder() async {
+        let fetcher = StubFetcher()
+        let coordinator = makeCoordinator(fetcher: fetcher)
+        let source = RemoteQuotaSourceConfig(id: "s1", name: "Pool", baseURL: "https://a.test")
+        await coordinator.addSource(source, managementKey: "k")
+        await fetcher.enqueue(
+            .result(RemoteQuotaPoolFetchResult(
+                outcome: .complete,
+                knownAccountKeys: [.codex: ["a"]],
+                temporarilyUnavailableAccountKeys: [.codex: ["a"]],
+                placeholderQuotas: [.codex: ["a": Self.placeholder(name: "a@example.com")]]
+            )),
+            for: "s1"
+        )
+
+        await coordinator.refresh(sourceId: "s1")
+
+        let state = await coordinator.state
+        let entry = state.poolQuotas["s1"]?[.codex]?["a"]
+        XCTAssertNotNil(entry)
+        XCTAssertEqual(entry?.accountDisplayName, "a@example.com")
+        XCTAssertEqual(entry?.isTemporarilyUnavailable, true)
+        XCTAssertEqual(entry?.models, [], "a stand-in carries identity only, never metrics")
+    }
+
     /// An account that drops out of the auth-file listing entirely (deleted or
     /// disabled on the remote server) must be pruned from `poolQuotas` instead of
     /// lingering forever, once the fetcher reports the current round's full
@@ -658,6 +820,10 @@ final class RemoteQuotaSourceCoordinatorTests: XCTestCase {
 
     private static func quota(_ percentage: Double) -> ProviderQuota {
         ProviderQuota(models: [QuotaMetric(name: "usage", percentage: percentage, resetTime: "")])
+    }
+
+    private static func placeholder(name: String) -> ProviderQuota {
+        ProviderQuota(accountDisplayName: name, isTemporarilyUnavailable: true)
     }
 }
 

@@ -26,4 +26,29 @@ final class QuotaDateFormattingTests: XCTestCase {
         XCTAssertNil(QuotaDateFormatting.absoluteJST(""))
         XCTAssertNil(QuotaDateFormatting.absoluteJST("not-a-date"))
     }
+
+    func testParseISO8601ParsesStandardAndFractionalForms() {
+        XCTAssertNotNil(QuotaDateFormatting.parseISO8601("2026-09-21T07:22:00Z"))
+        XCTAssertNotNil(QuotaDateFormatting.parseISO8601("2026-09-21T07:22:00.500Z"))
+        XCTAssertNil(QuotaDateFormatting.parseISO8601(""))
+        XCTAssertNil(QuotaDateFormatting.parseISO8601("not-a-date"))
+    }
+
+    func testRelativeCompactFormatsHoursMinutesWithNoSpace() {
+        let now = Date(timeIntervalSince1970: 0)
+        let in3h32m = now.addingTimeInterval(3 * 3600 + 32 * 60)
+        XCTAssertEqual(QuotaDateFormatting.relativeCompact(to: in3h32m, from: now), "3h32m")
+    }
+
+    func testRelativeCompactFormatsDaysAndHours() {
+        let now = Date(timeIntervalSince1970: 0)
+        let in2d5h = now.addingTimeInterval(2 * 86_400 + 5 * 3600)
+        XCTAssertEqual(QuotaDateFormatting.relativeCompact(to: in2d5h, from: now), "2d5h")
+    }
+
+    func testRelativeCompactFormatsMinutesOnlyUnderAnHour() {
+        let now = Date(timeIntervalSince1970: 0)
+        let in12m = now.addingTimeInterval(12 * 60)
+        XCTAssertEqual(QuotaDateFormatting.relativeCompact(to: in12m, from: now), "12m")
+    }
 }

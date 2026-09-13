@@ -805,11 +805,53 @@ private struct MenuAccountCardView: View {
         return data.codexResetCreditSummary?.formattedSummary
     }
 
+    private static let frozenColor = Color(red: 0.93, green: 0.35, blue: 0.13)
+
+    /// Icon/label/color for the freeze/cooldown status marker shown left of the tier
+    /// badge — `nil` for a normal, currently-usable account (`data.availabilityStatus`).
+    private var availabilityMarker: (icon: String, label: String, color: Color)? {
+        switch data.availabilityStatus {
+        case .frozen:
+            return ("lock.fill", "quota.account.frozen".localized(), Self.frozenColor)
+        case .cooling:
+            return ("clock.fill", "quota.account.cooling".localized(), .yellow)
+        case nil:
+            return nil
+        }
+    }
+
+    /// "3h32m 后解封"/"3h48m 后恢复"-style estimate, or the explicit "time unknown"
+    /// fallback when this account's last-known-good reading carries no future reset
+    /// time to count down to (`data.formattedAvailabilityCountdown`) — never a
+    /// fabricated guess. `nil` for a normal, currently-usable account.
+    private var availabilityCountdownText: String? {
+        guard let status = data.availabilityStatus else { return nil }
+        if let countdown = data.formattedAvailabilityCountdown {
+            let key = status == .frozen ? "quota.account.frozenCountdown" : "quota.account.coolingCountdown"
+            return String(format: key.localized(), countdown)
+        }
+        let key = status == .frozen ? "quota.account.frozenUnknown" : "quota.account.coolingUnknown"
+        return key.localized()
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             headerSection
 
             quotaContentSection
+
+            if let availabilityCountdownText {
+                // The absolute recovery time is auxiliary detail, not shown as its own
+                // line — it rides along as a hover tooltip on the same countdown text
+                // instead, so the two never compete for space. Absent (empty tooltip,
+                // which `menuNativeTooltip` treats as "no tooltip") when the countdown
+                // itself is already the "time unknown" fallback.
+                Text(availabilityCountdownText)
+                    .font(.system(size: 10, design: .rounded))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .menuNativeTooltip(data.formattedAvailabilityAbsolute ?? "")
+            }
 
             if let codexResetCreditsText {
                 Text(codexResetCreditsText)
@@ -863,6 +905,22 @@ private struct MenuAccountCardView: View {
             .disabled(!canRefresh)
             .help("action.refreshQuota".localized())
             
+            // Freeze/cooldown status marker — placed left of the tier badge, never
+            // shown for a normal, currently-usable account.
+            if let marker = availabilityMarker {
+                HStack(spacing: 3) {
+                    Image(systemName: marker.icon)
+                        .font(.system(size: 9, weight: .semibold))
+                    Text(marker.label)
+                        .font(.system(size: 10, weight: .semibold, design: .rounded))
+                }
+                .foregroundStyle(marker.color)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(marker.color.opacity(0.15))
+                .clipShape(Capsule())
+            }
+
             // Tier Badge
             if let config = tierConfig {
                 Text(config.name)

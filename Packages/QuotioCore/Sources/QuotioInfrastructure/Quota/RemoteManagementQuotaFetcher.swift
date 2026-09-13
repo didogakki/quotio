@@ -58,43 +58,98 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
             throw RemoteQuotaFetchError.authFilesUnavailable
         }
 
+        // A frozen account (cooling after a rate limit, flagged unavailable) is still an
+        // account: `isQuotaTrackable` keeps it here so it stays in `knownAccountKeys` and
+        // survives the coordinator's prune, instead of being mistaken for one that was
+        // deleted from the server. Only an explicitly disabled file is left out.
         let candidates = files.filter { file in
-            file.isReady && file.providerID.map(Self.supportedProviders.contains) == true
+            file.isQuotaTrackable && file.providerID.map(Self.supportedProviders.contains) == true
         }
 
         // The listing succeeded, so it is authoritative for **every** provider this
         // fetcher supports — seeding each with an empty set (rather than only recording
         // providers that happen to have a candidate) is what tells the coordinator that
         // a provider whose last account was deleted now genuinely has none, instead of
-        // leaving its stale reading behind forever.
+        // leaving its stale reading behind forever. The frozen-account listing is seeded
+        // the same way, for the same reason in reverse: an empty set is what clears the
+        // state off every account of a provider that recovered.
         var knownAccountKeys = Dictionary(
             uniqueKeysWithValues: Self.supportedProviders.map { ($0, Set<String>()) }
         )
+        var temporarilyUnavailableAccountKeys = knownAccountKeys
         guard !candidates.isEmpty else {
             // An empty listing is a real, authoritative answer — never a fetch error —
             // so it must still be allowed to prune. `outcome` keeps the round marked
             // as a failure so it can't be mistaken for a healthy refresh.
             return RemoteQuotaPoolFetchResult(
                 outcome: .noAccountsListed,
-                knownAccountKeys: knownAccountKeys
+                knownAccountKeys: knownAccountKeys,
+                temporarilyUnavailableAccountKeys: temporarilyUnavailableAccountKeys
             )
         }
 
-        // Each ready, supported auth file is one real remote account — its quota is
+        // Each trackable, supported auth file is one real remote account — its quota is
         // kept under its own raw key (never merged/aggregated with any other account's
         // reading), so the same identity survives from fetch through display.
         var byProviderAndAccount: [QuotaProvider: [String: ProviderQuota]] = [:]
+        var placeholderQuotas: [QuotaProvider: [String: ProviderQuota]] = [:]
+        var availabilityRecoveryDates: [QuotaProvider: [String: Date]] = [:]
+        // Counted over the accounts this round could reasonably expect a reading from,
+        // which excludes the frozen ones: a request that fails because the server already
+        // said the account is cooling is not evidence that the *source* is unhealthy, and
+        // counting it as one would drive the coordinator's consecutive-failure threshold
+        // and hide the whole source — the same disappearance, one level up.
+        var expectedCount = 0
         var succeededCount = 0
         for file in candidates {
             guard let provider = file.providerID else { continue }
             let accountKey = file.authIndex ?? file.name
             knownAccountKeys[provider, default: []].insert(accountKey)
-            guard var quota = try? await fetchQuota(provider: provider, file: file, source: source, api: api) else {
+            let isFrozen = file.isTemporarilyUnavailable
+            if isFrozen {
+                temporarilyUnavailableAccountKeys[provider, default: []].insert(accountKey)
+            } else {
+                expectedCount += 1
+            }
+            // Still attempted for a frozen account: the management API may well answer
+            // (a cooldown is the remote server's own routing state, not a hard block), and
+            // a real reading is always better than a placeholder.
+            let attempt = try? await fetchQuota(provider: provider, file: file, source: source, api: api)
+            // The auth-file listing's own explicit fields are authoritative when present;
+            // the quota request's own (429-only, estimated) `Retry-After` header is only a
+            // fallback for a server build that exposes no such field on the listing at
+            // all. Only resolved for a frozen account — a ready one has nothing to recover
+            // from.
+            let recoveryDate = isFrozen
+                ? (file.recoveryDate(fetchedAt: now()) ?? attempt?.headerRecoveryDate)
+                : nil
+            // Recorded for every frozen account this round, whether or not one resolved —
+            // an absent entry is this round's authoritative "unknown", which is what lets
+            // the coordinator clear a stale recovery time from an earlier round instead of
+            // only ever being able to set one.
+            if isFrozen {
+                availabilityRecoveryDates[provider, default: [:]][accountKey] = recoveryDate
+            }
+            guard var quota = attempt?.quota else {
+                if isFrozen {
+                    // Identity only — no models, so nothing here can read as a real
+                    // measurement. The coordinator drops it in favour of any reading it
+                    // already holds.
+                    placeholderQuotas[provider, default: [:]][accountKey] = ProviderQuota(
+                        lastUpdated: now(),
+                        accountDisplayName: file.email?.nilIfBlank ?? file.name,
+                        isTemporarilyUnavailable: true,
+                        availabilityRecoveryDate: recoveryDate
+                    )
+                }
                 continue
             }
-            succeededCount += 1
+            if !isFrozen { succeededCount += 1 }
             if quota.accountDisplayName == nil {
                 quota.accountDisplayName = file.email?.nilIfBlank ?? file.name
+            }
+            if isFrozen {
+                quota.availabilityRecoveryDate = recoveryDate
             }
             byProviderAndAccount[provider, default: [:]][accountKey] = quota
         }
@@ -104,9 +159,14 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
         // than thrown away, so a round where every request fails can still prune
         // accounts that disappeared from the remote server.
         let outcome: RemoteQuotaPoolFetchResult.QuotaOutcome
-        if succeededCount == 0 {
+        if expectedCount == 0 {
+            // Every listed account is frozen, so nothing was expected to report and
+            // nothing failed. The listing itself succeeded and the accounts are all
+            // still there — a healthy round, not a failing one.
+            outcome = .complete
+        } else if succeededCount == 0 {
             outcome = .allFailed
-        } else if succeededCount < candidates.count {
+        } else if succeededCount < expectedCount {
             outcome = .partial
         } else {
             outcome = .complete
@@ -115,7 +175,10 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
         return RemoteQuotaPoolFetchResult(
             quotasByProviderAndAccount: byProviderAndAccount,
             outcome: outcome,
-            knownAccountKeys: knownAccountKeys
+            knownAccountKeys: knownAccountKeys,
+            temporarilyUnavailableAccountKeys: temporarilyUnavailableAccountKeys,
+            placeholderQuotas: placeholderQuotas,
+            availabilityRecoveryDates: availabilityRecoveryDates
         )
     }
 
@@ -204,12 +267,22 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
         )
     }
 
+    /// One provider-specific quota fetch attempt's outcome: the parsed quota when the
+    /// upstream request produced one, plus any real cooldown/recovery time recovered
+    /// from that same HTTP response's own `Retry-After`/`X-RateLimit-Reset` headers —
+    /// carried separately so a failed request (e.g. the upstream returning 429) can
+    /// still report a real recovery time even though it produced no quota.
+    private struct QuotaFetchAttempt {
+        var quota: ProviderQuota?
+        var headerRecoveryDate: Date?
+    }
+
     private func fetchQuota(
         provider: QuotaProvider,
         file: ManagedAuthFile,
         source: RemoteQuotaSourceConfig,
         api: any ProxyManagementAPI
-    ) async throws -> ProviderQuota? {
+    ) async throws -> QuotaFetchAttempt {
         let authIndex = file.authIndex ?? file.name
         switch provider {
         case .claude:
@@ -220,7 +293,10 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
                 header: Self.claudeAPIHeaders,
                 data: nil
             ))
-            guard let data = bodyData(result) else { return nil }
+            let headerRecoveryDate = Self.recoveryDate(statusCode: result.statusCode, headers: result.header, fetchedAt: now())
+            guard let data = bodyData(result) else {
+                return QuotaFetchAttempt(quota: nil, headerRecoveryDate: headerRecoveryDate)
+            }
             var quota = ClaudeQuotaFetcher.mapUsage(data, planFallback: trustedPlanFallback(file), now: now())
             // Claude only ever authenticates via OAuth, so the auth-file listing never
             // carries a trustworthy plan for it (see `trustedPlanFallback`) — the OAuth
@@ -231,7 +307,7 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
             if quota?.planType == nil {
                 quota?.planType = await fetchClaudeProfilePlan(authIndex: authIndex, api: api)
             }
-            return quota
+            return QuotaFetchAttempt(quota: quota, headerRecoveryDate: headerRecoveryDate)
 
         case .codex:
             var header = [
@@ -248,15 +324,18 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
                 header: header,
                 data: nil
             ))
-            guard let data = bodyData(result) else { return nil }
+            let headerRecoveryDate = Self.recoveryDate(statusCode: result.statusCode, headers: result.header, fetchedAt: now())
+            guard let data = bodyData(result) else {
+                return QuotaFetchAttempt(quota: nil, headerRecoveryDate: headerRecoveryDate)
+            }
             guard var quota = try? CodexQuotaFetcher.mapUsage(data, planFallback: trustedPlanFallback(file), now: now()) else {
-                return nil
+                return QuotaFetchAttempt(quota: nil, headerRecoveryDate: headerRecoveryDate)
             }
             if let resetCredits = await fetchCodexResetCredits(authIndex: authIndex, accountId: file.account, api: api) {
                 quota.analytics = CodexResetCreditInventoryFetcher.merge(resetCredits.analytics, into: quota.analytics)
                 quota.codexResetCreditSummary = resetCredits.summary
             }
-            return quota
+            return QuotaFetchAttempt(quota: quota, headerRecoveryDate: headerRecoveryDate)
 
         case .grok:
             let result = try await api.apiCall(ProxyAPICall(
@@ -266,7 +345,10 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
                 header: Self.grokAPIHeaders,
                 data: nil
             ))
-            guard let data = bodyData(result) else { return nil }
+            let headerRecoveryDate = Self.recoveryDate(statusCode: result.statusCode, headers: result.header, fetchedAt: now())
+            guard let data = bodyData(result) else {
+                return QuotaFetchAttempt(quota: nil, headerRecoveryDate: headerRecoveryDate)
+            }
             let displayName = file.email?.nilIfBlank ?? file.name
             // Prefer real metadata: the auth-file listing carries no per-account Grok
             // plan field, so `/v1/settings` (the same endpoint the local Grok fetcher
@@ -279,12 +361,62 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
             // that identity beyond the single `RemoteQuotaSourceConfig` it was called
             // with.
             let plan = await fetchGrokSettingsPlan(authIndex: authIndex, api: api) ?? trustedPlanFallback(file)
-            return GrokQuotaFetcher.mapBilling(data, plan: plan, displayName: displayName, now: now())
+            let quota = GrokQuotaFetcher.mapBilling(data, plan: plan, displayName: displayName, now: now())
+            return QuotaFetchAttempt(quota: quota, headerRecoveryDate: headerRecoveryDate)
 
         default:
-            return nil
+            return QuotaFetchAttempt(quota: nil, headerRecoveryDate: nil)
         }
     }
+
+    /// Extracts an **estimated** retry time from an explicit 429 (rate-limited) quota
+    /// HTTP response's own `Retry-After` header (RFC 7231: either delta-seconds or an
+    /// HTTP-date, relative to when this response was received) — the header CLIProxyAPI's
+    /// `/api-call` passes straight through from the upstream provider in
+    /// `ProxyAPICallResult.header`. Header name lookup is case-insensitive, since HTTP
+    /// header casing is not guaranteed to survive the pass-through.
+    ///
+    /// Deliberately gated on `statusCode == 429`: `Retry-After` on any other response
+    /// (including a normal 2xx success) says nothing about a freeze/cooldown. Likewise
+    /// deliberately never falls back to `X-RateLimit-Reset` — on a successful response
+    /// that header names the *next quota window*, not a freeze/cooldown recovery (the
+    /// same distinction `ProviderQuota.availabilityRecoveryDate`'s own doc comment
+    /// draws against `QuotaMetric.resetTime`), and even on a 429 it is not a documented
+    /// unfreeze signal the way `Retry-After` is. This is only ever a best-effort
+    /// **estimate**: the upstream provider's own `Retry-After` is not a guarantee that
+    /// the account is actually usable again once it elapses — the auth-file listing's own
+    /// structured fields (see `ManagedAuthFile.recoveryDate(fetchedAt:)`), tried first by
+    /// the caller, are the more authoritative signal when present. `nil` when the
+    /// response isn't a 429, or the header is absent/unparseable — never a fabricated
+    /// fallback.
+    private static func recoveryDate(statusCode: Int, headers: [String: [String]]?, fetchedAt now: Date) -> Date? {
+        guard statusCode == 429, let headers else { return nil }
+        func firstValue(_ name: String) -> String? {
+            for (key, values) in headers where key.caseInsensitiveCompare(name) == .orderedSame {
+                let value = values.first?.trimmingCharacters(in: .whitespaces)
+                return (value?.isEmpty ?? true) ? nil : value
+            }
+            return nil
+        }
+        guard let retryAfter = firstValue("Retry-After") else { return nil }
+        if let seconds = Double(retryAfter), seconds > 0 {
+            return now.addingTimeInterval(seconds)
+        }
+        if let httpDate = httpDateFormatter.date(from: retryAfter) {
+            return httpDate
+        }
+        return nil
+    }
+
+    /// RFC 7231 `HTTP-date` format (e.g. `Wed, 21 Oct 2026 07:28:00 GMT`) — the
+    /// alternate, non-numeric form `Retry-After` may use.
+    private static let httpDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "GMT")
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        return formatter
+    }()
 
     /// Auth-mechanism labels the Management API's `account_type` field can carry (e.g.
     /// Claude only ever authenticates via OAuth, so its `account_type` is always

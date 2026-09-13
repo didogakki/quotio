@@ -222,6 +222,12 @@ struct AccountRowData: Identifiable, Hashable {
     /// `storageKey` is the exact `RemoteQuotaAccountIdentity` composite key already
     /// present in the merged quota dictionary, so the resulting `menuBarItem` pins
     /// precisely that account — never a source-wide/plan-level aggregate.
+    ///
+    /// A frozen account reports `"cooling"`, which is the same status string a local
+    /// proxy account uses for the same condition — so it picks up the orange indicator
+    /// `statusColor` already draws, with no new UI. `isDisabled` stays `false`: the
+    /// account is temporarily unusable, not switched off, and the two read very
+    /// differently in the row.
     static func from(
         provider: QuotaProvider,
         sourceId: String,
@@ -236,7 +242,7 @@ struct AccountRowData: Identifiable, Hashable {
             displayName: quota.accountDisplayName ?? rawAccountKey,
             menuBarAccountKey: storageKey,
             source: .remoteQuotaSource(sourceName),
-            status: nil,
+            status: quota.isTemporarilyUnavailable == true ? "cooling" : nil,
             statusMessage: nil,
             isDisabled: false,
             canDelete: false,

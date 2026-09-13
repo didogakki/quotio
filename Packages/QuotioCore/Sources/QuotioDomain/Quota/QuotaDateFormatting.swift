@@ -25,6 +25,32 @@ public enum QuotaDateFormatting {
         return "\(formatter.string(from: date)) JST"
     }
 
+    /// Parses `value` as ISO-8601 (with or without fractional seconds), the same
+    /// tolerant parsing `absoluteJST(_:String)` uses internally — exposed so callers
+    /// that need the `Date` itself (not just its JST label) share one parsing rule
+    /// rather than re-implementing it.
+    public static func parseISO8601(_ value: String) -> Date? {
+        parseISO8601Date(value)
+    }
+
+    /// Compact "3h32m"/"2d5h"/"12m" countdown to `date` — the same style already shown
+    /// next to each quota meter in the menu bar. Never negative: a `date` at or before
+    /// `now` reads as "0m" rather than producing a nonsensical countdown, since callers
+    /// are expected to only pass a still-upcoming `date`.
+    public static func relativeCompact(to date: Date, from now: Date = Date()) -> String {
+        let totalMinutes = max(0, Int(date.timeIntervalSince(now)) / 60)
+        let days = totalMinutes / 1440
+        let hours = (totalMinutes % 1440) / 60
+        let minutes = totalMinutes % 60
+        if days > 0 {
+            return hours > 0 ? "\(days)d\(hours)h" : "\(days)d"
+        }
+        if hours > 0 {
+            return "\(hours)h\(minutes)m"
+        }
+        return "\(minutes)m"
+    }
+
     private static func parseISO8601Date(_ value: String) -> Date? {
         let fractional = ISO8601DateFormatter()
         fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]

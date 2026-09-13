@@ -1,5 +1,74 @@
 import Foundation
 
+/// One recovery-time value as the Management API may report it: either an absolute
+/// timestamp string (ISO-8601, matching every other date field on `ManagedAuthFile`) or
+/// a bare number of seconds (matching the HTTP `Retry-After: <seconds>` convention some
+/// `retry_after`-style fields use). Never assumes which — both are decoded and resolved
+/// explicitly, never guessed from context.
+public enum AuthFileRecoveryTimeValue: Codable, Equatable, Sendable {
+    case absolute(String)
+    case secondsFromNow(Double)
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let seconds = try? container.decode(Double.self) {
+            self = .secondsFromNow(seconds)
+            return
+        }
+        self = .absolute(try container.decode(String.self))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .absolute(let value): try container.encode(value)
+        case .secondsFromNow(let value): try container.encode(value)
+        }
+    }
+
+    /// A bare number this large could never plausibly be a "seconds from now" retry
+    /// delay (30 days) — at that magnitude it is far more likely a misclassified Unix
+    /// epoch timestamp (which `AuthFileRecoveryTimeValue` never attempts to detect, since
+    /// doing so would itself be a guess). Treating every bare number as a short duration
+    /// regardless of size is exactly the heuristic this bound exists to avoid: past it,
+    /// the field is unsupported/ambiguous data, so `resolvedDate` returns `nil` rather
+    /// than resolving to a wildly wrong date.
+    private static let maxPlausibleRetrySeconds: Double = 30 * 24 * 60 * 60
+
+    /// Resolves this value to a concrete `Date`. `now` is only consulted for
+    /// `.secondsFromNow`, where it anchors the duration to when the listing carrying
+    /// this value was fetched. `nil` when an `.absolute` string fails to parse, a
+    /// `.secondsFromNow` value is zero/negative, or it exceeds `maxPlausibleRetrySeconds`
+    /// — never a fabricated date and never a guessed epoch/duration reinterpretation.
+    /// Only meaningful for a field whose API contract is actually a relative duration
+    /// (`retry_after`) — see `resolvedAbsoluteDate()` for fields that are timestamps.
+    func resolvedDate(fetchedAt now: Date) -> Date? {
+        switch self {
+        case .absolute(let value):
+            return QuotaDateFormatting.parseISO8601(value)
+        case .secondsFromNow(let seconds):
+            guard seconds > 0, seconds <= Self.maxPlausibleRetrySeconds else { return nil }
+            return now.addingTimeInterval(seconds)
+        }
+    }
+
+    /// Resolves this value only when it is an absolute timestamp. For fields whose
+    /// documented contract is a point-in-time (`unfreeze_at`, `frozen_until`,
+    /// `cooldown_until`, `recovery_at`, `next_retry_after`), a bare number is never a
+    /// legitimate value for that field — there is no size threshold that reliably tells a
+    /// relative-seconds value apart from a timestamp expressed as a number, so guessing
+    /// via a magnitude cutoff would just trade one wrong interpretation for another.
+    /// Unsupported/ambiguous data resolves to `nil` instead of a fabricated date.
+    func resolvedAbsoluteDate() -> Date? {
+        switch self {
+        case .absolute(let value):
+            return QuotaDateFormatting.parseISO8601(value)
+        case .secondsFromNow:
+            return nil
+        }
+    }
+}
+
 public struct ManagedAuthFile: Codable, Identifiable, Hashable, Sendable {
     public let id: String
     public let name: String
@@ -19,6 +88,17 @@ public struct ManagedAuthFile: Codable, Identifiable, Hashable, Sendable {
     public let createdAt: String?
     public let updatedAt: String?
     public let lastRefresh: String?
+    /// Real freeze/cooldown recovery signals the Management API may report for this
+    /// specific account. None of these are guaranteed to exist on any given server
+    /// build — `recoveryDate(fetchedAt:)` resolves whichever, if any, is actually
+    /// present, and every one of them is optional so decoding an older/plainer response
+    /// (none of these fields present) never fails.
+    public let nextRetryAfter: AuthFileRecoveryTimeValue?
+    public let retryAfter: AuthFileRecoveryTimeValue?
+    public let unfreezeAt: AuthFileRecoveryTimeValue?
+    public let frozenUntil: AuthFileRecoveryTimeValue?
+    public let cooldownUntil: AuthFileRecoveryTimeValue?
+    public let recoveryAt: AuthFileRecoveryTimeValue?
 
     public init(
         id: String,
@@ -38,7 +118,13 @@ public struct ManagedAuthFile: Codable, Identifiable, Hashable, Sendable {
         authIndex: String? = nil,
         createdAt: String? = nil,
         updatedAt: String? = nil,
-        lastRefresh: String? = nil
+        lastRefresh: String? = nil,
+        nextRetryAfter: AuthFileRecoveryTimeValue? = nil,
+        retryAfter: AuthFileRecoveryTimeValue? = nil,
+        unfreezeAt: AuthFileRecoveryTimeValue? = nil,
+        frozenUntil: AuthFileRecoveryTimeValue? = nil,
+        cooldownUntil: AuthFileRecoveryTimeValue? = nil,
+        recoveryAt: AuthFileRecoveryTimeValue? = nil
     ) {
         self.id = id
         self.name = name
@@ -58,6 +144,12 @@ public struct ManagedAuthFile: Codable, Identifiable, Hashable, Sendable {
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.lastRefresh = lastRefresh
+        self.nextRetryAfter = nextRetryAfter
+        self.retryAfter = retryAfter
+        self.unfreezeAt = unfreezeAt
+        self.frozenUntil = frozenUntil
+        self.cooldownUntil = cooldownUntil
+        self.recoveryAt = recoveryAt
     }
 
     enum CodingKeys: String, CodingKey {
@@ -69,6 +161,39 @@ public struct ManagedAuthFile: Codable, Identifiable, Hashable, Sendable {
         case createdAt = "created_at"
         case updatedAt = "updated_at"
         case lastRefresh = "last_refresh"
+        case nextRetryAfter = "next_retry_after"
+        case retryAfter = "retry_after"
+        case unfreezeAt = "unfreeze_at"
+        case frozenUntil = "frozen_until"
+        case cooldownUntil = "cooldown_until"
+        case recoveryAt = "recovery_at"
+    }
+
+    /// Real freeze/cooldown recovery time for this account, resolved from whichever
+    /// explicit, structured signal the Management API actually provided — never a guess
+    /// and never derived from any quota model's own reset time (a distinct, unrelated
+    /// concept). Checked in this order: the explicit absolute/duration fields above,
+    /// first one present wins. Deliberately never falls back to free-text inference from
+    /// `statusMessage` (a server can freely change that copy, or state when the freeze
+    /// *started* rather than when it ends) and never treats `updatedAt`/`lastRefresh` —
+    /// which describe when the listing itself was last touched, not this account's
+    /// unfreeze time — as a recovery signal. `nil` when none of these structured fields
+    /// resolve to a concrete date, rather than a guessed one.
+    ///
+    /// `unfreezeAt`, `frozenUntil`, `cooldownUntil`, `recoveryAt`, and `nextRetryAfter`
+    /// are all documented as absolute timestamps, so only an `.absolute` value resolves
+    /// for them — a bare number under any of those keys is unsupported/ambiguous data,
+    /// not a relative duration to guess at. `retryAfter` is the one field whose contract
+    /// is a relative `Retry-After`-style duration, so it is the only one that accepts a
+    /// `.secondsFromNow` value.
+    public func recoveryDate(fetchedAt now: Date) -> Date? {
+        let absoluteOnlyCandidates = [unfreezeAt, frozenUntil, cooldownUntil, recoveryAt, nextRetryAfter]
+        for candidate in absoluteOnlyCandidates {
+            if let date = candidate?.resolvedAbsoluteDate() {
+                return date
+            }
+        }
+        return retryAfter?.resolvedDate(fetchedAt: now)
     }
 
     public var providerID: QuotaProvider? {
@@ -103,6 +228,23 @@ public struct ManagedAuthFile: Codable, Identifiable, Hashable, Sendable {
     public var isReady: Bool {
         (status == "ready" || status == "active") && !disabled && !unavailable
     }
+
+    /// Whether this auth file counts as an account that **exists** for quota tracking.
+    /// Deliberately independent of `status`/`unavailable`: those describe a transient
+    /// server-side condition (a cooldown after a rate limit, a failed token refresh),
+    /// never whether the account is there — and conflating the two is what used to make
+    /// a merely-frozen remote account vanish from the menu bar entirely instead of
+    /// keeping its last-known-good reading. Only an explicitly disabled file is
+    /// excluded: that one is a deliberate user action on the server, so it keeps its
+    /// existing "not tracked at all" behavior.
+    public var isQuotaTrackable: Bool { !disabled }
+
+    /// Exists (see `isQuotaTrackable`) but the server currently reports it as not
+    /// usable — cooling after a rate limit, an errored refresh, or flagged unavailable.
+    /// Purely a display/bookkeeping state: an account in it is still listed, still
+    /// keeps whatever quota reading it already had, and clears the state by itself as
+    /// soon as the server reports it ready again.
+    public var isTemporarilyUnavailable: Bool { isQuotaTrackable && !isReady }
 
     public func hash(into hasher: inout Hasher) {
         hasher.combine(id)

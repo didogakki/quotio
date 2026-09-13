@@ -273,6 +273,15 @@ public actor RemoteQuotaSourceCoordinator {
                     QuotaPolicy.mergingCodexResetCredits(old: old, new: new)
                 }
             }
+            // A frozen account that produced no reading of its own gets an identity-only
+            // stand-in, but only where nothing is known yet: a reading already in the pool
+            // — this round's or a previous one's — always wins, so freezing never costs an
+            // account the numbers it last reported.
+            for (provider, placeholders) in result.placeholderQuotas {
+                for (accountKey, placeholder) in placeholders where pools[provider]?[accountKey] == nil {
+                    pools[provider, default: [:]][accountKey] = placeholder
+                }
+            }
             // `knownAccountKeys` is this round's authoritative listing (a listing that
             // could not be obtained throws instead of returning a result), so every
             // provider it mentions is pruned down to exactly the accounts that still
@@ -288,6 +297,29 @@ public actor RemoteQuotaSourceCoordinator {
                     pools.removeValue(forKey: provider)
                 } else {
                     pools[provider] = retained
+                }
+            }
+            // Applied after the prune, over whatever survived it, because the state must
+            // describe this round's listing rather than the round a given reading came
+            // from — the pool can legitimately hold a previous round's quota object.
+            // Clearing back to `nil` is what lets an account that recovered stop reading
+            // as frozen without waiting for its next successful fetch. `availabilityRecoveryDate`
+            // is re-stamped from this round's own authoritative `availabilityRecoveryDates`
+            // right alongside `isTemporarilyUnavailable` — every other field on `quota`
+            // (models, plan, etc.) is left untouched — precisely so an account whose own
+            // quota request merely failed again (keeping its last-known-good reading via
+            // the merge above, never a placeholder, since it already has one) doesn't keep
+            // showing an earlier round's stale recovery estimate: a round with no fresh
+            // signal for it reports that as `nil` here, same as when it recovers.
+            for (provider, frozenKeys) in result.temporarilyUnavailableAccountKeys {
+                guard let byAccount = pools[provider] else { continue }
+                let recoveryDates = result.availabilityRecoveryDates[provider] ?? [:]
+                pools[provider] = byAccount.reduce(into: [String: ProviderQuota]()) { stamped, entry in
+                    var quota = entry.value
+                    let isFrozen = frozenKeys.contains(entry.key)
+                    quota.isTemporarilyUnavailable = isFrozen ? true : nil
+                    quota.availabilityRecoveryDate = isFrozen ? recoveryDates[entry.key] : nil
+                    stamped[entry.key] = quota
                 }
             }
             state.poolQuotas[sourceId] = pools

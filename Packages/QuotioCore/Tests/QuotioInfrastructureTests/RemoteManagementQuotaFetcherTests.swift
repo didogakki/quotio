@@ -17,7 +17,7 @@ final class RemoteManagementQuotaFetcherTests: XCTestCase {
       ManagedAuthFile(
         id: "3", name: "grok-c.json", provider: "grok", status: "ready", disabled: false,
         unavailable: false, email: "c@example.com", authIndex: "grok-c"),
-      // Not ready — must be skipped entirely.
+      // Explicitly disabled on the server — must be skipped entirely.
       ManagedAuthFile(
         id: "4", name: "claude-d.json", provider: "claude", status: "ready", disabled: true,
         unavailable: false, email: "d@example.com", authIndex: "claude-d"),
@@ -65,6 +65,248 @@ final class RemoteManagementQuotaFetcherTests: XCTestCase {
     for call in await api.recordedCalls {
       XCTAssertEqual(call.header?["Authorization"], "Bearer $TOKEN$")
     }
+  }
+
+  /// A frozen account — cooling after a rate limit, or flagged unavailable — is still a
+  /// real account on the server. It must stay in `knownAccountKeys`, which is exactly
+  /// what the coordinator prunes against, instead of being mistaken for one that was
+  /// deleted; only an explicitly disabled file is left out.
+  func testFrozenAccountsStayListedAndAreReportedSeparately() async throws {
+    let files = [
+      ManagedAuthFile(
+        id: "1", name: "claude-a.json", provider: "claude", status: "ready", disabled: false,
+        unavailable: false, email: "a@example.com", authIndex: "claude-a"),
+      // Cooling and silent — the case that used to make the account vanish.
+      ManagedAuthFile(
+        id: "2", name: "claude-b.json", provider: "claude", status: "cooling", disabled: false,
+        unavailable: false, email: "b@example.com", authIndex: "claude-b"),
+      // Flagged unavailable but still answering: frozen accounts are always attempted,
+      // and a real reading always beats a stand-in.
+      ManagedAuthFile(
+        id: "3", name: "claude-c.json", provider: "claude", status: "ready", disabled: false,
+        unavailable: true, email: "c@example.com", authIndex: "claude-c"),
+      // Explicitly disabled on the server — a deliberate user action, still excluded.
+      ManagedAuthFile(
+        id: "4", name: "claude-d.json", provider: "claude", status: "ready", disabled: true,
+        unavailable: false, email: "d@example.com", authIndex: "claude-d"),
+    ]
+    let claudeBody = #"{"five_hour":{"utilization":40,"resets_at":"2026-01-01T00:00:00Z"}}"#
+    let api = StubProxyManagementAPI(
+      authFiles: files,
+      responses: ["claude-a": (200, claudeBody), "claude-c": (200, claudeBody)]
+    )
+    let fetcher = RemoteManagementQuotaFetcher(
+      apiFactory: StubProxyManagementAPIFactory(api: api),
+      now: { Date(timeIntervalSince1970: 1_800_000_000) }
+    )
+    let source = RemoteQuotaSourceConfig(id: "src-1", name: "Pool", baseURL: "https://proxy.test:8317")
+
+    let result = try await fetcher.fetchPool(source, managementKey: "admin-key")
+
+    XCTAssertEqual(result.knownAccountKeys[.claude], ["claude-a", "claude-b", "claude-c"])
+    XCTAssertEqual(result.temporarilyUnavailableAccountKeys[.claude], ["claude-b", "claude-c"])
+    // Only the one unfrozen account was expected to report, and it did — a frozen
+    // account staying silent is not evidence that the source is unhealthy.
+    XCTAssertEqual(result.outcome, .complete)
+    XCTAssertEqual(
+      result.quotasByProviderAndAccount[.claude]?["claude-c"]?.models.first?.percentage, 60,
+      "a frozen account that still answers keeps its real reading")
+    XCTAssertNil(
+      result.quotasByProviderAndAccount[.claude]?["claude-c"]?.isTemporarilyUnavailable,
+      "the frozen state is the coordinator's to stamp, from this round's listing")
+    XCTAssertNil(result.placeholderQuotas[.claude]?["claude-c"])
+    // The silent one gets an identity-only stand-in — never fabricated metrics.
+    XCTAssertNil(result.quotasByProviderAndAccount[.claude]?["claude-b"])
+    XCTAssertEqual(result.placeholderQuotas[.claude]?["claude-b"]?.accountDisplayName, "b@example.com")
+    XCTAssertEqual(result.placeholderQuotas[.claude]?["claude-b"]?.isTemporarilyUnavailable, true)
+    XCTAssertEqual(result.placeholderQuotas[.claude]?["claude-b"]?.models, [])
+    XCTAssertNil(result.placeholderQuotas[.claude]?["claude-d"])
+  }
+
+  /// Every account frozen at once must not read as a failing round: three of those in a
+  /// row would trip the coordinator's hide threshold and take the whole source out of
+  /// the menu bar — the same disappearance the frozen-account handling exists to prevent.
+  func testSourceWithOnlyFrozenAccountsIsNotReportedAsFailing() async throws {
+    let files = [
+      ManagedAuthFile(
+        id: "1", name: "claude-a.json", provider: "claude", status: "cooling", disabled: false,
+        unavailable: false, email: "a@example.com", authIndex: "claude-a"),
+      ManagedAuthFile(
+        id: "2", name: "codex-b.json", provider: "codex", status: "ready", disabled: false,
+        unavailable: true, email: "b@example.com", authIndex: "codex-b"),
+    ]
+    let api = StubProxyManagementAPI(authFiles: files, responses: [:])
+    let fetcher = RemoteManagementQuotaFetcher(
+      apiFactory: StubProxyManagementAPIFactory(api: api),
+      now: { Date(timeIntervalSince1970: 1_800_000_000) }
+    )
+    let source = RemoteQuotaSourceConfig(id: "src-1", name: "Pool", baseURL: "https://proxy.test:8317")
+
+    let result = try await fetcher.fetchPool(source, managementKey: "admin-key")
+
+    XCTAssertEqual(result.outcome, .complete)
+    XCTAssertFalse(result.isFailure)
+    XCTAssertEqual(result.knownAccountKeys[.claude], ["claude-a"])
+    XCTAssertEqual(result.knownAccountKeys[.codex], ["codex-b"])
+    XCTAssertEqual(result.placeholderQuotas[.claude]?.keys.sorted(), ["claude-a"])
+    XCTAssertEqual(result.placeholderQuotas[.codex]?.keys.sorted(), ["codex-b"])
+  }
+
+  /// The auth-file listing's own explicit recovery field is the real, authoritative
+  /// unfreeze time — carried through to the placeholder the coordinator stores, never
+  /// derived from any quota model's `resetTime`.
+  func testFrozenAccountPlaceholderCarriesTheAuthFileListingsOwnRecoveryTime() async throws {
+    let files = [
+      ManagedAuthFile(
+        id: "1", name: "claude-a.json", provider: "claude", status: "cooling", disabled: false,
+        unavailable: false, email: "a@example.com", authIndex: "claude-a",
+        unfreezeAt: .absolute("2027-01-15T06:00:00Z")),
+    ]
+    let api = StubProxyManagementAPI(authFiles: files, responses: [:])
+    let fetcher = RemoteManagementQuotaFetcher(
+      apiFactory: StubProxyManagementAPIFactory(api: api),
+      now: { Date(timeIntervalSince1970: 1_800_000_000) }
+    )
+    let source = RemoteQuotaSourceConfig(id: "src-1", name: "Pool", baseURL: "https://proxy.test:8317")
+
+    let result = try await fetcher.fetchPool(source, managementKey: "admin-key")
+
+    XCTAssertEqual(
+      result.placeholderQuotas[.claude]?["claude-a"]?.availabilityRecoveryDate,
+      ISO8601DateFormatter().date(from: "2027-01-15T06:00:00Z")
+    )
+  }
+
+  /// When the listing itself carries no recovery field, the quota request's own
+  /// `Retry-After` response header (passed straight through from the upstream provider)
+  /// is used as a fallback real signal — never a fabricated one.
+  func testFrozenAccountFallsBackToRetryAfterHeaderWhenListingHasNoRecoveryField() async throws {
+    let files = [
+      ManagedAuthFile(
+        id: "1", name: "claude-a.json", provider: "claude", status: "cooling", disabled: false,
+        unavailable: false, email: "a@example.com", authIndex: "claude-a"),
+    ]
+    let api = StubProxyManagementAPI(
+      authFiles: files,
+      responses: ["claude-a": (429, "rate limited")],
+      headerResponses: ["claude-a": ["Retry-After": ["120"]]]
+    )
+    let fetchedAt = Date(timeIntervalSince1970: 1_800_000_000)
+    let fetcher = RemoteManagementQuotaFetcher(
+      apiFactory: StubProxyManagementAPIFactory(api: api),
+      now: { fetchedAt }
+    )
+    let source = RemoteQuotaSourceConfig(id: "src-1", name: "Pool", baseURL: "https://proxy.test:8317")
+
+    let result = try await fetcher.fetchPool(source, managementKey: "admin-key")
+
+    XCTAssertEqual(
+      result.placeholderQuotas[.claude]?["claude-a"]?.availabilityRecoveryDate,
+      fetchedAt.addingTimeInterval(120)
+    )
+  }
+
+  /// Neither the listing nor the quota response's headers carry any real recovery
+  /// signal — the placeholder must report no recovery time at all, never one guessed
+  /// from the quota model data it doesn't even have.
+  func testFrozenAccountPlaceholderHasNoRecoveryDateWhenNoRealSignalExists() async throws {
+    let files = [
+      ManagedAuthFile(
+        id: "1", name: "claude-a.json", provider: "claude", status: "cooling", disabled: false,
+        unavailable: false, email: "a@example.com", authIndex: "claude-a"),
+    ]
+    let api = StubProxyManagementAPI(authFiles: files, responses: [:])
+    let fetcher = RemoteManagementQuotaFetcher(
+      apiFactory: StubProxyManagementAPIFactory(api: api),
+      now: { Date(timeIntervalSince1970: 1_800_000_000) }
+    )
+    let source = RemoteQuotaSourceConfig(id: "src-1", name: "Pool", baseURL: "https://proxy.test:8317")
+
+    let result = try await fetcher.fetchPool(source, managementKey: "admin-key")
+
+    XCTAssertNil(result.placeholderQuotas[.claude]?["claude-a"]?.availabilityRecoveryDate)
+  }
+
+  /// `X-RateLimit-Reset` on a normal, successful response names the *next quota
+  /// window*, never a freeze/cooldown recovery — it must never be read as one, even
+  /// when present and even though the account is frozen per the listing.
+  func testFrozenAccountNeverFallsBackToXRateLimitResetHeader() async throws {
+    let files = [
+      ManagedAuthFile(
+        id: "1", name: "claude-a.json", provider: "claude", status: "cooling", disabled: false,
+        unavailable: false, email: "a@example.com", authIndex: "claude-a"),
+    ]
+    let claudeBody = #"{"five_hour":{"utilization":40,"resets_at":"2026-01-01T00:00:00Z"}}"#
+    let api = StubProxyManagementAPI(
+      authFiles: files,
+      responses: ["claude-a": (200, claudeBody)],
+      headerResponses: ["claude-a": ["X-RateLimit-Reset": ["2027-01-15T06:00:00Z"]]]
+    )
+    let fetcher = RemoteManagementQuotaFetcher(
+      apiFactory: StubProxyManagementAPIFactory(api: api),
+      now: { Date(timeIntervalSince1970: 1_800_000_000) }
+    )
+    let source = RemoteQuotaSourceConfig(id: "src-1", name: "Pool", baseURL: "https://proxy.test:8317")
+
+    let result = try await fetcher.fetchPool(source, managementKey: "admin-key")
+
+    XCTAssertNil(result.quotasByProviderAndAccount[.claude]?["claude-a"]?.availabilityRecoveryDate)
+  }
+
+  /// `Retry-After` only ever describes an explicit 429 rate-limit response — on any
+  /// other status (including a normal 2xx success) it must never be read as a
+  /// freeze/cooldown recovery signal.
+  func testRetryAfterHeaderIsIgnoredOnANonRateLimitedResponse() async throws {
+    let files = [
+      ManagedAuthFile(
+        id: "1", name: "claude-a.json", provider: "claude", status: "cooling", disabled: false,
+        unavailable: false, email: "a@example.com", authIndex: "claude-a"),
+    ]
+    let claudeBody = #"{"five_hour":{"utilization":40,"resets_at":"2026-01-01T00:00:00Z"}}"#
+    let api = StubProxyManagementAPI(
+      authFiles: files,
+      responses: ["claude-a": (200, claudeBody)],
+      headerResponses: ["claude-a": ["Retry-After": ["120"]]]
+    )
+    let fetcher = RemoteManagementQuotaFetcher(
+      apiFactory: StubProxyManagementAPIFactory(api: api),
+      now: { Date(timeIntervalSince1970: 1_800_000_000) }
+    )
+    let source = RemoteQuotaSourceConfig(id: "src-1", name: "Pool", baseURL: "https://proxy.test:8317")
+
+    let result = try await fetcher.fetchPool(source, managementKey: "admin-key")
+
+    XCTAssertNil(result.quotasByProviderAndAccount[.claude]?["claude-a"]?.availabilityRecoveryDate)
+  }
+
+  /// `availabilityRecoveryDates` is this round's own authoritative per-account map —
+  /// separate from `placeholderQuotas`, which only ever covers an account with no
+  /// existing reading — so the coordinator can refresh/clear a recovery time on an
+  /// account it already has metrics for.
+  func testAvailabilityRecoveryDatesReportsEveryFrozenAccountIncludingThoseWithARealReading() async throws {
+    let files = [
+      ManagedAuthFile(
+        id: "1", name: "claude-a.json", provider: "claude", status: "cooling", disabled: false,
+        unavailable: false, email: "a@example.com", authIndex: "claude-a",
+        unfreezeAt: .absolute("2027-01-15T06:00:00Z")),
+    ]
+    let claudeBody = #"{"five_hour":{"utilization":40,"resets_at":"2026-01-01T00:00:00Z"}}"#
+    let api = StubProxyManagementAPI(authFiles: files, responses: ["claude-a": (200, claudeBody)])
+    let fetcher = RemoteManagementQuotaFetcher(
+      apiFactory: StubProxyManagementAPIFactory(api: api),
+      now: { Date(timeIntervalSince1970: 1_800_000_000) }
+    )
+    let source = RemoteQuotaSourceConfig(id: "src-1", name: "Pool", baseURL: "https://proxy.test:8317")
+
+    let result = try await fetcher.fetchPool(source, managementKey: "admin-key")
+
+    // The account produced a real reading (frozen but still answering), so it's not in
+    // `placeholderQuotas` — but its recovery time must still be reported authoritatively.
+    XCTAssertNil(result.placeholderQuotas[.claude]?["claude-a"])
+    XCTAssertEqual(
+      result.availabilityRecoveryDates[.claude]?["claude-a"],
+      ISO8601DateFormatter().date(from: "2027-01-15T06:00:00Z")
+    )
   }
 
   func testFetchPoolSelectsCurrentSchemaActiveXaiFileAsGrok() async throws {
@@ -747,6 +989,9 @@ private actor StubProxyManagementAPI: ProxyManagementAPI {
   /// one `authIndex` but hit different URLs), since `responses` alone can't distinguish
   /// them. Checked first; falls back to `responses` when a URL has no explicit entry.
   private let urlResponses: [String: (statusCode: Int, body: String)]
+  /// Response headers keyed by `authIndex` — kept separate from `responses`/`urlResponses`
+  /// so existing call sites (which only supply status/body tuples) don't need updating.
+  private let headerResponses: [String: [String: [String]]]
   private let responding: Bool
   private let authFilesError: Bool
   private let authFilesFailure: Error?
@@ -756,6 +1001,7 @@ private actor StubProxyManagementAPI: ProxyManagementAPI {
     authFiles: [ManagedAuthFile],
     responses: [String: (statusCode: Int, body: String)],
     urlResponses: [String: (statusCode: Int, body: String)] = [:],
+    headerResponses: [String: [String: [String]]] = [:],
     responding: Bool = true,
     authFilesError: Bool = false,
     authFilesFailure: Error? = nil
@@ -763,6 +1009,7 @@ private actor StubProxyManagementAPI: ProxyManagementAPI {
     self.authFilesToReturn = authFiles
     self.responses = responses
     self.urlResponses = urlResponses
+    self.headerResponses = headerResponses
     self.responding = responding
     self.authFilesError = authFilesError
     self.authFilesFailure = authFilesFailure
@@ -780,18 +1027,20 @@ private actor StubProxyManagementAPI: ProxyManagementAPI {
 
   func apiCall(_ request: ProxyAPICall) async throws -> ProxyAPICallResult {
     recordedCalls.append(request)
+    let headers = request.authIndex.flatMap { headerResponses[$0] }
     if let response = urlResponses[request.url] {
-      return Self.makeResult(statusCode: response.statusCode, body: response.body)
+      return Self.makeResult(statusCode: response.statusCode, body: response.body, headers: headers)
     }
     guard let authIndex = request.authIndex, let response = responses[authIndex] else {
-      return Self.makeResult(statusCode: 404, body: nil)
+      return Self.makeResult(statusCode: 404, body: nil, headers: headers)
     }
-    return Self.makeResult(statusCode: response.statusCode, body: response.body)
+    return Self.makeResult(statusCode: response.statusCode, body: response.body, headers: headers)
   }
 
-  private static func makeResult(statusCode: Int, body: String?) -> ProxyAPICallResult {
+  private static func makeResult(statusCode: Int, body: String?, headers: [String: [String]]? = nil) -> ProxyAPICallResult {
     var payload: [String: Any] = ["status_code": statusCode]
     if let body { payload["body"] = body }
+    if let headers { payload["header"] = headers }
     let data = try! JSONSerialization.data(withJSONObject: payload)
     return try! JSONDecoder().decode(ProxyAPICallResult.self, from: data)
   }

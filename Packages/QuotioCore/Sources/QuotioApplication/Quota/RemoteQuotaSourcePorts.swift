@@ -63,9 +63,9 @@ public struct RemoteQuotaPoolFetchResult: Equatable, Sendable {
         case partial
         /// The listing reported accounts, but none of them produced a quota.
         case allFailed
-        /// The listing reported no supported, ready account at all. Still authoritative:
-        /// the source genuinely has nothing left, so stale entries must be pruned rather
-        /// than kept forever.
+        /// The listing reported no supported, trackable account at all. Still
+        /// authoritative: the source genuinely has nothing left, so stale entries must be
+        /// pruned rather than kept forever.
         case noAccountsListed
     }
 
@@ -77,17 +77,48 @@ public struct RemoteQuotaPoolFetchResult: Equatable, Sendable {
     /// That is what lets the coordinator drop a provider's last remaining account (and
     /// the provider itself) instead of leaving a stale reading behind forever. A
     /// provider absent from this dictionary is one the listing said nothing about, so
-    /// its previous accounts are left untouched.
+    /// its previous accounts are left untouched. A frozen account stays in this list:
+    /// being temporarily unusable is a state, never an absence, so it is listed here and
+    /// additionally named in `temporarilyUnavailableAccountKeys`.
     public var knownAccountKeys: [QuotaProvider: Set<String>]
+    /// Which of `knownAccountKeys` the source currently reports as frozen (cooling after
+    /// a rate limit, or otherwise flagged unavailable). Seeded for every provider the
+    /// fetcher supports — **including an empty set** — so the coordinator can clear the
+    /// state off an account that recovered, not just set it on one that just froze.
+    /// Carried separately from the quotas rather than stamped onto them because a quota
+    /// left in the pool may be a *previous* round's reading, while this state must always
+    /// come from this round's authoritative listing.
+    public var temporarilyUnavailableAccountKeys: [QuotaProvider: Set<String>]
+    /// Identity-only stand-ins for frozen accounts that produced no reading of their own
+    /// this round. Never carry fabricated metrics, and never replace a reading the
+    /// coordinator already holds — they exist so an account that froze before it was ever
+    /// read successfully still shows up as a row instead of silently not existing.
+    public var placeholderQuotas: [QuotaProvider: [String: ProviderQuota]]
+    /// This round's authoritative freeze/cooldown recovery time for every account named
+    /// in `temporarilyUnavailableAccountKeys`, when one could actually be resolved (see
+    /// `ManagedAuthFile.recoveryDate(fetchedAt:)`). An entry missing here for a frozen
+    /// account means this round found no real signal for it, never that its previous
+    /// recovery time should be kept — the coordinator applies this dictionary to *every*
+    /// frozen account each round, freshly, precisely so a stale recovery time from an
+    /// earlier round can never linger on an account whose own quota request merely failed
+    /// again without producing a fresh reading of its own (see `placeholderQuotas`, which
+    /// only ever covers an account with no reading in the pool at all).
+    public var availabilityRecoveryDates: [QuotaProvider: [String: Date]]
 
     public init(
         quotasByProviderAndAccount: [QuotaProvider: [String: ProviderQuota]] = [:],
         outcome: QuotaOutcome = .complete,
-        knownAccountKeys: [QuotaProvider: Set<String>] = [:]
+        knownAccountKeys: [QuotaProvider: Set<String>] = [:],
+        temporarilyUnavailableAccountKeys: [QuotaProvider: Set<String>] = [:],
+        placeholderQuotas: [QuotaProvider: [String: ProviderQuota]] = [:],
+        availabilityRecoveryDates: [QuotaProvider: [String: Date]] = [:]
     ) {
         self.quotasByProviderAndAccount = quotasByProviderAndAccount
         self.outcome = outcome
         self.knownAccountKeys = knownAccountKeys
+        self.temporarilyUnavailableAccountKeys = temporarilyUnavailableAccountKeys
+        self.placeholderQuotas = placeholderQuotas
+        self.availabilityRecoveryDates = availabilityRecoveryDates
     }
 
     /// Whether this round counts as a failure for the status badge and the
@@ -110,10 +141,12 @@ public struct RemoteQuotaPoolFetchResult: Equatable, Sendable {
 /// to test connectivity and pull each real remote account's own `ProviderQuota`, one per
 /// account — never aggregated into a plan-level pool. Throws **only** when the auth-file
 /// listing itself could not be obtained, since that is the one case where the returned
-/// account list would be a guess. "No supported ready files" and "every quota request
+/// account list would be a guess. "No supported trackable files" and "every quota request
 /// failed" both return a result instead: the listing succeeded, so it is authoritative
 /// and must still be allowed to prune, while `outcome` keeps the round marked as a
-/// failure so it can never look like a successful refresh.
+/// failure so it can never look like a successful refresh. Accounts the source reports as
+/// frozen are listed like any other — they are simply not expected to produce a reading,
+/// so their failure to do so never counts against `outcome`.
 public protocol RemoteQuotaSourceFetching: Sendable {
     func isResponding(_ source: RemoteQuotaSourceConfig, managementKey: String) async -> Bool
     func fetchPool(
@@ -138,9 +171,10 @@ public enum RemoteQuotaFetchError: Error, Equatable, Sendable {
     case connectivityUnavailable
     /// Listing auth files failed for a reason that doesn't fit the categories above.
     case authFilesUnavailable
-    /// Never thrown — the listing that reported "nothing supported and ready" succeeded,
-    /// so it comes back as `RemoteQuotaPoolFetchResult.QuotaOutcome.noAccountsListed`
-    /// and this case exists only to name that outcome's localization key.
+    /// Never thrown — the listing that reported "nothing supported and trackable"
+    /// succeeded, so it comes back as
+    /// `RemoteQuotaPoolFetchResult.QuotaOutcome.noAccountsListed` and this case exists
+    /// only to name that outcome's localization key.
     case noSupportedReadyFiles
     /// Never thrown, for the same reason: see
     /// `RemoteQuotaPoolFetchResult.QuotaOutcome.allFailed`.

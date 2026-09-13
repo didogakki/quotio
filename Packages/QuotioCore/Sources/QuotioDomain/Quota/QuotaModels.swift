@@ -235,6 +235,28 @@ public struct ProviderQuota: Codable, Equatable, Sendable {
     public var analytics: QuotaAnalytics?
     public var accountDisplayName: String?
     public var codexResetCreditSummary: CodexResetCreditSummary?
+    /// Set only for a remote (CLIProxyAPI) account the source currently reports as
+    /// frozen — cooling after a rate limit, or otherwise flagged unavailable. Distinct
+    /// from `isForbidden`, which means the account's own credential was rejected: this
+    /// one is transient and clears itself the moment the source lists the account as
+    /// ready again. `nil` (not `false`) means "no such state", which is also how every
+    /// reading written by an older build decodes — hence Optional: a non-Optional Bool
+    /// would make the synthesized decoder reject every cached reading that predates
+    /// this field, silently wiping the last-known-good snapshot it is meant to protect.
+    public var isTemporarilyUnavailable: Bool?
+    /// Real freeze/cooldown recovery time for this account, taken directly from the
+    /// remote source's own structured signals (see
+    /// `ManagedAuthFile.recoveryDate(fetchedAt:)`), or — only for an explicit 429
+    /// response — an *estimate* from that response's own `Retry-After` header (see
+    /// `RemoteManagementQuotaFetcher`'s header fallback); never derived from any
+    /// `QuotaMetric.resetTime`. That field is a distinct, unrelated concept (the
+    /// provider's own usage-window reset, e.g. Claude's 5-hour session window); using it
+    /// here would misrepresent an account's freeze/cooldown recovery as its next quota
+    /// reset. `nil` means "no real recovery time is known", never a fabricated fallback —
+    /// this is re-resolved fresh every refresh round (see
+    /// `RemoteQuotaSourceCoordinator.refresh`), so a round with no fresh signal clears a
+    /// stale value rather than leaving it in place.
+    public var availabilityRecoveryDate: Date?
 
     public init(
         models: [QuotaMetric] = [],
@@ -244,7 +266,9 @@ public struct ProviderQuota: Codable, Equatable, Sendable {
         tokenExpiresAt: Date? = nil,
         analytics: QuotaAnalytics? = nil,
         accountDisplayName: String? = nil,
-        codexResetCreditSummary: CodexResetCreditSummary? = nil
+        codexResetCreditSummary: CodexResetCreditSummary? = nil,
+        isTemporarilyUnavailable: Bool? = nil,
+        availabilityRecoveryDate: Date? = nil
     ) {
         self.models = models
         self.lastUpdated = lastUpdated
@@ -254,6 +278,8 @@ public struct ProviderQuota: Codable, Equatable, Sendable {
         self.analytics = analytics
         self.accountDisplayName = accountDisplayName
         self.codexResetCreditSummary = codexResetCreditSummary
+        self.isTemporarilyUnavailable = isTemporarilyUnavailable
+        self.availabilityRecoveryDate = availabilityRecoveryDate
     }
 }
 
