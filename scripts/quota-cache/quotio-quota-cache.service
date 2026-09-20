@@ -1,0 +1,29 @@
+[Unit]
+Description=Quotio quota-cache service (shared local quota read cache)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# User-level (systemd --user) unit template. Deploy under the account that
+# should run it (e.g. gakki) — adjust every path below if deployed elsewhere.
+# Install to ~/.config/systemd/user/quotio-quota-cache.service and run:
+#   systemctl --user enable --now quotio-quota-cache
+WorkingDirectory=/home/gakki/.local/opt/quotio-quota-cache
+ExecStart=/usr/bin/python3 -B /home/gakki/.local/opt/quotio-quota-cache/service.py --config /home/gakki/.config/quotio-quota-cache/config.json
+Restart=on-failure
+RestartSec=5
+
+# Runs as the invoking user (no DynamicUser/User= — those are system-unit-only
+# and unavailable to a user unit). The service binds 127.0.0.1 only and never
+# needs elevated privileges.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/home/gakki/.local/state/quotio-quota-cache
+# secrets.env files referenced by config.json's pools[*].secrets_env must be
+# readable by this same user — no extra ReadOnlyPaths needed unless they live
+# outside this user's own home directory.
+
+[Install]
+WantedBy=default.target

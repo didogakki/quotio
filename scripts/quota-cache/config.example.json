@@ -1,0 +1,28 @@
+{
+  "listen_host": "127.0.0.1",
+  "listen_port": 8328,
+  "state_db": "/home/gakki/.local/state/quotio-quota-cache/state.db",
+
+  "auth_files_ttl_seconds": 5,
+  "upstream_timeout_seconds": 10,
+  "max_upstream_response_bytes": 1048576,
+  "max_concurrent_upstream_calls": 8,
+  "max_concurrent_requests": 64,
+
+  "failure_backoff_seconds": 30,
+  "failure_backoff_max_seconds": 1800,
+  "max_retry_after_seconds": 604800,
+
+  "pools": {
+    "plus": {
+      "base_url": "https://cpa-plus.internal.example.com",
+      "secrets_env": "/etc/cliproxyapi/plus/secrets.env",
+      "secret_key": "CLIPROXYAPI_MANAGEMENT_KEY"
+    },
+    "business": {
+      "base_url": "https://cpa-business.internal.example.com",
+      "secrets_env": "/etc/cliproxyapi/business/secrets.env",
+      "secret_key": "CLIPROXYAPI_MANAGEMENT_KEY"
+    }
+  }
+}

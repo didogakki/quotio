@@ -301,16 +301,9 @@ public actor CodexQuotaFetcher: QuotaFetching {
     let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
     var metrics: [QuotaMetric] = []
     var kinds = Set<String>()
-    for (window, fallback) in [
-      (response.rateLimit?.primary, "codex-session"),
-      (response.rateLimit?.secondary, "codex-weekly"),
-    ] {
-      guard let window else { continue }
-      let name =
-        window.windowSeconds.map {
-          $0 >= 518_400 ? "codex-weekly" : ($0 <= 86_400 ? "codex-session" : fallback)
-        }
-        ?? (window.resetAfter.map { $0 > 86_400 ? "codex-weekly" : fallback } ?? fallback)
+    for window in [response.rateLimit?.primary, response.rateLimit?.secondary] {
+      guard let window, let name = Self.windowKind(window, weekly: "codex-weekly", session: "codex-session")
+      else { continue }
       guard kinds.insert(name).inserted else { continue }
       metrics.append(
         .init(
@@ -324,14 +317,10 @@ public actor CodexQuotaFetcher: QuotaFetching {
         $0.contains("spark")
       }
       if spark {
-        for (window, fallback) in [
-          (limit.rateLimit?.primary, "codex-spark"),
-          (limit.rateLimit?.secondary, "codex-spark-weekly"),
-        ] {
-          guard let window else { continue }
-          let name =
-            window.windowSeconds.map { $0 >= 518_400 ? "codex-spark-weekly" : "codex-spark" }
-            ?? fallback
+        for window in [limit.rateLimit?.primary, limit.rateLimit?.secondary] {
+          guard let window,
+            let name = Self.windowKind(window, weekly: "codex-spark-weekly", session: "codex-spark")
+          else { continue }
           guard kinds.insert(name).inserted else { continue }
           metrics.append(
             .init(
@@ -454,6 +443,42 @@ public actor CodexQuotaFetcher: QuotaFetching {
     var allowed = CharacterSet.alphanumerics
     allowed.insert(charactersIn: "-._~")
     return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+  }
+
+  /// Classifies one Codex rate-limit window strictly by its own exact
+  /// duration — never by whether it happened to arrive in the
+  /// `primary_window` or `secondary_window` position. CPA has been observed
+  /// returning a lone weekly window as `primary_window` with no
+  /// `secondary_window` at all for an account that has no five-hour limit,
+  /// so position is never a valid signal for which kind of window this is;
+  /// `limit_window_seconds` (this window's own total duration) is the only
+  /// signal that actually says so, and only the two known real durations —
+  /// exactly 18,000s (five hours) or exactly 604,800s (seven days) — count as
+  /// conclusive. Anything else, including `0`, negative, or a duration that
+  /// merely happens to fall on one side of some threshold, is not one of
+  /// those two known windows and must not be guessed into either.
+  ///
+  /// Never falls back to `resetAfter` (a countdown) to infer the kind:
+  /// `resetAfter` counts down within whichever window it belongs to, so any
+  /// value — large or small — is equally consistent with a five-hour window
+  /// nearing reset and a weekly window nearing reset, and guessing between
+  /// them from that magnitude alone would be exactly the kind of fabrication
+  /// this must avoid.
+  ///
+  /// Returns `nil` — never a fabricated "codex-session"/"codex-weekly" kind —
+  /// when the duration is missing or not exactly one of the two known
+  /// values, so a genuinely unknown or corrupted window is dropped by the
+  /// caller rather than mislabeled as a five-hour reading (which would also
+  /// wrongly impose a five-hour recovery expectation on an account that has
+  /// none) or a fictitious full quota.
+  private nonisolated static func windowKind(_ window: Window, weekly: String, session: String)
+    -> String?
+  {
+    switch window.windowSeconds {
+    case 604_800: return weekly
+    case 18_000: return session
+    default: return nil
+    }
   }
 
   private nonisolated static func includes(_ key: String, scope: QuotaFetchScope) -> Bool {

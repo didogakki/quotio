@@ -92,6 +92,11 @@ public final class StatusBarManager: NSObject, NSMenuDelegate {
         
         if statusItem == nil {
             statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+            // 菜单栏管理器（Thaw 等）按 AX identifier / label 识别图标，并用 identifier 拼系统的位置键；
+            // 所以 identifier 必须固定且与 autosaveName 一致，动态配额文字只放进 AXValue，
+            // 否则每次刷新都会被当成新图标，位置写入也会落到错误的键上。
+            statusItem?.autosaveName = "dev.quotio.desktop.statusItem"
+            statusItem?.button?.setAccessibilityIdentifier("dev.quotio.desktop.statusItem")
             observeStatusBarAppearance()
         }
         
@@ -130,6 +135,7 @@ public final class StatusBarManager: NSObject, NSMenuDelegate {
                 button.imagePosition = .imageOnly
             }
             button.setAccessibilityLabel("Quotio")
+            button.setAccessibilityValue(nil)
             statusItem?.length = NSStatusItem.variableLength
             lastRenderSignature = signature
             return
@@ -161,8 +167,9 @@ public final class StatusBarManager: NSObject, NSMenuDelegate {
                 for: configuration.items,
                 displayMode: configuration.quotaDisplayMode
             )
-            image.accessibilityDescription = description
-            button.setAccessibilityLabel(description)
+            image.accessibilityDescription = "Quotio"
+            button.setAccessibilityLabel("Quotio")
+            button.setAccessibilityValue(description)
             
             button.image = image
             button.imagePosition = .imageOnly

@@ -1,4 +1,5 @@
 import AppKit
+import QuotioApplication
 import QuotioDomain
 import SwiftUI
 import XCTest
@@ -114,6 +115,64 @@ final class MenuBarQuotaPairTests: XCTestCase {
         XCTAssertNil(MenuBarQuotaPair.resolve(for: .codex, from: models))
     }
 
+    /// A weekly-only Codex account (no five-hour session limit at all) never resolves a
+    /// stacked pair, but the menu bar's single-number fallback — the same
+    /// `totalUsagePercent` computation `CompositionRoot`/`RemoteQuotaPoolDisplayMapper`
+    /// feed into `MenuBarQuotaDisplayItem.percentage` when `quotaPair` is `nil` — must
+    /// still show the account's real weekly percentage instead of leaving it invisible.
+    /// This is the fallback the codex `.resolve` guard relies on; it must actually work.
+    @MainActor
+    func testCodexWeeklyOnlyFallsBackToTheRealWeeklyPercentageNotHiddenData() {
+        let models = [(name: "codex-weekly", percentage: 42.0)]
+        let settings = MenuBarSettingsManager(repository: MemoryMenuBarPreferencesRepository())
+
+        XCTAssertNil(MenuBarQuotaPair.resolve(
+            for: .codex,
+            from: models.map { QuotaMetric(name: $0.name, percentage: $0.percentage, resetTime: "") }
+        ))
+        XCTAssertEqual(settings.totalUsagePercent(models: models), 42)
+    }
+
+    /// A weekly-only account sitting at exactly 100% remaining must still read as a real
+    /// 100% — not conflated with the "-1" unknown/no-data sentinel just because it is the
+    /// upper bound.
+    @MainActor
+    func testCodexWeeklyOnlyAtFullRemainingIsNotMistakenForNoData() {
+        let settings = MenuBarSettingsManager(repository: MemoryMenuBarPreferencesRepository())
+        XCTAssertEqual(settings.totalUsagePercent(models: [(name: "codex-weekly", percentage: 100)]), 100)
+    }
+
+    /// A weekly-only account fully exhausted (0% remaining) is genuine data, not the
+    /// absence of data — it must never be reported as "-1" (unknown).
+    @MainActor
+    func testCodexWeeklyOnlyAtZeroRemainingIsNotMistakenForNoData() {
+        let settings = MenuBarSettingsManager(repository: MemoryMenuBarPreferencesRepository())
+        XCTAssertEqual(settings.totalUsagePercent(models: [(name: "codex-weekly", percentage: 0)]), 0)
+    }
+
+    /// No models fetched yet is the one case that must legitimately report "-1"
+    /// (unknown) — never a fabricated 0% or 100%.
+    @MainActor
+    func testCodexWithEmptyModelsReportsUnknownNotAFabricatedValue() {
+        XCTAssertNil(MenuBarQuotaPair.resolve(for: .codex, from: []))
+        let settings = MenuBarSettingsManager(repository: MemoryMenuBarPreferencesRepository())
+        XCTAssertEqual(settings.totalUsagePercent(models: []), -1)
+    }
+
+    /// A session-only (no weekly limit) Codex account is the mirror case of
+    /// `testCodexWithoutSessionDoesNotUseStackedLayout`: with a real session reading
+    /// present, the pair still resolves — top carries the session percentage and bottom
+    /// is the explicit "-1" unknown marker (rendered as "—"), never a duplicate of the
+    /// top value and never a fabricated weekly reading.
+    func testCodexSessionOnlyStillResolvesPairWithUnknownWeekly() throws {
+        let models = [QuotaMetric(name: "codex-session", percentage: 77, resetTime: "")]
+
+        let pair = try XCTUnwrap(MenuBarQuotaPair.resolve(for: .codex, from: models))
+
+        XCTAssertEqual(pair.top.remainingPercentage, 77)
+        XCTAssertEqual(pair.bottom.remainingPercentage, -1)
+    }
+
     func testUnknownValuesDoNotOverrideKnownMinimum() throws {
         let models = [
             QuotaMetric(name: "codex-session", percentage: -1, resetTime: ""),
@@ -173,4 +232,13 @@ final class MenuBarQuotaPairTests: XCTestCase {
         XCTAssertLessThanOrEqual(hostingView.fittingSize.height, 22)
         XCTAssertLessThan(hostingView.fittingSize.width, 40)
     }
+}
+
+// MARK: - Test doubles
+
+private final class MemoryMenuBarPreferencesRepository: MenuBarPreferencesRepository, @unchecked Sendable {
+    private var stored = MenuBarPreferences()
+
+    func load() -> MenuBarPreferences { stored }
+    func save(_ preferences: MenuBarPreferences) { stored = preferences }
 }

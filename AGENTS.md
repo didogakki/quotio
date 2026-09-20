@@ -86,7 +86,7 @@ the process remains running:
 ```
 
 The run script leaves Quotio running and writes derived data under
-`build/DebugDerivedData`. Always pass `--package-path Packages/QuotioCore` to SwiftPM;
+`~/Library/Developer/Xcode/DerivedData/Quotio-debug`. Always pass `--package-path Packages/QuotioCore` to SwiftPM;
 the repository root is not a Swift package.
 
 ## Architecture and Coding Conventions

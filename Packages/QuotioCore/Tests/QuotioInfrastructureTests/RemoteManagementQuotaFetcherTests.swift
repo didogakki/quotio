@@ -28,7 +28,7 @@ final class RemoteManagementQuotaFetcherTests: XCTestCase {
     ]
 
     let claudeBody = #"{"five_hour":{"utilization":40,"resets_at":"2026-01-01T00:00:00Z"}}"#
-    let codexBody = #"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":25}}}"#
+    let codexBody = #"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":25,"limit_window_seconds":18000}}}"#
     let grokBody = """
       {"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2026-01-01T00:00:00Z"},"creditUsagePercent":10,"onDemandCap":{"val":0}}}
       """
@@ -132,7 +132,7 @@ final class RemoteManagementQuotaFetcherTests: XCTestCase {
         id: "1", name: "codex-a.json", provider: "codex", status: "error", disabled: false,
         unavailable: false, email: "a@example.com", authIndex: "codex-a"),
     ]
-    let codexBody = #"{"plan_type":"team","rate_limit":{"primary_window":{"used_percent":60}}}"#
+    let codexBody = #"{"plan_type":"team","rate_limit":{"primary_window":{"used_percent":60,"limit_window_seconds":18000}}}"#
     let api = StubProxyManagementAPI(authFiles: files, responses: ["codex-a": (200, codexBody)])
     let fetcher = RemoteManagementQuotaFetcher(apiFactory: StubProxyManagementAPIFactory(api: api))
     let source = RemoteQuotaSourceConfig(id: "src-1", name: "Pool", baseURL: "https://proxy.test:8317")
@@ -620,8 +620,8 @@ final class RemoteManagementQuotaFetcherTests: XCTestCase {
     let api = StubProxyManagementAPI(
       authFiles: files,
       responses: [
-        "codex-a": (200, #"{"rate_limit":{"primary_window":{"used_percent":25}}}"#),
-        "codex-b": (200, #"{"rate_limit":{"primary_window":{"used_percent":40}}}"#),
+        "codex-a": (200, #"{"rate_limit":{"primary_window":{"used_percent":25,"limit_window_seconds":18000}}}"#),
+        "codex-b": (200, #"{"rate_limit":{"primary_window":{"used_percent":40,"limit_window_seconds":18000}}}"#),
       ]
     )
     let fetcher = RemoteManagementQuotaFetcher(apiFactory: StubProxyManagementAPIFactory(api: api))
@@ -872,7 +872,7 @@ final class RemoteManagementQuotaFetcherTests: XCTestCase {
       authFiles: files,
       responses: [:],
       urlResponses: [
-        CodexQuotaFetcher.usageURL.absoluteString: (200, #"{"rate_limit":{"primary_window":{"used_percent":25}}}"#),
+        CodexQuotaFetcher.usageURL.absoluteString: (200, #"{"rate_limit":{"primary_window":{"used_percent":25,"limit_window_seconds":18000}}}"#),
         CodexResetCreditInventoryFetcher.inventoryURL.absoluteString: (200, resetCreditsBody),
       ]
     )
@@ -908,7 +908,7 @@ final class RemoteManagementQuotaFetcherTests: XCTestCase {
       authFiles: files,
       responses: [:],
       urlResponses: [
-        CodexQuotaFetcher.usageURL.absoluteString: (200, #"{"rate_limit":{"primary_window":{"used_percent":25}}}"#),
+        CodexQuotaFetcher.usageURL.absoluteString: (200, #"{"rate_limit":{"primary_window":{"used_percent":25,"limit_window_seconds":18000}}}"#),
         CodexResetCreditInventoryFetcher.inventoryURL.absoluteString: (500, "internal error"),
       ]
     )

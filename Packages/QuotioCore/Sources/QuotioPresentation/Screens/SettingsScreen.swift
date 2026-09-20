@@ -3032,8 +3032,7 @@ private struct RemoteQuotaSourceEditSheet: View {
         Task {
             let succeeded: Bool
             if let source {
-                let updated = RemoteQuotaSourceConfig(
-                    id: source.id,
+                let updated = source.updatingEditableFields(
                     name: trimmedName,
                     baseURL: url,
                     isEnabled: isEnabled

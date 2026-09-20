@@ -393,4 +393,27 @@ final class QuotaModelsTests: XCTestCase {
         XCTAssertEqual(result.models.first { $0.name == "session" }?.percentage, 50)
         XCTAssertEqual(result.models.first { $0.name == "extra-usage" }?.percentage, 10)
     }
+
+    /// A weekly-only Codex account has no `codex-session` metric at all. Aggregating it
+    /// alongside a normal dual-window account must never pad the missing five-hour
+    /// window with a fabricated 100% just so the weekly-only account can "participate" —
+    /// `codex-session` must average purely over the accounts that actually report it,
+    /// and `codex-weekly` must still combine both accounts normally.
+    func testAggregateNeverPadsAWeeklyOnlyCodexAccountsMissingFiveHourWindow() {
+        let dualWindow = ProviderQuota(models: [
+            QuotaMetric(name: "codex-session", percentage: 90, resetTime: ""),
+            QuotaMetric(name: "codex-weekly", percentage: 60, resetTime: ""),
+        ])
+        let weeklyOnly = ProviderQuota(models: [
+            QuotaMetric(name: "codex-weekly", percentage: 20, resetTime: ""),
+        ])
+
+        let result = QuotaPolicy.aggregate([dualWindow, weeklyOnly], mode: .average)
+
+        XCTAssertEqual(
+            result.models.first { $0.name == "codex-session" }?.percentage, 90,
+            "codex-session must reflect only the account that reports it, never diluted by a fabricated reading from the weekly-only account"
+        )
+        XCTAssertEqual(result.models.first { $0.name == "codex-weekly" }?.percentage, 40)
+    }
 }

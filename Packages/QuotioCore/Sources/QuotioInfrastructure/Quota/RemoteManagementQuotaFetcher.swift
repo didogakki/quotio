@@ -15,13 +15,16 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
 
     private let apiFactory: any ProxyManagementAPIFactory
     private let now: @Sendable () -> Date
+    private let cacheClient: QuotaCacheClient
 
     public init(
         apiFactory: any ProxyManagementAPIFactory = LiveProxyManagementAPIFactory(),
-        now: @escaping @Sendable () -> Date = Date.init
+        now: @escaping @Sendable () -> Date = Date.init,
+        cacheClient: QuotaCacheClient = QuotaCacheClient()
     ) {
         self.apiFactory = apiFactory
         self.now = now
+        self.cacheClient = cacheClient
     }
 
     public func isResponding(_ source: RemoteQuotaSourceConfig, managementKey: String) async -> Bool {
@@ -115,7 +118,7 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
             // Still attempted for a frozen account: the management API may well answer
             // (a cooldown is the remote server's own routing state, not a hard block), and
             // a real reading is always better than a placeholder.
-            let attempt = try? await fetchQuota(provider: provider, file: file, source: source, api: api)
+            let attempt = try? await fetchQuota(provider: provider, file: file, source: source, managementKey: managementKey, api: api)
             // The auth-file listing's own explicit fields are authoritative when present;
             // the quota request's own (429-only, estimated) `Retry-After` header is only a
             // fallback for a server build that exposes no such field on the listing at
@@ -195,14 +198,13 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
     /// path. Best-effort supplement: swallows every failure into `nil`, exactly like
     /// `fetchClaudeProfilePlan`, so a failed/unparsable settings response never blocks
     /// the billing quota that already succeeded.
-    private func fetchGrokSettingsPlan(authIndex: String, api: any ProxyManagementAPI) async -> String? {
-        guard let result = try? await api.apiCall(ProxyAPICall(
-            authIndex: authIndex,
-            method: "GET",
-            url: "https://cli-chat-proxy.grok.com/v1/settings",
-            header: Self.grokAPIHeaders,
-            data: nil
-        )), let data = bodyData(result),
+    private func fetchGrokSettingsPlan(
+        source: RemoteQuotaSourceConfig, managementKey: String, authIndex: String, api: any ProxyManagementAPI
+    ) async -> String? {
+        guard let call = await performQuotaCall(
+            source: source, managementKey: managementKey, resource: "grok-settings", authIndex: authIndex,
+            method: "GET", url: "https://cli-chat-proxy.grok.com/v1/settings", header: Self.grokAPIHeaders, api: api
+        ), let data = bodyData(call.result),
             let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return nil }
         let value = (json["subscription_tier_display"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -221,14 +223,13 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
     /// usage call and maps it via `ClaudeQuotaFetcher.mapProfilePlan`. Swallows every
     /// failure into `nil` — this is a best-effort supplement to a usage fetch that
     /// already succeeded, never a requirement for it.
-    private func fetchClaudeProfilePlan(authIndex: String, api: any ProxyManagementAPI) async -> String? {
-        guard let result = try? await api.apiCall(ProxyAPICall(
-            authIndex: authIndex,
-            method: "GET",
-            url: ClaudeQuotaFetcher.profileURL.absoluteString,
-            header: Self.claudeAPIHeaders,
-            data: nil
-        )), let data = bodyData(result) else { return nil }
+    private func fetchClaudeProfilePlan(
+        source: RemoteQuotaSourceConfig, managementKey: String, authIndex: String, api: any ProxyManagementAPI
+    ) async -> String? {
+        guard let call = await performQuotaCall(
+            source: source, managementKey: managementKey, resource: "claude-profile", authIndex: authIndex,
+            method: "GET", url: ClaudeQuotaFetcher.profileURL.absoluteString, header: Self.claudeAPIHeaders, api: api
+        ), let data = bodyData(call.result) else { return nil }
         return ClaudeQuotaFetcher.mapProfilePlan(data)
     }
 
@@ -245,18 +246,18 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
     /// that re-attaches the previous round's `codexResetCreditSummary`/analytics rows
     /// when merging, so the account doesn't visibly lose them for one failed round.
     private func fetchCodexResetCredits(
+        source: RemoteQuotaSourceConfig,
+        managementKey: String,
         authIndex: String,
         accountId: String?,
         api: any ProxyManagementAPI
     ) async -> (analytics: QuotaAnalytics, summary: CodexResetCreditSummary)? {
-        guard let result = try? await api.apiCall(ProxyAPICall(
-            authIndex: authIndex,
-            method: "GET",
-            url: CodexResetCreditInventoryFetcher.inventoryURL.absoluteString,
-            header: CodexResetCreditInventoryFetcher.headers(accessToken: "$TOKEN$", accountID: accountId),
-            data: nil
-        )), let data = bodyData(result) else { return nil }
-        return try? CodexResetCreditInventoryFetcher.parse(data, now: now())
+        guard let call = await performQuotaCall(
+            source: source, managementKey: managementKey, resource: "codex-reset-credits", authIndex: authIndex,
+            method: "GET", url: CodexResetCreditInventoryFetcher.inventoryURL.absoluteString,
+            header: CodexResetCreditInventoryFetcher.headers(accessToken: "$TOKEN$", accountID: accountId), api: api
+        ), let data = bodyData(call.result) else { return nil }
+        return try? CodexResetCreditInventoryFetcher.parse(data, now: call.fetchedAt)
     }
 
     private func makeAPI(
@@ -282,23 +283,23 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
         provider: QuotaProvider,
         file: ManagedAuthFile,
         source: RemoteQuotaSourceConfig,
+        managementKey: String,
         api: any ProxyManagementAPI
     ) async throws -> QuotaFetchAttempt {
         let authIndex = file.authIndex ?? file.name
         switch provider {
         case .claude:
-            let result = try await api.apiCall(ProxyAPICall(
-                authIndex: authIndex,
-                method: "GET",
-                url: ClaudeQuotaFetcher.usageURL.absoluteString,
-                header: Self.claudeAPIHeaders,
-                data: nil
-            ))
-            let headerRecoveryDate = Self.recoveryDate(statusCode: result.statusCode, headers: result.header, fetchedAt: now())
-            guard let data = bodyData(result) else {
+            guard let call = await performQuotaCall(
+                source: source, managementKey: managementKey, resource: "claude-usage", authIndex: authIndex,
+                method: "GET", url: ClaudeQuotaFetcher.usageURL.absoluteString, header: Self.claudeAPIHeaders, api: api
+            ) else {
+                return QuotaFetchAttempt(quota: nil, headerRecoveryDate: nil)
+            }
+            let headerRecoveryDate = Self.recoveryDate(statusCode: call.result.statusCode, headers: call.result.header, fetchedAt: call.fetchedAt)
+            guard let data = bodyData(call.result) else {
                 return QuotaFetchAttempt(quota: nil, headerRecoveryDate: headerRecoveryDate)
             }
-            var quota = ClaudeQuotaFetcher.mapUsage(data, planFallback: trustedPlanFallback(file), now: now())
+            var quota = ClaudeQuotaFetcher.mapUsage(data, planFallback: trustedPlanFallback(file), now: call.fetchedAt)
             // Claude only ever authenticates via OAuth, so the auth-file listing never
             // carries a trustworthy plan for it (see `trustedPlanFallback`) — the OAuth
             // profile endpoint is the only source that does. Only consulted when usage
@@ -306,7 +307,7 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
             // non-2xx, unparsable body) must never discard the usage quota that already
             // succeeded — it just leaves the plan unset, same as before this existed.
             if quota?.planType == nil {
-                quota?.planType = await fetchClaudeProfilePlan(authIndex: authIndex, api: api)
+                quota?.planType = await fetchClaudeProfilePlan(source: source, managementKey: managementKey, authIndex: authIndex, api: api)
             }
             return QuotaFetchAttempt(quota: quota, headerRecoveryDate: headerRecoveryDate)
 
@@ -318,36 +319,37 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
             if let account = file.account, !account.isEmpty {
                 header["ChatGPT-Account-Id"] = account
             }
-            let result = try await api.apiCall(ProxyAPICall(
-                authIndex: authIndex,
-                method: "GET",
-                url: CodexQuotaFetcher.usageURL.absoluteString,
-                header: header,
-                data: nil
-            ))
-            let headerRecoveryDate = Self.recoveryDate(statusCode: result.statusCode, headers: result.header, fetchedAt: now())
-            guard let data = bodyData(result) else {
+            guard let call = await performQuotaCall(
+                source: source, managementKey: managementKey, resource: "codex-usage", authIndex: authIndex,
+                method: "GET", url: CodexQuotaFetcher.usageURL.absoluteString, header: header, api: api
+            ) else {
+                return QuotaFetchAttempt(quota: nil, headerRecoveryDate: nil)
+            }
+            let headerRecoveryDate = Self.recoveryDate(statusCode: call.result.statusCode, headers: call.result.header, fetchedAt: call.fetchedAt)
+            guard let data = bodyData(call.result) else {
                 return QuotaFetchAttempt(quota: nil, headerRecoveryDate: headerRecoveryDate)
             }
-            guard var quota = try? CodexQuotaFetcher.mapUsage(data, planFallback: trustedPlanFallback(file), now: now()) else {
+            guard var quota = try? CodexQuotaFetcher.mapUsage(data, planFallback: trustedPlanFallback(file), now: call.fetchedAt) else {
                 return QuotaFetchAttempt(quota: nil, headerRecoveryDate: headerRecoveryDate)
             }
-            if let resetCredits = await fetchCodexResetCredits(authIndex: authIndex, accountId: file.account, api: api) {
+            if let resetCredits = await fetchCodexResetCredits(
+                source: source, managementKey: managementKey, authIndex: authIndex, accountId: file.account, api: api
+            ) {
                 quota.analytics = CodexResetCreditInventoryFetcher.merge(resetCredits.analytics, into: quota.analytics)
                 quota.codexResetCreditSummary = resetCredits.summary
             }
             return QuotaFetchAttempt(quota: quota, headerRecoveryDate: headerRecoveryDate)
 
         case .grok:
-            let result = try await api.apiCall(ProxyAPICall(
-                authIndex: authIndex,
-                method: "GET",
-                url: "https://cli-chat-proxy.grok.com/v1/billing?format=credits",
-                header: Self.grokAPIHeaders,
-                data: nil
-            ))
-            let headerRecoveryDate = Self.recoveryDate(statusCode: result.statusCode, headers: result.header, fetchedAt: now())
-            guard let data = bodyData(result) else {
+            guard let call = await performQuotaCall(
+                source: source, managementKey: managementKey, resource: "grok-usage", authIndex: authIndex,
+                method: "GET", url: "https://cli-chat-proxy.grok.com/v1/billing?format=credits",
+                header: Self.grokAPIHeaders, api: api
+            ) else {
+                return QuotaFetchAttempt(quota: nil, headerRecoveryDate: nil)
+            }
+            let headerRecoveryDate = Self.recoveryDate(statusCode: call.result.statusCode, headers: call.result.header, fetchedAt: call.fetchedAt)
+            guard let data = bodyData(call.result) else {
                 return QuotaFetchAttempt(quota: nil, headerRecoveryDate: headerRecoveryDate)
             }
             let displayName = file.email?.nilIfBlank ?? file.name
@@ -361,13 +363,79 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
             // source's stable `id` across renames; a fetch round here has no memory of
             // that identity beyond the single `RemoteQuotaSourceConfig` it was called
             // with.
-            let plan = await fetchGrokSettingsPlan(authIndex: authIndex, api: api) ?? trustedPlanFallback(file)
-            let quota = GrokQuotaFetcher.mapBilling(data, plan: plan, displayName: displayName, now: now())
+            let plan = await fetchGrokSettingsPlan(source: source, managementKey: managementKey, authIndex: authIndex, api: api)
+                ?? trustedPlanFallback(file)
+            let quota = GrokQuotaFetcher.mapBilling(data, plan: plan, displayName: displayName, now: call.fetchedAt)
             return QuotaFetchAttempt(quota: quota, headerRecoveryDate: headerRecoveryDate)
 
         default:
             return QuotaFetchAttempt(quota: nil, headerRecoveryDate: nil)
         }
+    }
+
+    /// Executes one upstream-bound quota/profile/credits request, either directly
+    /// through the remote CLIProxyAPI's `/api-call` pass-through (this fetcher's
+    /// original behavior, and still the only path when `source.quotaCacheBaseURL` is
+    /// unset) or, when a cache base URL is configured, through the local read-only
+    /// quota-cache service instead — reusing the same management key already used for
+    /// every other call on this source, so enabling the cache adds no new secret
+    /// surface. A cache-enabled source never falls back to a direct request when the
+    /// cache call fails — that failure is reported exactly like any other failed quota
+    /// attempt (see call sites), never silently retried against the real upstream.
+    /// `fetchedAt` on the result is the real time the value was last actually obtained
+    /// from upstream: the cache's own `fetched_at` when read from cache, or the moment
+    /// of this direct call otherwise — never the moment this function returns.
+    private func performQuotaCall(
+        source: RemoteQuotaSourceConfig,
+        managementKey: String,
+        resource: String,
+        authIndex: String,
+        method: String,
+        url: String,
+        header: [String: String],
+        api: any ProxyManagementAPI
+    ) async -> (result: ProxyAPICallResult, fetchedAt: Date)? {
+        if let cacheBaseURL = source.quotaCacheBaseURL?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !cacheBaseURL.isEmpty {
+            guard Self.cacheOriginIsTrusted(cacheBaseURL: cacheBaseURL, managementBaseURL: source.managementBaseURL)
+            else { return nil }
+            guard let response = try? await cacheClient.fetch(
+                baseURL: cacheBaseURL, resource: resource, authIndex: authIndex, managementKey: managementKey
+            ) else { return nil }
+            return (response.result, Date(timeIntervalSince1970: response.fetchedAt))
+        }
+        guard let result = try? await api.apiCall(ProxyAPICall(
+            authIndex: authIndex, method: method, url: url, header: header, data: nil
+        )) else { return nil }
+        return (result, now())
+    }
+
+    /// Binds the configured quota-cache base URL to this source's own management
+    /// origin before the management key is ever sent to it, so a misconfigured (or
+    /// malicious) `quotaCacheBaseURL` can never siphon that secret to an unrelated
+    /// domain. A loopback `http://127.0.0.1:...` cache is trusted unconditionally —
+    /// the documented same-host deployment (scripts/quota-cache/README.md) where the
+    /// cache runs on a different local port than the remote management API, so it
+    /// never leaves the machine regardless of port. Any other cache must be `https`
+    /// on the exact same host and port as `managementBaseURL` — the documented
+    /// reverse-proxy-on-the-existing-domain deployment; a cache on a different host,
+    /// even over `https`, is never trusted.
+    private static func cacheOriginIsTrusted(cacheBaseURL: String, managementBaseURL: String) -> Bool {
+        guard let cacheComponents = URLComponents(string: cacheBaseURL),
+            let cacheScheme = cacheComponents.scheme?.lowercased(),
+            let cacheHost = cacheComponents.host, !cacheHost.isEmpty
+        else { return false }
+        if cacheScheme == "http" {
+            return QuotaCacheClient.isLoopbackHost(cacheHost)
+        }
+        guard cacheScheme == "https",
+            let sourceComponents = URLComponents(string: managementBaseURL),
+            sourceComponents.scheme?.lowercased() == "https",
+            let sourceHost = sourceComponents.host, !sourceHost.isEmpty
+        else { return false }
+        let cachePort = cacheComponents.port ?? 443
+        let sourcePort = sourceComponents.port ?? 443
+        return cacheHost.lowercased() == sourceHost.lowercased() && cachePort == sourcePort
     }
 
     /// Extracts an **estimated** retry time from an explicit 429 (rate-limited) quota

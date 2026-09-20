@@ -3,6 +3,32 @@ import XCTest
 @testable import QuotioDomain
 
 final class RemoteQuotaSourceTests: XCTestCase {
+    func testFormEditPreservesCacheAndMetadataThroughPersistence() throws {
+        let original = RemoteQuotaSourceConfig(
+            id: "source", name: "Old", baseURL: "https://cpa.example.com",
+            isLegacyGrokPlusSource: true,
+            quotaCacheBaseURL: "https://cpa.example.com/quota-cache/v1/plus"
+        )
+        let edited = original.updatingEditableFields(
+            name: "Renamed", baseURL: "https://cpa.example.com/v0/management", isEnabled: false
+        )
+        let restored = try JSONDecoder().decode(RemoteQuotaSourceConfig.self, from: JSONEncoder().encode(edited))
+        XCTAssertEqual(restored.name, "Renamed")
+        XCTAssertEqual(restored.baseURL, "https://cpa.example.com/v0/management")
+        XCTAssertFalse(restored.isEnabled)
+        XCTAssertEqual(restored.id, original.id)
+        XCTAssertEqual(restored.quotaCacheBaseURL, original.quotaCacheBaseURL)
+        XCTAssertEqual(restored.isLegacyGrokPlusSource, true)
+        XCTAssertEqual(original.name, "Old")
+    }
+
+    func testFormEditDoesNotInventCacheForDirectSources() {
+        let original = RemoteQuotaSourceConfig(id: "direct", name: "Direct", baseURL: "https://cpa.example.com")
+        let edited = original.updatingEditableFields(name: "Changed", baseURL: original.baseURL, isEnabled: true)
+        XCTAssertNil(edited.quotaCacheBaseURL)
+        XCTAssertNil(edited.isLegacyGrokPlusSource)
+    }
+
     // MARK: - RemoteQuotaPoolIdentity
 
     func testStorageKeyRoundTripsSourceIdAndPlanKey() {

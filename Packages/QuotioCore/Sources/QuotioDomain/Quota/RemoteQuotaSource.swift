@@ -19,19 +19,40 @@ public struct RemoteQuotaSourceConfig: Codable, Equatable, Identifiable, Sendabl
     /// absent (never as `false`, which would be indistinguishable from "confirmed not
     /// this source").
     public var isLegacyGrokPlusSource: Bool?
+    /// Base URL of a local, read-only quota-cache service (`scripts/quota-cache`) that
+    /// this source's usage/profile/credits requests should go through instead of the
+    /// remote CLIProxyAPI's `/api-call` pass-through directly. `nil` (the default)
+    /// preserves the original direct-fetch behavior — every other source, and every
+    /// config persisted before this field existed, decodes with it absent. Never
+    /// guessed/derived: only set when the operator has actually deployed a cache for
+    /// this specific source. Auth-file listing and account control always stay direct
+    /// regardless of this setting, so cache availability never affects which accounts
+    /// are known to exist.
+    public var quotaCacheBaseURL: String?
 
     public init(
         id: String = UUID().uuidString,
         name: String,
         baseURL: String,
         isEnabled: Bool = true,
-        isLegacyGrokPlusSource: Bool? = nil
+        isLegacyGrokPlusSource: Bool? = nil,
+        quotaCacheBaseURL: String? = nil
     ) {
         self.id = id
         self.name = name
         self.baseURL = baseURL
         self.isEnabled = isEnabled
         self.isLegacyGrokPlusSource = isLegacyGrokPlusSource
+        self.quotaCacheBaseURL = quotaCacheBaseURL
+    }
+
+    /// Edits only form-owned fields, retaining cache configuration and internal metadata.
+    public func updatingEditableFields(name: String, baseURL: String, isEnabled: Bool) -> Self {
+        var updated = self
+        updated.name = name
+        updated.baseURL = baseURL
+        updated.isEnabled = isEnabled
+        return updated
     }
 
     /// Normalizes the configured base URL to the CLIProxyAPI management root,

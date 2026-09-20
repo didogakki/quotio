@@ -221,7 +221,7 @@ final class ClaudeCodexQuotaFetcherTests: XCTestCase {
   }
 
   func testCodexKeepsQuotaWhenOptionalAnalyticsRequestsFail() async throws {
-    let usage = #"{"rate_limit":{"primary_window":{"used_percent":25}}}"#
+    let usage = #"{"rate_limit":{"primary_window":{"limit_window_seconds":18000,"used_percent":25}}}"#
     let session = RecordingQuotaSession(responses: [
       (usage, 200),
       ("not-json", 200),
@@ -272,7 +272,11 @@ final class ClaudeCodexQuotaFetcherTests: XCTestCase {
     XCTAssertEqual(quota.models.first?.usedPercentage, 25)
   }
 
-  func testCodexMissingWindowSecondsUsesResetHorizon() throws {
+  func testCodexMissingWindowSecondsDropsTheWindowRatherThanGuessFromResetCountdown() throws {
+    // A large `reset_after_seconds` (here, more than a five-hour window's own
+    // 18,000s length) is *not* a conclusive signal that this is the weekly
+    // window — it is merely a countdown, and no countdown magnitude may
+    // stand in for the missing `limit_window_seconds` duration.
     let quota = try CodexQuotaFetcher.mapUsage(Data(#"""
       {
       "plan_type":"free",
@@ -283,10 +287,32 @@ final class ClaudeCodexQuotaFetcherTests: XCTestCase {
       }
       """#.utf8))
 
-    XCTAssertEqual(quota.models.map(\.name), ["codex-weekly"])
+    XCTAssertEqual(quota.models.map(\.name), [], "a window with no exact limit_window_seconds must be dropped, never fabricated from its reset countdown")
   }
 
-  func testCodexMissingDurationSignalsUsePositionalFallback() throws {
+  func testCodexRejectsDurationsThatAreNeitherKnownWindowLength() throws {
+    // 0, a negative value, and a value merely close to (but not exactly) one
+    // of the two known window lengths must all be dropped, not guessed by
+    // position or magnitude.
+    for seconds in [0, -1, 86_400, 518_400, 604_799, 604_801] {
+      let quota = try CodexQuotaFetcher.mapUsage(Data(#"""
+        {
+        "rate_limit":{
+          "primary_window":{"used_percent":10,"limit_window_seconds":\#(seconds)}
+        }
+        }
+        """#.utf8))
+      XCTAssertEqual(quota.models.map(\.name), [], "seconds=\(seconds) must not be classified as a known window")
+    }
+  }
+
+  func testCodexMissingDurationSignalsDropTheWindowRatherThanGuessFromPosition() throws {
+    // Neither window carries a conclusive duration signal: a 3600s remaining
+    // time is equally consistent with a five-hour window nearing reset and a
+    // weekly window nearing reset, and the other window has no signal at all.
+    // `primary_window`/`secondary_window` are positions, not window types, so
+    // this must never resolve to "codex-session"/"codex-weekly" by which slot
+    // the window happened to arrive in.
     let quota = try CodexQuotaFetcher.mapUsage(Data(#"""
       {
       "plan_type":"plus",
@@ -297,7 +323,56 @@ final class ClaudeCodexQuotaFetcherTests: XCTestCase {
       }
       """#.utf8))
 
-    XCTAssertEqual(quota.models.map(\.name), ["codex-session", "codex-weekly"])
+    XCTAssertEqual(quota.models.map(\.name), [], "an undeterminable window kind must be dropped, never fabricated")
+  }
+
+  func testCodexWeeklyOnlyAccountReportedInThePrimarySlotDoesNotImposeAFiveHourLimit() throws {
+    // CPA has been observed returning a lone weekly window as `primary_window`
+    // (position, not type) for an account that genuinely has no five-hour
+    // limit — this must read as "no five-hour limit", never as a five-hour
+    // window with a missing/zero reading.
+    let quota = try CodexQuotaFetcher.mapUsage(Data(#"""
+      {
+      "plan_type":"plus",
+      "rate_limit":{
+        "limit_reached":false,
+        "allowed":true,
+        "primary_window":{"used_percent":0,"limit_window_seconds":604800,"reset_at":1790460294,"reset_after_seconds":603650},
+        "secondary_window":null
+      }
+      }
+      """#.utf8))
+
+    XCTAssertEqual(quota.models.map(\.name), ["codex-weekly"])
+    XCTAssertEqual(quota.models.first?.usedPercentage, 0)
+  }
+
+  func testCodexClassifiesWindowsByDurationRegardlessOfWhichSlotEachArrivesIn() throws {
+    // Desensitized fixture (account "ab741ebb"): a five-hour window (9% used,
+    // resets 2026-09-15T18:30:13+09:00) and a weekly window (96% used, resets
+    // 2026-09-19T17:09:45+09:00), with their usual primary/secondary slots
+    // swapped from a normal response — the classification (and which reset
+    // time attaches to which kind) must follow `limit_window_seconds`, not
+    // the slot name.
+    var jst = Calendar(identifier: .gregorian)
+    jst.timeZone = TimeZone(identifier: "Asia/Tokyo")!
+    func jstEpoch(_ y: Int, _ m: Int, _ d: Int, _ h: Int, _ mi: Int, _ s: Int) -> Int {
+      Int(jst.date(from: DateComponents(year: y, month: m, day: d, hour: h, minute: mi, second: s))!.timeIntervalSince1970)
+    }
+    let fiveHourReset = jstEpoch(2026, 9, 15, 18, 30, 13)
+    let weeklyReset = jstEpoch(2026, 9, 19, 17, 9, 45)
+    let quota = try CodexQuotaFetcher.mapUsage(Data(#"""
+      {
+      "plan_type":"plus",
+      "rate_limit":{
+        "primary_window":{"used_percent":96,"limit_window_seconds":604800,"reset_at":\#(weeklyReset)},
+        "secondary_window":{"used_percent":9,"limit_window_seconds":18000,"reset_at":\#(fiveHourReset)}
+      }
+      }
+      """#.utf8))
+
+    XCTAssertEqual(quota.models.map(\.name), ["codex-weekly", "codex-session"])
+    XCTAssertEqual(quota.models.map(\.usedPercentage), [96, 9])
   }
 
   func testCodexDeduplicatesWindowsClassifiedAsTheSameKind() throws {
@@ -527,7 +602,7 @@ final class ClaudeCodexQuotaFetcherTests: XCTestCase {
   func testCodexPersistsAllRotatedTokensBeforeRetryingUsage() async throws {
     let now = Date(timeIntervalSince1970: 2_000)
     let usage =
-      #"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":10}}}"#
+      #"{"plan_type":"plus","rate_limit":{"primary_window":{"limit_window_seconds":18000,"used_percent":10}}}"#
     let session = RecordingQuotaSession(responses: [
       ("", 401),
       (
