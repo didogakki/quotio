@@ -14,66 +14,31 @@ public enum RemoteQuotaSourceGroupIdentity {
     }
 }
 
-/// Pure ordering logic for `RemoteQuotaSourceGroupIdentity` keys, persisted as a plain
-/// ordered `[String]` (`MenuBarPreferences.sourceGroupOrder`) — position in the array is
-/// the rank. Deliberately never consults live quota data (percentage, staleness, error
-/// state): the order only ever changes because the user moved something.
+/// Ordering of `RemoteQuotaSourceGroupIdentity` keys, persisted as a plain ordered
+/// `[String]` (`MenuBarPreferences.sourceGroupOrder`) — position in the array is the
+/// rank. The ranking mechanics live in `DisplayOrderRanking`, shared with the
+/// per-account order inside one of these groups; this type adds only the pin-specific
+/// `orderedSelectedItems`.
 public enum RemoteQuotaSourceGroupOrdering {
-    public enum Direction {
-        case up
-        case down
-    }
+    public typealias Direction = DisplayOrderRanking.Direction
 
-    /// Compares two group keys purely by their position in `order`. Returns `nil` when
-    /// neither key has a persisted rank (or both share one), signaling "no opinion" so
-    /// the caller's own tie-breaker (e.g. alphabetical by source name) decides — this is
-    /// what makes a never-ranked group fall back to the pre-existing sort instead of
-    /// being pinned to a default position.
+    /// Compares two group keys purely by their position in `order` — see
+    /// `DisplayOrderRanking.precedes` for the "no opinion" fallback contract that lets a
+    /// never-ranked group keep the pre-existing alphabetical sort.
     public static func precedes(_ lhsKey: String, _ rhsKey: String, order: [String]) -> Bool? {
-        let lhsRank = order.firstIndex(of: lhsKey)
-        let rhsRank = order.firstIndex(of: rhsKey)
-        switch (lhsRank, rhsRank) {
-        case let (l?, r?):
-            return l == r ? nil : l < r
-        case (.some, nil):
-            return true
-        case (nil, .some):
-            return false
-        case (nil, nil):
-            return nil
-        }
+        DisplayOrderRanking.precedes(lhsKey, rhsKey, order: order)
     }
 
-    /// Returns a new order list with `key` swapped one position earlier/later relative
-    /// to its `siblingKeys` — the other group keys currently visible in the same scope
-    /// (e.g. every remote-source group under one provider). Any sibling missing from
-    /// `order` is appended (in `siblingKeys`' own order) before the swap, so a
-    /// never-before-ranked group can still be moved, and a key present in `order` but
-    /// not currently in `siblingKeys` (a hidden/disabled source) keeps its rank
-    /// untouched rather than being dropped — satisfying "hidden/re-enabled groups retain
-    /// rank". Swapping the two keys' array *values* — wherever they physically sit —
-    /// rather than adjacent indices keeps every other scope's relative order (their keys
-    /// may be interleaved in the same global list) unaffected.
+    /// Returns a new order list with `key` swapped one step earlier/later relative to
+    /// `siblingKeys` — the other group keys currently visible in the same scope (e.g.
+    /// every remote-source group under one provider). See `DisplayOrderRanking.moved`.
     public static func moved(
         key: String,
         direction: Direction,
         order: [String],
         siblingKeys: [String]
     ) -> [String] {
-        var materialized = order
-        var seen = Set(order)
-        for candidate in siblingKeys where seen.insert(candidate).inserted {
-            materialized.append(candidate)
-        }
-
-        let siblingSet = Set(siblingKeys)
-        let logical = materialized.enumerated().filter { siblingSet.contains($0.element) }
-        guard let position = logical.firstIndex(where: { $0.element == key }) else { return order }
-        let swapPosition = direction == .up ? position - 1 : position + 1
-        guard logical.indices.contains(swapPosition) else { return materialized }
-
-        materialized.swapAt(logical[position].offset, logical[swapPosition].offset)
-        return materialized
+        DisplayOrderRanking.moved(key: key, direction: direction, order: order, siblingKeys: siblingKeys)
     }
 
     /// Reorders a flat list of pinned `MenuBarQuotaItem`s — the menu bar status icon's

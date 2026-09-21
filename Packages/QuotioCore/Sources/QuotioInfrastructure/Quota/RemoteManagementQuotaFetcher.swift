@@ -98,6 +98,8 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
         var byProviderAndAccount: [QuotaProvider: [String: ProviderQuota]] = [:]
         var placeholderQuotas: [QuotaProvider: [String: ProviderQuota]] = [:]
         var availabilityRecoveryDates: [QuotaProvider: [String: Date]] = [:]
+        var accountIssues: [QuotaProvider: [String: RemoteQuotaAccountIssue]] = [:]
+        var accountIssueObservedKeys: [QuotaProvider: Set<String>] = [:]
         // Counted over the accounts this round could reasonably expect a reading from,
         // which excludes the frozen ones: a request that fails because the server already
         // said the account is cooling is not evidence that the *source* is unhealthy, and
@@ -112,20 +114,34 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
             let isFrozen = file.isTemporarilyUnavailable
             if isFrozen {
                 temporarilyUnavailableAccountKeys[provider, default: []].insert(accountKey)
-            } else {
-                expectedCount += 1
             }
             // Still attempted for a frozen account: the management API may well answer
             // (a cooldown is the remote server's own routing state, not a hard block), and
             // a real reading is always better than a placeholder.
-            let attempt = try? await fetchQuota(provider: provider, file: file, source: source, managementKey: managementKey, api: api)
+            let attempt = await fetchQuota(
+                provider: provider, file: file, source: source, managementKey: managementKey, api: api
+            )
+            let issue = attempt.remoteAccountIssue
+            let isAuthInvalid = issue == .invalidOAuth
+            if attempt.accountIssueWasObserved {
+                accountIssueObservedKeys[provider, default: []].insert(accountKey)
+                if let issue {
+                    accountIssues[provider, default: [:]][accountKey] = issue
+                }
+            }
+            // A confirmed invalid credential is an account-level quarantine, not evidence
+            // that the whole source failed. It therefore releases its balancing weight
+            // without driving the source-wide consecutive-failure hide threshold.
+            if !isFrozen && !isAuthInvalid {
+                expectedCount += 1
+            }
             // The auth-file listing's own explicit fields are authoritative when present;
             // the quota request's own (429-only, estimated) `Retry-After` header is only a
             // fallback for a server build that exposes no such field on the listing at
             // all. Only resolved for a frozen account — a ready one has nothing to recover
             // from.
             let recoveryDate = isFrozen
-                ? (file.recoveryDate(fetchedAt: now()) ?? attempt?.headerRecoveryDate)
+                ? (file.recoveryDate(fetchedAt: now()) ?? attempt.headerRecoveryDate)
                 : nil
             // Recorded for every frozen account this round, whether or not one resolved —
             // an absent entry is this round's authoritative "unknown", which is what lets
@@ -134,21 +150,23 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
             if isFrozen {
                 availabilityRecoveryDates[provider, default: [:]][accountKey] = recoveryDate
             }
-            guard var quota = attempt?.quota else {
-                if isFrozen {
+            guard var quota = attempt.quota else {
+                if isFrozen || isAuthInvalid {
                     // Identity only — no models, so nothing here can read as a real
                     // measurement. The coordinator drops it in favour of any reading it
                     // already holds.
                     placeholderQuotas[provider, default: [:]][accountKey] = ProviderQuota(
                         lastUpdated: now(),
                         accountDisplayName: file.email?.nilIfBlank ?? file.name,
-                        isTemporarilyUnavailable: true,
+                        remoteAccountIssue: issue,
+                        isTemporarilyUnavailable: isFrozen ? true : nil,
                         availabilityRecoveryDate: recoveryDate
                     )
                 }
                 continue
             }
-            if !isFrozen { succeededCount += 1 }
+            if !isFrozen && !isAuthInvalid { succeededCount += 1 }
+            quota.remoteAccountIssue = issue
             if quota.accountDisplayName == nil {
                 quota.accountDisplayName = file.email?.nilIfBlank ?? file.name
             }
@@ -182,7 +200,9 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
             knownAccountKeys: knownAccountKeys,
             temporarilyUnavailableAccountKeys: temporarilyUnavailableAccountKeys,
             placeholderQuotas: placeholderQuotas,
-            availabilityRecoveryDates: availabilityRecoveryDates
+            availabilityRecoveryDates: availabilityRecoveryDates,
+            accountIssues: accountIssues,
+            accountIssueObservedKeys: accountIssueObservedKeys
         )
     }
 
@@ -204,7 +224,7 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
         guard let call = await performQuotaCall(
             source: source, managementKey: managementKey, resource: "grok-settings", authIndex: authIndex,
             method: "GET", url: "https://cli-chat-proxy.grok.com/v1/settings", header: Self.grokAPIHeaders, api: api
-        ), let data = bodyData(call.result),
+        ), let result = call.result, let data = bodyData(result),
             let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return nil }
         let value = (json["subscription_tier_display"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -229,7 +249,7 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
         guard let call = await performQuotaCall(
             source: source, managementKey: managementKey, resource: "claude-profile", authIndex: authIndex,
             method: "GET", url: ClaudeQuotaFetcher.profileURL.absoluteString, header: Self.claudeAPIHeaders, api: api
-        ), let data = bodyData(call.result) else { return nil }
+        ), let result = call.result, let data = bodyData(result) else { return nil }
         return ClaudeQuotaFetcher.mapProfilePlan(data)
     }
 
@@ -256,8 +276,9 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
             source: source, managementKey: managementKey, resource: "codex-reset-credits", authIndex: authIndex,
             method: "GET", url: CodexResetCreditInventoryFetcher.inventoryURL.absoluteString,
             header: CodexResetCreditInventoryFetcher.headers(accessToken: "$TOKEN$", accountID: accountId), api: api
-        ), let data = bodyData(call.result) else { return nil }
-        return try? CodexResetCreditInventoryFetcher.parse(data, now: call.fetchedAt)
+        ), let result = call.result, let fetchedAt = call.fetchedAt,
+           let data = bodyData(result) else { return nil }
+        return try? CodexResetCreditInventoryFetcher.parse(data, now: fetchedAt)
     }
 
     private func makeAPI(
@@ -277,6 +298,27 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
     private struct QuotaFetchAttempt {
         var quota: ProviderQuota?
         var headerRecoveryDate: Date?
+        var remoteAccountIssue: RemoteQuotaAccountIssue?
+        var accountIssueWasObserved: Bool
+
+        init(
+            quota: ProviderQuota?,
+            headerRecoveryDate: Date?,
+            remoteAccountIssue: RemoteQuotaAccountIssue? = nil,
+            accountIssueWasObserved: Bool = false
+        ) {
+            self.quota = quota
+            self.headerRecoveryDate = headerRecoveryDate
+            self.remoteAccountIssue = remoteAccountIssue
+            self.accountIssueWasObserved = accountIssueWasObserved
+        }
+    }
+
+    private struct QuotaCallResult {
+        var result: ProxyAPICallResult?
+        var fetchedAt: Date?
+        var remoteAccountIssue: RemoteQuotaAccountIssue?
+        var canClearAccountIssue: Bool
     }
 
     private func fetchQuota(
@@ -285,7 +327,7 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
         source: RemoteQuotaSourceConfig,
         managementKey: String,
         api: any ProxyManagementAPI
-    ) async throws -> QuotaFetchAttempt {
+    ) async -> QuotaFetchAttempt {
         let authIndex = file.authIndex ?? file.name
         switch provider {
         case .claude:
@@ -295,11 +337,22 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
             ) else {
                 return QuotaFetchAttempt(quota: nil, headerRecoveryDate: nil)
             }
-            let headerRecoveryDate = Self.recoveryDate(statusCode: call.result.statusCode, headers: call.result.header, fetchedAt: call.fetchedAt)
-            guard let data = bodyData(call.result) else {
-                return QuotaFetchAttempt(quota: nil, headerRecoveryDate: headerRecoveryDate)
+            guard let result = call.result, let fetchedAt = call.fetchedAt else {
+                return QuotaFetchAttempt(
+                    quota: nil, headerRecoveryDate: nil, remoteAccountIssue: call.remoteAccountIssue,
+                    accountIssueWasObserved: call.remoteAccountIssue != nil
+                )
             }
-            var quota = ClaudeQuotaFetcher.mapUsage(data, planFallback: trustedPlanFallback(file), now: call.fetchedAt)
+            let headerRecoveryDate = Self.recoveryDate(
+                statusCode: result.statusCode, headers: result.header, fetchedAt: fetchedAt
+            )
+            guard let data = bodyData(result) else {
+                return QuotaFetchAttempt(
+                    quota: nil, headerRecoveryDate: headerRecoveryDate, remoteAccountIssue: call.remoteAccountIssue,
+                    accountIssueWasObserved: call.remoteAccountIssue != nil
+                )
+            }
+            var quota = ClaudeQuotaFetcher.mapUsage(data, planFallback: trustedPlanFallback(file), now: fetchedAt)
             // Claude only ever authenticates via OAuth, so the auth-file listing never
             // carries a trustworthy plan for it (see `trustedPlanFallback`) — the OAuth
             // profile endpoint is the only source that does. Only consulted when usage
@@ -309,7 +362,10 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
             if quota?.planType == nil {
                 quota?.planType = await fetchClaudeProfilePlan(source: source, managementKey: managementKey, authIndex: authIndex, api: api)
             }
-            return QuotaFetchAttempt(quota: quota, headerRecoveryDate: headerRecoveryDate)
+            return QuotaFetchAttempt(
+                quota: quota, headerRecoveryDate: headerRecoveryDate, remoteAccountIssue: call.remoteAccountIssue,
+                accountIssueWasObserved: call.remoteAccountIssue != nil || (quota != nil && call.canClearAccountIssue)
+            )
 
         case .codex:
             var header = [
@@ -325,12 +381,28 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
             ) else {
                 return QuotaFetchAttempt(quota: nil, headerRecoveryDate: nil)
             }
-            let headerRecoveryDate = Self.recoveryDate(statusCode: call.result.statusCode, headers: call.result.header, fetchedAt: call.fetchedAt)
-            guard let data = bodyData(call.result) else {
-                return QuotaFetchAttempt(quota: nil, headerRecoveryDate: headerRecoveryDate)
+            guard let result = call.result, let fetchedAt = call.fetchedAt else {
+                return QuotaFetchAttempt(
+                    quota: nil, headerRecoveryDate: nil, remoteAccountIssue: call.remoteAccountIssue,
+                    accountIssueWasObserved: call.remoteAccountIssue != nil
+                )
             }
-            guard var quota = try? CodexQuotaFetcher.mapUsage(data, planFallback: trustedPlanFallback(file), now: call.fetchedAt) else {
-                return QuotaFetchAttempt(quota: nil, headerRecoveryDate: headerRecoveryDate)
+            let headerRecoveryDate = Self.recoveryDate(
+                statusCode: result.statusCode, headers: result.header, fetchedAt: fetchedAt
+            )
+            guard let data = bodyData(result) else {
+                return QuotaFetchAttempt(
+                    quota: nil, headerRecoveryDate: headerRecoveryDate, remoteAccountIssue: call.remoteAccountIssue,
+                    accountIssueWasObserved: call.remoteAccountIssue != nil
+                )
+            }
+            guard var quota = try? CodexQuotaFetcher.mapUsage(
+                data, planFallback: trustedPlanFallback(file), now: fetchedAt
+            ) else {
+                return QuotaFetchAttempt(
+                    quota: nil, headerRecoveryDate: headerRecoveryDate, remoteAccountIssue: call.remoteAccountIssue,
+                    accountIssueWasObserved: call.remoteAccountIssue != nil
+                )
             }
             if let resetCredits = await fetchCodexResetCredits(
                 source: source, managementKey: managementKey, authIndex: authIndex, accountId: file.account, api: api
@@ -338,7 +410,10 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
                 quota.analytics = CodexResetCreditInventoryFetcher.merge(resetCredits.analytics, into: quota.analytics)
                 quota.codexResetCreditSummary = resetCredits.summary
             }
-            return QuotaFetchAttempt(quota: quota, headerRecoveryDate: headerRecoveryDate)
+            return QuotaFetchAttempt(
+                quota: quota, headerRecoveryDate: headerRecoveryDate, remoteAccountIssue: call.remoteAccountIssue,
+                accountIssueWasObserved: call.remoteAccountIssue != nil || call.canClearAccountIssue
+            )
 
         case .grok:
             guard let call = await performQuotaCall(
@@ -348,9 +423,20 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
             ) else {
                 return QuotaFetchAttempt(quota: nil, headerRecoveryDate: nil)
             }
-            let headerRecoveryDate = Self.recoveryDate(statusCode: call.result.statusCode, headers: call.result.header, fetchedAt: call.fetchedAt)
-            guard let data = bodyData(call.result) else {
-                return QuotaFetchAttempt(quota: nil, headerRecoveryDate: headerRecoveryDate)
+            guard let result = call.result, let fetchedAt = call.fetchedAt else {
+                return QuotaFetchAttempt(
+                    quota: nil, headerRecoveryDate: nil, remoteAccountIssue: call.remoteAccountIssue,
+                    accountIssueWasObserved: call.remoteAccountIssue != nil
+                )
+            }
+            let headerRecoveryDate = Self.recoveryDate(
+                statusCode: result.statusCode, headers: result.header, fetchedAt: fetchedAt
+            )
+            guard let data = bodyData(result) else {
+                return QuotaFetchAttempt(
+                    quota: nil, headerRecoveryDate: headerRecoveryDate, remoteAccountIssue: call.remoteAccountIssue,
+                    accountIssueWasObserved: call.remoteAccountIssue != nil
+                )
             }
             let displayName = file.email?.nilIfBlank ?? file.name
             // Prefer real metadata: the auth-file listing carries no per-account Grok
@@ -365,8 +451,11 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
             // with.
             let plan = await fetchGrokSettingsPlan(source: source, managementKey: managementKey, authIndex: authIndex, api: api)
                 ?? trustedPlanFallback(file)
-            let quota = GrokQuotaFetcher.mapBilling(data, plan: plan, displayName: displayName, now: call.fetchedAt)
-            return QuotaFetchAttempt(quota: quota, headerRecoveryDate: headerRecoveryDate)
+            let quota = GrokQuotaFetcher.mapBilling(data, plan: plan, displayName: displayName, now: fetchedAt)
+            return QuotaFetchAttempt(
+                quota: quota, headerRecoveryDate: headerRecoveryDate, remoteAccountIssue: call.remoteAccountIssue,
+                accountIssueWasObserved: call.remoteAccountIssue != nil || (quota != nil && call.canClearAccountIssue)
+            )
 
         default:
             return QuotaFetchAttempt(quota: nil, headerRecoveryDate: nil)
@@ -394,20 +483,50 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
         url: String,
         header: [String: String],
         api: any ProxyManagementAPI
-    ) async -> (result: ProxyAPICallResult, fetchedAt: Date)? {
+    ) async -> QuotaCallResult? {
         if let cacheBaseURL = source.quotaCacheBaseURL?.trimmingCharacters(in: .whitespacesAndNewlines),
             !cacheBaseURL.isEmpty {
             guard Self.cacheOriginIsTrusted(cacheBaseURL: cacheBaseURL, managementBaseURL: source.managementBaseURL)
             else { return nil }
-            guard let response = try? await cacheClient.fetch(
-                baseURL: cacheBaseURL, resource: resource, authIndex: authIndex, managementKey: managementKey
-            ) else { return nil }
-            return (response.result, Date(timeIntervalSince1970: response.fetchedAt))
+            do {
+                let response = try await cacheClient.fetch(
+                    baseURL: cacheBaseURL, resource: resource, authIndex: authIndex, managementKey: managementKey
+                )
+                return QuotaCallResult(
+                    result: response.result,
+                    fetchedAt: Date(timeIntervalSince1970: response.fetchedAt),
+                    remoteAccountIssue: response.failure?.remoteAccountIssue,
+                    canClearAccountIssue: !response.stale && 200...299 ~= response.result.statusCode
+                )
+            } catch QuotaCacheError.authInvalid(_) {
+                return QuotaCallResult(
+                    result: nil, fetchedAt: nil, remoteAccountIssue: .invalidOAuth,
+                    canClearAccountIssue: false
+                )
+            } catch {
+                return nil
+            }
         }
         guard let result = try? await api.apiCall(ProxyAPICall(
             authIndex: authIndex, method: method, url: url, header: header, data: nil
         )) else { return nil }
-        return (result, now())
+        return QuotaCallResult(
+            result: result,
+            fetchedAt: now(),
+            remoteAccountIssue: Self.classifiedAccountIssue(statusCode: result.statusCode, body: result.body),
+            canClearAccountIssue: 200...299 ~= result.statusCode
+        )
+    }
+
+    private static func classifiedAccountIssue(statusCode: Int, body: String?) -> RemoteQuotaAccountIssue? {
+        if statusCode == 401 { return .invalidOAuth }
+        guard statusCode == 403 else { return nil }
+        let lowered = body?.lowercased() ?? ""
+        return lowered.contains("invalidated oauth token")
+            || lowered.contains("invalid oauth token")
+            || lowered.contains("oauth token has been invalidated")
+            ? .invalidOAuth
+            : nil
     }
 
     /// Binds the configured quota-cache base URL to this source's own management

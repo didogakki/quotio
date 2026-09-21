@@ -151,6 +151,19 @@ public struct MenuBarPreferences: Equatable, Sendable {
     /// Defaults to empty so pre-existing installs keep today's alphabetical order until
     /// the user explicitly reorders something.
     public var sourceGroupOrder: [String]
+    /// User-customized display order for individual accounts *inside* one group — the
+    /// local group or one remote source's group under a provider — keyed by
+    /// `MenuBarQuotaItem.id` (which already namespaces by provider and, for remote
+    /// accounts, by source id, so two accounts sharing a raw key/email never collide).
+    /// Position in the array is the rank; a key absent from this list has no persisted
+    /// rank and falls back to the pre-existing (alphabetical/display) sort. One flat
+    /// array holds every group's ranks: comparisons only ever happen between accounts of
+    /// the same group, so keys from different groups being interleaved here is
+    /// immaterial. Drives the menu bar dropdown's per-group account order and the
+    /// Accounts page list, and is never reordered automatically from live quota data.
+    /// Defaults to empty so pre-existing installs keep today's order until the user
+    /// explicitly moves an account.
+    public var accountOrder: [String]
 
     public init(
         showMenuBarIcon: Bool = true,
@@ -168,7 +181,8 @@ public struct MenuBarPreferences: Equatable, Sendable {
         hasUserModifiedMenuBar: Bool = false,
         deselectedPoolAccounts: Set<String> = [],
         hiddenDropdownKeys: Set<String> = [],
-        sourceGroupOrder: [String] = []
+        sourceGroupOrder: [String] = [],
+        accountOrder: [String] = []
     ) {
         self.showMenuBarIcon = showMenuBarIcon
         self.showQuotaInMenuBar = showQuotaInMenuBar
@@ -186,6 +200,7 @@ public struct MenuBarPreferences: Equatable, Sendable {
         self.deselectedPoolAccounts = deselectedPoolAccounts
         self.hiddenDropdownKeys = hiddenDropdownKeys
         self.sourceGroupOrder = sourceGroupOrder
+        self.accountOrder = accountOrder
     }
 }
 

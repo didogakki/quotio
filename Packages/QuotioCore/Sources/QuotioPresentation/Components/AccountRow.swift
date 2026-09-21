@@ -92,6 +92,7 @@ struct AccountRowData: Identifiable, Hashable {
     let source: AccountRowSource
     let status: String?           // "ready", "cooling", "error", etc.
     let statusMessage: String?
+    let remoteAccountIssue: RemoteQuotaAccountIssue?
     let isDisabled: Bool
     let canDelete: Bool           // Only proxy accounts can be deleted
     let canEdit: Bool             // Whether this account can be edited (GLM only)
@@ -112,6 +113,7 @@ struct AccountRowData: Identifiable, Hashable {
         source: AccountRowSource,
         status: String?,
         statusMessage: String?,
+        remoteAccountIssue: RemoteQuotaAccountIssue? = nil,
         isDisabled: Bool,
         canDelete: Bool,
         canEdit: Bool = false,
@@ -126,6 +128,7 @@ struct AccountRowData: Identifiable, Hashable {
         self.source = source
         self.status = status
         self.statusMessage = statusMessage
+        self.remoteAccountIssue = remoteAccountIssue
         self.isDisabled = isDisabled
         self.canDelete = canDelete
         self.canEdit = canEdit
@@ -242,8 +245,11 @@ struct AccountRowData: Identifiable, Hashable {
             displayName: quota.accountDisplayName ?? rawAccountKey,
             menuBarAccountKey: storageKey,
             source: .remoteQuotaSource(sourceName),
-            status: quota.isTemporarilyUnavailable == true ? "cooling" : nil,
+            status: quota.remoteAccountIssue == .invalidOAuth
+                ? "error"
+                : (quota.isTemporarilyUnavailable == true ? "cooling" : nil),
             statusMessage: nil,
+            remoteAccountIssue: quota.remoteAccountIssue,
             isDisabled: false,
             canDelete: false,
             sourceConfigId: sourceId
@@ -284,13 +290,15 @@ struct AccountRowData: Identifiable, Hashable {
         hasher.combine(authFileName)
         hasher.combine(isDisabled)
         hasher.combine(status)
+        hasher.combine(remoteAccountIssue)
     }
 
     static func == (lhs: AccountRowData, rhs: AccountRowData) -> Bool {
         lhs.id == rhs.id &&
         lhs.authFileName == rhs.authFileName &&
         lhs.isDisabled == rhs.isDisabled &&
-        lhs.status == rhs.status
+        lhs.status == rhs.status &&
+        lhs.remoteAccountIssue == rhs.remoteAccountIssue
     }
 }
 
@@ -308,6 +316,10 @@ struct AccountRow: View {
     /// aggregate row's "move source group up/down" context menu actions. Empty (the
     /// default) for every non-aggregate row, which never shows those actions.
     var sourceGroupSiblingKeys: [String] = []
+    /// The `MenuBarQuotaItem.id`s of the accounts this row can be reordered against —
+    /// the other real accounts in the same dropdown group. Empty (the default) when
+    /// there is nothing to reorder against, which hides the per-account move actions.
+    var accountSiblingIds: [String] = []
 
     @Environment(MenuBarSettingsManager.self) private var settings
     @State private var showWarning = false
@@ -334,6 +346,16 @@ struct AccountRow: View {
         account.displayName.masked(if: settings.hideSensitiveInfo && !account.source.isAggregate)
     }
     
+    private var displayedStatus: String? {
+        account.remoteAccountIssue == .invalidOAuth
+            ? "quota.account.oauthInvalid".localized()
+            : account.status
+    }
+
+    private var displayedStatusMessage: String? {
+        account.remoteAccountIssue == .invalidOAuth ? nil : account.statusMessage
+    }
+
     private var statusColor: Color {
         switch account.status {
         case "ready": return account.isDisabled ? .gray : .green
@@ -361,7 +383,7 @@ struct AccountRow: View {
                         .foregroundStyle(.secondary)
                     
                     // Status indicator (only for proxy accounts)
-                    if let status = account.status {
+                    if let status = displayedStatus {
                         Circle()
                             .fill(statusColor)
                             .frame(width: 6, height: 6)
@@ -381,7 +403,7 @@ struct AccountRow: View {
                     }
                 }
 
-                if let message = account.statusMessage, !message.isEmpty {
+                if let message = displayedStatusMessage, !message.isEmpty {
                     Text(message)
                         .font(.caption2)
                         .foregroundStyle(account.status == "error" ? .red : .secondary)
@@ -539,6 +561,32 @@ struct AccountRow: View {
                     } else {
                         Label("providers.dropdown.hide".localized(), systemImage: "minus.circle")
                     }
+                }
+            }
+
+            // Reorder this account relative to the other accounts of its own group —
+            // the same order the menu bar dropdown lists that group's accounts in.
+            if !account.source.isAggregate, accountSiblingIds.count > 1 {
+                Divider()
+
+                Button {
+                    settings.moveAccount(
+                        itemId: account.menuBarItem.id,
+                        direction: .up,
+                        siblingIds: accountSiblingIds
+                    )
+                } label: {
+                    Label("providers.account.moveUp".localized(), systemImage: "arrow.up")
+                }
+
+                Button {
+                    settings.moveAccount(
+                        itemId: account.menuBarItem.id,
+                        direction: .down,
+                        siblingIds: accountSiblingIds
+                    )
+                } label: {
+                    Label("providers.account.moveDown".localized(), systemImage: "arrow.down")
                 }
             }
 

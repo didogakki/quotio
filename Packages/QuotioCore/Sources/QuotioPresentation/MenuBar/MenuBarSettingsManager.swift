@@ -483,6 +483,12 @@ public final class MenuBarSettingsManager {
         didSet { persist() }
     }
 
+    /// User-customized order for individual accounts inside one group. See
+    /// `MenuBarPreferences.accountOrder` for the full contract.
+    public private(set) var accountOrder: [String] {
+        didSet { persist() }
+    }
+
     /// Every real remote account `RemoteQuotaSourceScreenModel` reported as visible in
     /// its most recent sync, refreshed by `syncKnownRemoteAccountItems` after every
     /// remote refresh. Used only to tell whether a legacy pool pin (`accountKey ==
@@ -573,7 +579,8 @@ public final class MenuBarSettingsManager {
             hasUserModifiedMenuBar: hasUserModifiedMenuBar,
             deselectedPoolAccounts: deselectedPoolAccounts,
             hiddenDropdownKeys: hiddenDropdownKeys,
-            sourceGroupOrder: sourceGroupOrder
+            sourceGroupOrder: sourceGroupOrder,
+            accountOrder: accountOrder
         )
     }
 
@@ -596,6 +603,7 @@ public final class MenuBarSettingsManager {
         self.deselectedPoolAccounts = preferences.deselectedPoolAccounts
         self.hiddenDropdownKeys = preferences.hiddenDropdownKeys
         self.sourceGroupOrder = preferences.sourceGroupOrder
+        self.accountOrder = preferences.accountOrder
     }
 
     public func setDidChangeHandler(_ handler: (@MainActor (MenuBarPreferences) -> Void)?) {
@@ -725,6 +733,25 @@ public final class MenuBarSettingsManager {
             direction: direction,
             order: sourceGroupOrder,
             siblingKeys: siblingKeys
+        )
+    }
+
+    /// Moves one account one step earlier/later relative to `siblingIds` — the
+    /// `MenuBarQuotaItem.id`s of the other accounts currently shown in the same group
+    /// (the local group, or one remote source's accounts under the same provider and
+    /// plan). No-ops at either end of the list. Never touches pins, visibility, or any
+    /// quota data — purely a persisted display-order change shared by the Accounts page
+    /// and the menu bar dropdown.
+    public func moveAccount(
+        itemId: String,
+        direction: DisplayOrderRanking.Direction,
+        siblingIds: [String]
+    ) {
+        accountOrder = DisplayOrderRanking.moved(
+            key: itemId,
+            direction: direction,
+            order: accountOrder,
+            siblingKeys: siblingIds
         )
     }
 

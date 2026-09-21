@@ -472,6 +472,46 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual(cpa.call_count, 2, "the replaced account must trigger its own fresh fetch, not reuse the old cache row")
 
 
+class AuthInvalidClassificationTests(unittest.TestCase):
+    def test_401_is_persisted_as_safe_sticky_failure_and_cleared_by_success(self):
+        clock = ClockStub(1_700_000_000)
+        raw = '{"error":{"message":"Encountered invalidated oauth token for user, failing request"}}'
+        service, cpa, store, _ = make_service(
+            [_account("codex-a", provider="codex")],
+            {"codex-a": (401, {}, raw)},
+            clock=clock,
+            failure_backoff_seconds=1,
+        )
+
+        with self.assertRaises(ServiceError) as ctx:
+            service.handle("plus", "codex-usage", "codex-a", True)
+        self.assertEqual(ctx.exception.failure, {"kind": "auth_invalid", "status_code": 401})
+        row = store.get("plus", "codex-usage", "codex-a")
+        self.assertEqual((row.failure_kind, row.failure_status_code), ("auth_invalid", 401))
+        self.assertNotIn("invalidated oauth token", repr(row).lower())
+
+        # A generic transport failure does not clear a confirmed auth quarantine.
+        clock.advance(2)
+        cpa.responses["codex-a"] = UpstreamError("temporary")
+        with self.assertRaises(ServiceError) as retry_ctx:
+            service.handle("plus", "codex-usage", "codex-a", True)
+        self.assertEqual(retry_ctx.exception.failure, {"kind": "auth_invalid", "status_code": 401})
+
+        # A successful reading is the only thing that clears the failure for the
+        # same identity, allowing the account to rejoin automatically.
+        clock.advance(3)
+        cpa.responses["codex-a"] = (
+            200,
+            {},
+            '{"rate_limit":{"primary_window":{"used_percent":20,"limit_window_seconds":604800,"reset_at":1700604800}}}',
+        )
+        envelope = service.handle("plus", "codex-usage", "codex-a", True)
+        self.assertNotIn("failure", envelope)
+        row = store.get("plus", "codex-usage", "codex-a")
+        self.assertIsNone(row.failure_kind)
+        self.assertIsNone(row.failure_status_code)
+
+
 class HeaderAllowlistTests(unittest.TestCase):
     def test_only_retry_after_is_persisted_from_a_successful_response_never_set_cookie_or_others(self):
         clock = ClockStub(1_700_000_000)

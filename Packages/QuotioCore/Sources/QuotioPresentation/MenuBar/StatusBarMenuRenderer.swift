@@ -811,6 +811,8 @@ private struct MenuAccountCardView: View {
     /// badge — `nil` for a normal, currently-usable account (`data.availabilityStatus`).
     private var availabilityMarker: (icon: String, label: String, color: Color)? {
         switch data.availabilityStatus {
+        case .authInvalid:
+            return ("exclamationmark.triangle.fill", "quota.account.oauthInvalid".localized(), .red)
         case .frozen:
             return ("lock.fill", "quota.account.frozen".localized(), Self.frozenColor)
         case .cooling:
@@ -826,6 +828,7 @@ private struct MenuAccountCardView: View {
     /// fabricated guess. `nil` for a normal, currently-usable account.
     private var availabilityCountdownText: String? {
         guard let status = data.availabilityStatus else { return nil }
+        if status == .authInvalid { return nil }
         if let countdown = data.formattedAvailabilityCountdown {
             let key = status == .frozen ? "quota.account.frozenCountdown" : "quota.account.coolingCountdown"
             return String(format: key.localized(), countdown)
@@ -851,13 +854,6 @@ private struct MenuAccountCardView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .menuNativeTooltip(data.formattedAvailabilityAbsolute ?? "")
-            }
-
-            if let codexResetCreditsText {
-                Text(codexResetCreditsText)
-                    .font(.system(size: 10, design: .rounded))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
             }
 
             footerSection
@@ -1053,16 +1049,49 @@ private struct MenuAccountCardView: View {
     
     // MARK: - Footer
 
+    /// Per-metric reset info lives inside each metric, so the footer carries only the
+    /// reset-credit summary and the "last updated" stamp. They share a single row —
+    /// summary leading, stamp trailing — whenever both fit on it, and fall back to
+    /// stacked lines (stamp still trailing) only when the row is too narrow.
+    @ViewBuilder
     private var footerSection: some View {
-        HStack(spacing: 12) {
-            // Reset info is now shown inside each metric, so only show last update here
-            Spacer()
+        if let codexResetCreditsText {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 0) {
+                    resetCreditsLabel(codexResetCreditsText)
+                        .lineLimit(1)
+                    Spacer(minLength: 12)
+                    lastUpdatedLabel
+                }
 
-            // Last Update
-            Text(data.lastUpdated.formatted(.relative(presentation: .named)))
-                .font(.system(size: 10, design: .rounded))
-                .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 4) {
+                    resetCreditsLabel(codexResetCreditsText)
+                        .lineLimit(2)
+                    HStack(spacing: 0) {
+                        Spacer(minLength: 0)
+                        lastUpdatedLabel
+                    }
+                }
+            }
+        } else {
+            HStack(spacing: 0) {
+                Spacer(minLength: 0)
+                lastUpdatedLabel
+            }
         }
+    }
+
+    private func resetCreditsLabel(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 10, design: .rounded))
+            .foregroundStyle(.secondary)
+    }
+
+    private var lastUpdatedLabel: some View {
+        Text(data.lastUpdated.formatted(.relative(presentation: .named)))
+            .font(.system(size: 10, design: .rounded))
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: true, vertical: false)
     }
     
     private var displayStyle: QuotaDisplayStyle { settings.quotaDisplayStyle }

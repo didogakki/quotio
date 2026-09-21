@@ -132,6 +132,25 @@ final class AccountRowSourceTests: XCTestCase {
         XCTAssertEqual(realAccountCount, 3, "5 rows total, but only 3 are real accounts")
     }
 
+    func testRemoteAuthInvalidAccountIsAnErrorButNeverDisabled() {
+        let row = AccountRowData.from(
+            provider: .codex,
+            sourceId: "src-1",
+            sourceName: "Business",
+            rawAccountKey: "codex-a",
+            storageKey: "remote-key",
+            quota: ProviderQuota(
+                accountDisplayName: "a@example.com",
+                remoteAccountIssue: .invalidOAuth
+            )
+        )
+
+        XCTAssertEqual(row.status, "error")
+        XCTAssertEqual(row.remoteAccountIssue, .invalidOAuth)
+        XCTAssertFalse(row.isDisabled, "automatic OAuth quarantine must not become the manual disabled state")
+        XCTAssertFalse(row.source.supportsDisable)
+    }
+
     /// A remote account's `menuBarItem.id` must never collide with a local account that
     /// happens to carry the exact same raw storage key text.
     func testMenuBarItemIdNamespacesRemoteAccountsAwayFromLocalOnes() {

@@ -2806,7 +2806,7 @@ struct RemoteQuotaSourcesSection: View {
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(model.sources) { source in
-                    RemoteQuotaSourceRow(source: source)
+                    RemoteQuotaSourceRow(source: source, onDelete: { pendingDeletion = source })
                         .contentShape(Rectangle())
                         .onTapGesture { editingSource = source }
                         .swipeActions(edge: .trailing) {
@@ -2858,6 +2858,10 @@ struct RemoteQuotaSourcesSection: View {
 
 private struct RemoteQuotaSourceRow: View {
     let source: RemoteQuotaSourceConfig
+    /// Asks the section to start its confirm-then-delete flow for this source. The row
+    /// only reports the intent — the confirmation alert and the removal itself stay with
+    /// the section, which is also what the trailing swipe action drives.
+    let onDelete: () -> Void
     @Environment(RemoteQuotaSourceScreenModel.self) private var model
 
     private var status: RemoteQuotaSourceConnectionStatus {
@@ -2894,6 +2898,17 @@ private struct RemoteQuotaSourceRow: View {
             }
             .buttonStyle(.plain)
             .disabled(model.isRefreshing)
+
+            // Discoverable counterpart to the trailing swipe action, which is easy to
+            // miss on macOS — both go through the section's confirmation alert.
+            Button(role: .destructive) {
+                onDelete()
+            } label: {
+                Image(systemName: "trash")
+                    .foregroundStyle(.red.opacity(0.8))
+            }
+            .buttonStyle(.plain)
+            .help("remote.quotaSource.delete".localized())
         }
         .padding(.vertical, 2)
     }

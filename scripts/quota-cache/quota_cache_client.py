@@ -18,8 +18,38 @@ from typing import Any, Dict
 
 
 class QuotaCacheError(Exception):
-    """Raised for any non-200 or unparsable quota-cache response. Callers must
-    treat this exactly like an upstream failure — never invent a result."""
+    """A cache failure with an optional fixed, non-sensitive account category."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        http_status: int | None = None,
+        failure_kind: str | None = None,
+        failure_status_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+        self.failure_kind = failure_kind
+        self.failure_status_code = failure_status_code
+
+    @property
+    def is_auth_invalid(self) -> bool:
+        return self.failure_kind == "auth_invalid" and self.failure_status_code in (401, 403)
+
+
+def _safe_failure(body: bytes) -> tuple[str | None, int | None]:
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None, None
+    failure = payload.get("failure") if isinstance(payload, dict) else None
+    if not isinstance(failure, dict) or failure.get("kind") != "auth_invalid":
+        return None, None
+    status = failure.get("status_code")
+    if isinstance(status, bool) or status not in (401, 403):
+        return None, None
+    return "auth_invalid", status
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -60,17 +90,29 @@ def fetch(
             body = response.read()
     except urllib.error.HTTPError as exc:
         try:
-            exc.read()
+            error_body = exc.read(16_384)
         except Exception:
-            pass
-        raise QuotaCacheError(f"quota-cache returned HTTP {exc.code}") from None
+            error_body = b""
+        failure_kind, failure_status_code = _safe_failure(error_body)
+        raise QuotaCacheError(
+            f"quota-cache returned HTTP {exc.code}",
+            http_status=exc.code,
+            failure_kind=failure_kind,
+            failure_status_code=failure_status_code,
+        ) from None
     except urllib.error.URLError as exc:
         raise QuotaCacheError(f"quota-cache unreachable: {exc.reason}") from None
     except OSError as exc:
         raise QuotaCacheError(f"quota-cache request failed: {exc}") from None
 
     if status != 200:
-        raise QuotaCacheError(f"quota-cache returned HTTP {status}")
+        failure_kind, failure_status_code = _safe_failure(body)
+        raise QuotaCacheError(
+            f"quota-cache returned HTTP {status}",
+            http_status=status,
+            failure_kind=failure_kind,
+            failure_status_code=failure_status_code,
+        )
     try:
         envelope = json.loads(body.decode("utf-8"))
     except (ValueError, UnicodeDecodeError) as exc:

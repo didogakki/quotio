@@ -2,7 +2,8 @@
 """Balance New API pools and CPA Codex accounts by quota reset urgency.
 
 The controller reads non-sensitive Codex quota-window metadata through
-CLIProxyAPI's management API. It applies two layers of weighting:
+the shared quota-cache and applies two layers of weighting. Cooldown recovery
+is intentionally handled by the separate recovery stage before this script:
 
 1. Per-account smooth weighted round-robin weights inside each CPA pool.
 2. New API channel weights between the Plus and Business CPA pools.
@@ -33,6 +34,7 @@ import math
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -55,6 +57,9 @@ class AccountMetrics:
     reset_at: float = 0.0
     urgency_score: float = 0.0
     limit_reached: bool = False
+    fetched_at: float = 0.0
+    cpa_unavailable: bool = False
+    auth_invalid: bool = False
     current_weight: Optional[int] = None
     target_weight: int = 0
 
@@ -75,6 +80,8 @@ class PoolMetrics:
     urgency_score: float
     average_used_percent: float
     reached_accounts: int
+    failed_accounts: int = 0
+    auth_invalid_accounts: int = 0
 
 
 @dataclass
@@ -100,6 +107,64 @@ def load_quota_module(path: str):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def load_balance_state(path: str) -> Dict[str, Any]:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            value = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {"version": 1}
+    if not isinstance(value, dict):
+        return {"version": 1}
+    value.setdefault("version", 1)
+    return value
+
+
+def save_balance_state(path: str, state: Dict[str, Any]) -> None:
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".cpa-balance-state-", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def snapshot_fingerprint(
+    pools: Sequence["PoolMetrics"],
+    current_channels: Dict[str, int],
+    strategies: Dict[str, str],
+) -> str:
+    rows = []
+    for pool in sorted(pools, key=lambda item: item.name):
+        for account in sorted(pool.accounts, key=lambda item: item.label):
+            rows.append({
+                "pool": pool.name,
+                "account": account.label,
+                "fetched_at": round(account.fetched_at, 6),
+                "unavailable": account.cpa_unavailable,
+                "current_weight": account.current_weight,
+                "limit_reached": account.limit_reached,
+                "auth_invalid": account.auth_invalid,
+            })
+    payload = {
+        "accounts": rows,
+        "channels": current_channels,
+        "strategies": strategies,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def to_number(value: Any) -> Optional[float]:
@@ -172,7 +237,7 @@ def mixed_window_metrics(rate_limit, now, fetched_at, reserve, minimum_seconds):
     Equal normalized weekly budgets are a scheduling policy, not a claim that
     different subscriptions have equal token capacity. No 5h percent/hour is
     ever compared with weekly percent/hour. Missing 5h means no 5h constraint.
-    Unknown windows or expired observations abort the complete apply round.
+    Unknown windows or expired observations are rejected; callers isolate the account.
     """
     if not isinstance(rate_limit, dict):
         raise ValueError("missing rate limit")
@@ -236,7 +301,10 @@ def collect_pool(
     client = qr.ManagementClient(str(pool["base_url"]), management_key, timeout)
     cache_base_url = str(pool.get("quota_cache_base_url") or "").strip() or None
 
-    reserve_percent = max(0.0, min(99.0, float(config.get("reserve_percent", 5))))
+    # The former five-percentage-point hard reserve is intentionally disabled.
+    # Keep the config hook only for explicit rollback experiments; omitted/current
+    # production configuration means every confirmed remaining percentage is usable.
+    reserve_percent = max(0.0, min(99.0, float(config.get("reserve_percent", 0))))
     minimum_reset_seconds = max(60.0, float(config.get("minimum_reset_hours", 2)) * 3600.0)
     fallback_reset_seconds = max(
         minimum_reset_seconds,
@@ -246,6 +314,8 @@ def collect_pool(
 
     accounts: List[AccountMetrics] = []
     invalid = 0
+    failed = 0
+    auth_invalid_count = 0
     reached = 0
     remaining_score = 0.0
     usable_remaining_score = 0.0
@@ -259,6 +329,7 @@ def collect_pool(
         file_name = str(entry.get("name") or "").strip()
         if not auth_index or not file_name:
             invalid += 1
+            failed += 1
             continue
         if bool(entry.get("disabled")):
             invalid += 1
@@ -299,7 +370,8 @@ def collect_pool(
                 used, remaining, usable_remaining, reset_after, reset_at, score, reached_now = mixed_window_metrics(
                     rate_limit, now, fetched_at, reserve_percent, minimum_reset_seconds
                 )
-                if bool(entry.get("unavailable")):
+                cpa_unavailable = entry.get("unavailable") is True
+                if cpa_unavailable:
                     remaining = usable_remaining = score = 0.0
                     reached_now = True
             else:
@@ -319,6 +391,7 @@ def collect_pool(
                 reset_after, reset_at = reset_seconds(window, now, fetched_at, fallback_reset_seconds)
                 effective_hours = max(reset_after, minimum_reset_seconds) / 3600.0
                 score = usable_remaining / effective_hours if usable_remaining > 0 else 0.0
+                cpa_unavailable = entry.get("unavailable") is True
             metric = AccountMetrics(
                 label=account_label(name, entry),
                 file_name=file_name,
@@ -330,6 +403,8 @@ def collect_pool(
                 reset_at=reset_at,
                 urgency_score=score,
                 limit_reached=reached_now,
+                fetched_at=fetched_at,
+                cpa_unavailable=cpa_unavailable,
                 current_weight=parse_optional_weight(entry.get("weight")),
             )
             accounts.append(metric)
@@ -339,32 +414,51 @@ def collect_pool(
             usable_remaining_score += usable_remaining
             urgency_score += score
         except Exception as exc:
+            if isinstance(exc, quota_cache_client.QuotaCacheError) and exc.is_auth_invalid:
+                # A confirmed invalid OAuth credential is not unknown quota. Keep the
+                # auth file enabled so a replacement login can rejoin automatically,
+                # but remove it from routing immediately by giving it a known zero score.
+                accounts.append(AccountMetrics(
+                    label=account_label(name, entry),
+                    file_name=file_name,
+                    auth_index=auth_index,
+                    urgency_score=0.0,
+                    fetched_at=now,
+                    auth_invalid=True,
+                    current_weight=parse_optional_weight(entry.get("weight")),
+                ))
+                invalid += 1
+                auth_invalid_count += 1
+                LOG.warning("pool=%s account=%s quota_failure=auth_invalid action=quarantine_weight_zero",
+                            name, account_label(name, entry))
+                continue
             if cache_base_url or config.get("scoring_policy") == "weekly_headroom_v1":
-                # A cache-enabled pool must never rebalance on partial/missing/
-                # stale data for an account this round expected a reading from:
-                # abort the whole round here rather than silently excluding the
-                # account (which would skew every weighting formula below
-                # against incomplete input) or reassigning weights from it.
-                raise RuntimeError(
-                    f"pool {name} quota-cache read failed for an account: {type(exc).__name__}"
-                ) from exc
+                # Unknown is not exhausted: leave this account untouched and
+                # redistribute only the healthy accounts' existing weight budget.
+                failed += 1
+                invalid += 1
+                LOG.warning("pool=%s account=%s quota_unknown=%s action=freeze_account",
+                            name, account_label(name, entry), type(exc).__name__)
+                continue
             # Raw upstream errors may contain sensitive account data.
             invalid += 1
 
-    if not accounts:
+    if not accounts and not failed:
         raise RuntimeError(f"pool {name} has no valid Codex quota observations")
 
     return PoolMetrics(
         name=name,
         client=client,
         accounts=accounts,
-        valid_accounts=len(accounts),
+        valid_accounts=len(used_values),
         invalid_accounts=invalid,
         remaining_score=remaining_score,
         usable_remaining_score=usable_remaining_score,
         urgency_score=urgency_score,
-        average_used_percent=sum(used_values) / len(used_values),
+        average_used_percent=sum(used_values) / len(used_values) if used_values else 0.0,
         reached_accounts=reached,
+        failed_accounts=failed,
+        auth_invalid_accounts=auth_invalid_count,
     )
 
 
@@ -375,6 +469,8 @@ def bounded_integer_weights(
     maximum_share: int,
 ) -> Dict[str, int]:
     result = {label: 0 for label, _ in labelled_scores}
+    if total <= 0:
+        return result
     positive = [(label, float(score)) for label, score in labelled_scores if score > 0]
     if not positive:
         return result
@@ -428,11 +524,18 @@ def bounded_integer_weights(
 
 
 def assign_account_weights(config: Dict[str, Any], pool: PoolMetrics) -> None:
+    normal_total = int(config.get("account_weight_total", 100))
+    total = normal_total
+    if pool.failed_accounts:
+        # Keep the unknown accounts' relative share from being inflated simply
+        # by renormalizing a partial pool back to 100. Never infer their quota.
+        total = sum(account.effective_current_weight for account in pool.accounts)
+    scale = total / max(1, normal_total)
     targets = bounded_integer_weights(
         [(account.label, account.urgency_score) for account in pool.accounts],
-        total=int(config.get("account_weight_total", 100)),
-        minimum_nonzero=int(config.get("minimum_nonzero_account_weight", 5)),
-        maximum_share=int(config.get("maximum_account_weight", 80)),
+        total=total,
+        minimum_nonzero=int(int(config.get("minimum_nonzero_account_weight", 5)) * scale),
+        maximum_share=math.ceil(int(config.get("maximum_account_weight", 80)) * scale),
     )
     for account in pool.accounts:
         account.target_weight = targets[account.label]
@@ -596,7 +699,7 @@ def log_plan(pools: Sequence[PoolMetrics], current: Dict[str, int], target: Dict
         )
         for account in sorted(pool.accounts, key=lambda item: item.label):
             LOG.info(
-                "pool=%s account=%s used=%.1f usable=%.1f reset_hours=%.2f urgency=%.3f current_weight=%d target_weight=%d reached=%s",
+                "pool=%s account=%s used=%.1f usable=%.1f reset_hours=%.2f urgency=%.3f current_weight=%d target_weight=%d reached=%s unavailable=%s auth_invalid=%s fetched_age=%.1fs",
                 pool.name,
                 account.label,
                 account.used_percent,
@@ -606,6 +709,9 @@ def log_plan(pools: Sequence[PoolMetrics], current: Dict[str, int], target: Dict
                 account.effective_current_weight,
                 account.target_weight,
                 str(account.limit_reached).lower(),
+                str(account.cpa_unavailable).lower(),
+                str(account.auth_invalid).lower(),
+                max(0.0, time.time() - account.fetched_at),
             )
     LOG.info(
         "channel_weights current_plus=%d current_business=%d target_plus=%d target_business=%d mode=%s",
@@ -643,11 +749,39 @@ def main() -> int:
     business = collect_pool(qr, pools_cfg["business"], quota_cfg, cfg, timeout)
     pools = (plus, business)
     strategies = {pool.name: get_routing_strategy(pool.client) for pool in pools}
+    current_channels = current_channel_weights(cfg)
+    state_path = str(
+        cfg.get("state_file")
+        or "/home/gakki/.local/state/cpa-newapi-balance/state.json"
+    )
+    state = load_balance_state(state_path)
+    fingerprint = snapshot_fingerprint(pools, current_channels, strategies)
+    incomplete = any(pool.failed_accounts for pool in pools)
+    if (
+        args.apply
+        and not incomplete
+        and state.get("last_snapshot_fingerprint") == fingerprint
+    ):
+        LOG.info("quota snapshot and routing state unchanged; skip rebalance")
+        return 0
+
     for pool in pools:
         assign_account_weights(cfg, pool)
 
-    current_channels = current_channel_weights(cfg)
-    target_channels = target_channel_weights(cfg, plus, business)
+    no_usable_pool_score = plus.urgency_score + business.urgency_score <= 0
+    target_channels = (
+        dict(current_channels)
+        if incomplete or no_usable_pool_score
+        else target_channel_weights(cfg, plus, business)
+    )
+    if incomplete:
+        LOG.warning("partial quota observations: freeze channel weights; plus_failed=%d business_failed=%d",
+                    plus.failed_accounts, business.failed_accounts)
+    elif no_usable_pool_score:
+        # Still apply per-account zero boundaries (including auth-invalid
+        # quarantine) even when neither pool can receive traffic. Channel weights
+        # remain unchanged because there is no safe positive destination.
+        LOG.warning("all pools have zero usable score: preserve channel weights")
     changes = account_weight_changes(cfg, pools)
     update_channels = should_update_channels(cfg, current_channels, target_channels)
     mode_name = "apply" if args.apply else "dry-run"
@@ -667,6 +801,15 @@ def main() -> int:
         return 0
     if not changes and not update_channels:
         LOG.info("no update required")
+        if not incomplete:
+            save_balance_state(
+                state_path,
+                {
+                    "version": 1,
+                    "last_snapshot_fingerprint": fingerprint,
+                    "last_processed_at": time.time(),
+                },
+            )
         return 0
 
     applied_accounts: List[AccountWeightChange] = []
@@ -690,6 +833,19 @@ def main() -> int:
                 "updated New API channel weights: plus=%d business=%d",
                 after_channels["plus"],
                 after_channels["business"],
+            )
+        if not incomplete:
+            save_balance_state(
+                state_path,
+                {
+                    "version": 1,
+                    "last_snapshot_fingerprint": snapshot_fingerprint(
+                        pools,
+                        target_channels if update_channels else current_channels,
+                        strategies,
+                    ),
+                    "last_processed_at": time.time(),
+                },
             )
         return 0
     except Exception as exc:

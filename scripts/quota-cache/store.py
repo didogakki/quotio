@@ -30,6 +30,8 @@ class CacheRow:
     last_attempt: Optional[float]
     next_retry_at: Optional[float]
     consecutive_failures: int
+    failure_kind: Optional[str]
+    failure_status_code: Optional[int]
     generation: int
 
     @property
@@ -50,6 +52,8 @@ CREATE TABLE IF NOT EXISTS cache_rows (
     last_attempt REAL,
     next_retry_at REAL,
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    failure_kind TEXT,
+    failure_status_code INTEGER,
     generation INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (pool, resource, auth_index)
 );
@@ -65,6 +69,11 @@ class CacheStore:
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.execute(_SCHEMA)
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(cache_rows)")}
+        if "failure_kind" not in columns:
+            self._conn.execute("ALTER TABLE cache_rows ADD COLUMN failure_kind TEXT")
+        if "failure_status_code" not in columns:
+            self._conn.execute("ALTER TABLE cache_rows ADD COLUMN failure_status_code INTEGER")
         self._conn.commit()
         try:
             os.chmod(path, 0o600)
@@ -75,7 +84,8 @@ class CacheStore:
         with self._lock:
             cur = self._conn.execute(
                 "SELECT pool, resource, auth_index, identity, status_code, header_json, body, "
-                "fetched_at, last_attempt, next_retry_at, consecutive_failures, generation "
+                "fetched_at, last_attempt, next_retry_at, consecutive_failures, "
+                "failure_kind, failure_status_code, generation "
                 "FROM cache_rows WHERE pool = ? AND resource = ? AND auth_index = ?",
                 (pool, resource, auth_index),
             )
@@ -115,6 +125,7 @@ class CacheStore:
             pool, resource, auth_index, identity,
             status_code=status_code, header_json=header_json, body=body, fetched_at=fetched_at,
             last_attempt=fetched_at, next_retry_at=None, consecutive_failures=0,
+            failure_kind=None, failure_status_code=None,
             expected_generation=expected_generation,
         )
 
@@ -128,16 +139,31 @@ class CacheStore:
         next_retry_at: Optional[float],
         consecutive_failures: int,
         expected_generation: Optional[int],
+        failure_kind: Optional[str] = None,
+        failure_status_code: Optional[int] = None,
     ) -> bool:
         existing = self.get(pool, resource, auth_index)
         keep_status = existing.status_code if existing and existing.identity == identity else None
         keep_header = existing.header_json if existing and existing.identity == identity else None
         keep_body = existing.body if existing and existing.identity == identity else None
         keep_fetched_at = existing.fetched_at if existing and existing.identity == identity else None
+        # An explicitly invalid OAuth credential remains quarantined and visible until
+        # this identity produces a successful upstream reading (or the auth file is
+        # replaced, which deletes the row). A later generic network failure must not
+        # accidentally clear a confirmed authentication failure.
+        if (
+            failure_kind is None
+            and existing is not None
+            and existing.identity == identity
+            and existing.failure_kind == "auth_invalid"
+        ):
+            failure_kind = existing.failure_kind
+            failure_status_code = existing.failure_status_code
         return self._write(
             pool, resource, auth_index, identity,
             status_code=keep_status, header_json=keep_header, body=keep_body, fetched_at=keep_fetched_at,
             last_attempt=attempted_at, next_retry_at=next_retry_at, consecutive_failures=consecutive_failures,
+            failure_kind=failure_kind, failure_status_code=failure_status_code,
             expected_generation=expected_generation,
         )
 
@@ -155,6 +181,8 @@ class CacheStore:
         last_attempt: float,
         next_retry_at: Optional[float],
         consecutive_failures: int,
+        failure_kind: Optional[str],
+        failure_status_code: Optional[int],
         expected_generation: Optional[int],
     ) -> bool:
         with self._lock:
@@ -169,16 +197,19 @@ class CacheStore:
             next_generation = current_generation + 1
             self._conn.execute(
                 "INSERT INTO cache_rows (pool, resource, auth_index, identity, status_code, header_json, "
-                "body, fetched_at, last_attempt, next_retry_at, consecutive_failures, generation) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "body, fetched_at, last_attempt, next_retry_at, consecutive_failures, "
+                "failure_kind, failure_status_code, generation) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(pool, resource, auth_index) DO UPDATE SET "
                 "identity=excluded.identity, status_code=excluded.status_code, header_json=excluded.header_json, "
                 "body=excluded.body, fetched_at=excluded.fetched_at, last_attempt=excluded.last_attempt, "
                 "next_retry_at=excluded.next_retry_at, consecutive_failures=excluded.consecutive_failures, "
+                "failure_kind=excluded.failure_kind, failure_status_code=excluded.failure_status_code, "
                 "generation=excluded.generation",
                 (
                     pool, resource, auth_index, identity, status_code, header_json, body, fetched_at,
-                    last_attempt, next_retry_at, consecutive_failures, next_generation,
+                    last_attempt, next_retry_at, consecutive_failures, failure_kind,
+                    failure_status_code, next_generation,
                 ),
             )
             self._conn.commit()

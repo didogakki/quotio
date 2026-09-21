@@ -61,6 +61,56 @@ final class RemoteManagementQuotaFetcherCacheTests: XCTestCase {
     XCTAssertEqual(result.knownAccountKeys[.claude], ["claude-a"])
   }
 
+  func testClassified401CreatesVisibleQuarantineWithoutFailingTheWholeSource() async throws {
+    let files = [
+      ManagedAuthFile(
+        id: "1", name: "codex-a.json", provider: "codex", status: "ready", disabled: false,
+        unavailable: false, email: "a@example.com", authIndex: "codex-a")
+    ]
+    let api = CacheTestProxyManagementAPI(authFiles: files, urlResponses: [:])
+    let failure = Data(#"{"error":"upstream_unavailable","failure":{"kind":"auth_invalid","status_code":401}}"#.utf8)
+    let fetcher = RemoteManagementQuotaFetcher(
+      apiFactory: CacheTestProxyManagementAPIFactory(api: api),
+      cacheClient: QuotaCacheClient(session: CacheTestHTTPSession(statusCode: 503, body: failure))
+    )
+    let source = RemoteQuotaSourceConfig(
+      name: "Pool", baseURL: "https://proxy.test", quotaCacheBaseURL: "https://proxy.test/quota-cache/v1/plus")
+
+    let result = try await fetcher.fetchPool(source, managementKey: "k")
+
+    XCTAssertEqual(result.outcome, .complete, "a quarantined account is not a source-wide failure")
+    XCTAssertEqual(result.accountIssues[.codex]?["codex-a"], .invalidOAuth)
+    XCTAssertEqual(result.accountIssueObservedKeys[.codex], ["codex-a"])
+    XCTAssertEqual(result.placeholderQuotas[.codex]?["codex-a"]?.remoteAccountIssue, .invalidOAuth)
+    XCTAssertEqual(result.placeholderQuotas[.codex]?["codex-a"]?.accountDisplayName, "a@example.com")
+    XCTAssertEqual(result.placeholderQuotas[.codex]?["codex-a"]?.models, [])
+    let directCalls = await api.recordedCalls
+    XCTAssertTrue(directCalls.isEmpty, "cache failures must never fall back to direct apiCall")
+  }
+
+  func testStaleSuccessfulEnvelopeKeepsQuotaAndAttachesAuthIssue() async throws {
+    let files = [
+      ManagedAuthFile(
+        id: "1", name: "codex-a.json", provider: "codex", status: "ready", disabled: false,
+        unavailable: false, authIndex: "codex-a")
+    ]
+    let api = CacheTestProxyManagementAPI(authFiles: files, urlResponses: [:])
+    let envelope = #"{"result":{"status_code":200,"header":{},"body":"{\"plan_type\":\"plus\",\"rate_limit\":{\"primary_window\":{\"used_percent\":25,\"limit_window_seconds\":18000}}}"},"fetched_at":1700000000,"stale":true,"last_attempt":1700000500,"next_retry_at":1700000600,"failure":{"kind":"auth_invalid","status_code":401}}"#
+    let fetcher = RemoteManagementQuotaFetcher(
+      apiFactory: CacheTestProxyManagementAPIFactory(api: api),
+      cacheClient: QuotaCacheClient(session: CacheTestHTTPSession(statusCode: 200, body: Data(envelope.utf8)))
+    )
+    let source = RemoteQuotaSourceConfig(
+      name: "Pool", baseURL: "https://proxy.test", quotaCacheBaseURL: "https://proxy.test/quota-cache/v1/plus")
+
+    let result = try await fetcher.fetchPool(source, managementKey: "k")
+
+    XCTAssertEqual(result.outcome, .complete)
+    XCTAssertEqual(result.quotasByProviderAndAccount[.codex]?["codex-a"]?.models.first?.percentage, 75)
+    XCTAssertEqual(result.quotasByProviderAndAccount[.codex]?["codex-a"]?.remoteAccountIssue, .invalidOAuth)
+    XCTAssertEqual(result.accountIssues[.codex]?["codex-a"], .invalidOAuth)
+  }
+
   func testCacheEnabledSourceUsesTheCachesFetchedAtNotTheReadTime() async throws {
     let files = [
       ManagedAuthFile(

@@ -85,6 +85,10 @@ public struct QuotaCacheClient: Sendable {
             throw QuotaCacheError.invalidResponse
         }
         guard http.statusCode == 200 else {
+            if let envelope = try? JSONDecoder().decode(QuotaCacheErrorResponse.self, from: data),
+               let statusCode = envelope.failure?.authInvalidStatusCode {
+                throw QuotaCacheError.authInvalid(statusCode)
+            }
             throw QuotaCacheError.httpError(http.statusCode)
         }
         do {
@@ -114,13 +118,37 @@ public struct QuotaCacheResponse: Decodable, Sendable {
     public let stale: Bool
     public let lastAttempt: Double
     public let nextRetryAt: Double?
+    public let failure: QuotaCacheFailure?
 
     enum CodingKeys: String, CodingKey {
-        case result, stale
+        case result, stale, failure
         case fetchedAt = "fetched_at"
         case lastAttempt = "last_attempt"
         case nextRetryAt = "next_retry_at"
     }
+}
+
+public struct QuotaCacheFailure: Decodable, Equatable, Sendable {
+    public let kind: String
+    public let statusCode: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case kind
+        case statusCode = "status_code"
+    }
+
+    var authInvalidStatusCode: Int? {
+        guard kind == "auth_invalid", let statusCode, statusCode == 401 || statusCode == 403 else { return nil }
+        return statusCode
+    }
+
+    var remoteAccountIssue: RemoteQuotaAccountIssue? {
+        authInvalidStatusCode == nil ? nil : .invalidOAuth
+    }
+}
+
+private struct QuotaCacheErrorResponse: Decodable {
+    let failure: QuotaCacheFailure?
 }
 
 public enum QuotaCacheError: Error, Equatable, Sendable {
@@ -128,4 +156,5 @@ public enum QuotaCacheError: Error, Equatable, Sendable {
     case invalidResponse
     case connectionError
     case httpError(Int)
+    case authInvalid(Int)
 }

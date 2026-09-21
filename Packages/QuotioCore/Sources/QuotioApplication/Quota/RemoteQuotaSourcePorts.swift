@@ -104,6 +104,14 @@ public struct RemoteQuotaPoolFetchResult: Equatable, Sendable {
     /// again without producing a fresh reading of its own (see `placeholderQuotas`, which
     /// only ever covers an account with no reading in the pool at all).
     public var availabilityRecoveryDates: [QuotaProvider: [String: Date]]
+    /// Current safe account issues observed this round, keyed exactly like quota rows.
+    /// Only keys also present in `accountIssueObservedKeys` are authoritative.
+    public var accountIssues: [QuotaProvider: [String: RemoteQuotaAccountIssue]]
+    /// Accounts whose authentication state was definitively observed this round: either
+    /// a successful usage reading (which clears any old issue) or an explicit classified
+    /// auth failure. Accounts omitted here keep their previous issue across transient
+    /// cache/network failures.
+    public var accountIssueObservedKeys: [QuotaProvider: Set<String>]
 
     public init(
         quotasByProviderAndAccount: [QuotaProvider: [String: ProviderQuota]] = [:],
@@ -111,7 +119,9 @@ public struct RemoteQuotaPoolFetchResult: Equatable, Sendable {
         knownAccountKeys: [QuotaProvider: Set<String>] = [:],
         temporarilyUnavailableAccountKeys: [QuotaProvider: Set<String>] = [:],
         placeholderQuotas: [QuotaProvider: [String: ProviderQuota]] = [:],
-        availabilityRecoveryDates: [QuotaProvider: [String: Date]] = [:]
+        availabilityRecoveryDates: [QuotaProvider: [String: Date]] = [:],
+        accountIssues: [QuotaProvider: [String: RemoteQuotaAccountIssue]] = [:],
+        accountIssueObservedKeys: [QuotaProvider: Set<String>] = [:]
     ) {
         self.quotasByProviderAndAccount = quotasByProviderAndAccount
         self.outcome = outcome
@@ -119,6 +129,8 @@ public struct RemoteQuotaPoolFetchResult: Equatable, Sendable {
         self.temporarilyUnavailableAccountKeys = temporarilyUnavailableAccountKeys
         self.placeholderQuotas = placeholderQuotas
         self.availabilityRecoveryDates = availabilityRecoveryDates
+        self.accountIssues = accountIssues
+        self.accountIssueObservedKeys = accountIssueObservedKeys
     }
 
     /// Whether this round counts as a failure for the status badge and the

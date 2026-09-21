@@ -12423,6 +12423,64 @@
         }
       }
     },
+    "providers.account.moveDown" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Move Account Down"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Déplacer le compte vers le bas"
+          }
+        },
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Di chuyển tài khoản xuống"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "下移账户"
+          }
+        }
+      }
+    },
+    "providers.account.moveUp" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Move Account Up"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Déplacer le compte vers le haut"
+          }
+        },
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Di chuyển tài khoản lên"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "上移账户"
+          }
+        }
+      }
+    },
     "providers.sourceGroup.moveDown" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -12885,6 +12943,14 @@
             "value" : "恢复时间未知"
           }
         }
+      }
+    },
+    "quota.account.oauthInvalid" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "OAuth invalid" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "OAuth invalide" } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "OAuth không hợp lệ" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "OAuth 已失效" } }
       }
     },
     "quota.account.frozen" : {

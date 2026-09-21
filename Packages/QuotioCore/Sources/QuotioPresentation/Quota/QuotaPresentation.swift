@@ -245,6 +245,7 @@ public extension QuotaMetric {
 /// remote source's own listing reports the account temporarily unavailable, e.g. a
 /// rate-limit cooldown) — see `ProviderQuota.availabilityStatus`.
 public enum QuotaAccountAvailabilityStatus: Equatable, Sendable {
+    case authInvalid
     case frozen
     case cooling
 }
@@ -256,6 +257,7 @@ public extension ProviderQuota {
     /// currently-usable account. `frozen` takes priority when both are set, since a
     /// rejected credential is the more severe condition.
     var availabilityStatus: QuotaAccountAvailabilityStatus? {
+        if remoteAccountIssue == .invalidOAuth { return .authInvalid }
         if isForbidden { return .frozen }
         if isTemporarilyUnavailable == true { return .cooling }
         return nil

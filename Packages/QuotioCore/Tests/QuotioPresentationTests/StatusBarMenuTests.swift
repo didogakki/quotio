@@ -90,6 +90,40 @@ final class StatusBarMenuSnapshotMapperTests: XCTestCase {
         XCTAssertTrue(antigravity.accounts.allSatisfy(\.isRefreshBlocked))
     }
 
+    func testMonitorSnapshotPreservesRemoteOAuthIssueForTheDropdownCard() throws {
+        let storageKey = RemoteQuotaAccountIdentity.storageKey(sourceId: "src-1", accountKey: "codex-a")
+        let quota = QuotaSnapshot(quotas: [
+            .codex: [
+                storageKey: ProviderQuota(
+                    accountDisplayName: "a@example.com",
+                    remoteAccountIssue: .invalidOAuth
+                ),
+            ],
+        ])
+
+        let snapshot = StatusBarMenuSnapshotMapper.makeSnapshot(
+            mode: .monitor,
+            proxyPort: 8317,
+            isProxyRunning: false,
+            tunnel: CloudflareTunnelSnapshot(),
+            directAuthProviders: [],
+            monitorAccounts: [],
+            quota: quota,
+            installedAgents: [],
+            activeAntigravityEmail: nil,
+            menuBarPreferences: MenuBarPreferences(selectedProvider: .codex),
+            appearanceMode: .system,
+            language: .chinese,
+            remoteSourceNames: ["src-1": "Business"]
+        )
+
+        let codex = try XCTUnwrap(snapshot.providers.first { $0.provider == .codex })
+        let account = try XCTUnwrap(codex.accounts.first)
+        XCTAssertEqual(account.email, "a@example.com")
+        XCTAssertEqual(account.quota.remoteAccountIssue, .invalidOAuth)
+        XCTAssertEqual(account.quota.availabilityStatus, .authInvalid)
+    }
+
     func testLocalProxySnapshotFiltersCLIProvidersByInstalledAgents() {
         let snapshot = StatusBarMenuSnapshotMapper.makeSnapshot(
             mode: .localProxy,
@@ -297,6 +331,87 @@ final class StatusBarMenuSnapshotMapperTests: XCTestCase {
             codex.groups.map(\.origin),
             [.remote(sourceId: "plus", sourceName: "Plus"), .remote(sourceId: "business", sourceName: "Business")]
         )
+    }
+
+    /// A custom `accountOrder` must reorder the accounts *inside* one dropdown group —
+    /// the order the user arranged on the Accounts page — instead of the group staying
+    /// stuck on alphabetical-by-email. An account with no persisted rank keeps that
+    /// alphabetical fallback and sorts after the ones the user placed.
+    func testMonitorSnapshotOrdersAccountsWithinAGroupByPersistedOrder() throws {
+        let keys = ["a", "b", "c"].map {
+            RemoteQuotaAccountIdentity.storageKey(sourceId: "plus", accountKey: $0)
+        }
+        let quota = QuotaSnapshot(quotas: [
+            .codex: [
+                keys[0]: ProviderQuota(accountDisplayName: "a@example.com"),
+                keys[1]: ProviderQuota(accountDisplayName: "b@example.com"),
+                keys[2]: ProviderQuota(accountDisplayName: "c@example.com"),
+            ],
+        ])
+        let itemId: (String) -> String = {
+            MenuBarQuotaItem(provider: QuotaProvider.codex.rawValue, accountKey: $0, sourceConfigId: "plus").id
+        }
+        // "c" then "b" explicitly placed; "a" never ranked, so it keeps the fallback.
+        let preferences = MenuBarPreferences(accountOrder: [itemId(keys[2]), itemId(keys[1])])
+
+        let snapshot = StatusBarMenuSnapshotMapper.makeSnapshot(
+            mode: .monitor,
+            proxyPort: 8317,
+            isProxyRunning: false,
+            tunnel: CloudflareTunnelSnapshot(),
+            directAuthProviders: [.codex],
+            monitorAccounts: [],
+            quota: quota,
+            installedAgents: [],
+            activeAntigravityEmail: nil,
+            menuBarPreferences: preferences,
+            appearanceMode: .system,
+            language: .english,
+            remoteSourceNames: ["plus": "Plus"]
+        )
+
+        let codex = try XCTUnwrap(snapshot.providers.first { $0.provider == .codex })
+        XCTAssertEqual(
+            codex.groups.first?.accounts.map(\.email),
+            ["c@example.com", "b@example.com", "a@example.com"]
+        )
+    }
+
+    /// One group's `accountOrder` entries must never reach another group: a remote
+    /// account and a local account are keyed by distinct `MenuBarQuotaItem.id`s, so
+    /// ranking the remote one leaves the local group on its own alphabetical sort.
+    func testAccountOrderNeverLeaksAcrossGroups() throws {
+        let remoteKey = RemoteQuotaAccountIdentity.storageKey(sourceId: "plus", accountKey: "z")
+        let quota = QuotaSnapshot(quotas: [
+            .codex: [
+                "local-b": ProviderQuota(accountDisplayName: "b@example.com"),
+                "local-a": ProviderQuota(accountDisplayName: "a@example.com"),
+                remoteKey: ProviderQuota(accountDisplayName: "z@example.com"),
+            ],
+        ])
+        let preferences = MenuBarPreferences(accountOrder: [
+            MenuBarQuotaItem(provider: QuotaProvider.codex.rawValue, accountKey: remoteKey, sourceConfigId: "plus").id
+        ])
+
+        let snapshot = StatusBarMenuSnapshotMapper.makeSnapshot(
+            mode: .monitor,
+            proxyPort: 8317,
+            isProxyRunning: false,
+            tunnel: CloudflareTunnelSnapshot(),
+            directAuthProviders: [.codex],
+            monitorAccounts: [],
+            quota: quota,
+            installedAgents: [],
+            activeAntigravityEmail: nil,
+            menuBarPreferences: preferences,
+            appearanceMode: .system,
+            language: .english,
+            remoteSourceNames: ["plus": "Plus"]
+        )
+
+        let codex = try XCTUnwrap(snapshot.providers.first { $0.provider == .codex })
+        XCTAssertEqual(codex.groups.first?.origin, .local)
+        XCTAssertEqual(codex.groups.first?.accounts.map(\.email), ["a@example.com", "b@example.com"])
     }
 
     /// A raw account key/email that happens to also appear (verbatim, with no provider

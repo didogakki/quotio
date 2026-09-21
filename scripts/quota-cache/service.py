@@ -138,10 +138,40 @@ class PoolRuntime:
 
 
 class ServiceError(Exception):
-    def __init__(self, http_status: int, code: str) -> None:
+    def __init__(self, http_status: int, code: str, failure: Optional[Dict[str, Any]] = None) -> None:
         super().__init__(code)
         self.http_status = http_status
         self.code = code
+        self.failure = failure
+
+
+def _classified_auth_failure(status: Optional[int], body: str) -> Tuple[Optional[str], Optional[int]]:
+    """Return only a fixed, non-sensitive failure category.
+
+    The raw upstream body is inspected in memory and is never persisted or returned.
+    Every 401 is an unusable credential. A 403 is classified only when it carries
+    an explicit OAuth-token invalidation marker, because a generic 403 can also mean
+    an entitlement or policy denial rather than a broken login.
+    """
+    if status == 401:
+        return "auth_invalid", 401
+    lowered = body.lower()
+    if status == 403 and (
+        "invalidated oauth token" in lowered
+        or "invalid oauth token" in lowered
+        or "oauth token has been invalidated" in lowered
+    ):
+        return "auth_invalid", 403
+    return None, None
+
+
+def _failure_payload(row: Optional[CacheRow]) -> Optional[Dict[str, Any]]:
+    if row is None or row.failure_kind != "auth_invalid":
+        return None
+    payload: Dict[str, Any] = {"kind": "auth_invalid"}
+    if row.failure_status_code in (401, 403):
+        payload["status_code"] = row.failure_status_code
+    return payload
 
 
 def _http_date_to_epoch(value: str) -> Optional[float]:
@@ -309,7 +339,7 @@ class QuotaCacheService:
             if row.has_success and not require_fresh:
                 self._bump("hits")
                 return self._envelope(row, stale=True)
-            raise ServiceError(503, "not_ready")
+            raise ServiceError(503, "not_ready", _failure_payload(row))
 
         self._refresh(pool, spec, resource_name, auth_index, account, key)
 
@@ -318,17 +348,21 @@ class QuotaCacheService:
             fresh = row.next_retry_at is None and self._is_fresh(resource_name, row, self._now())
             if fresh or not require_fresh:
                 return self._envelope(row, stale=not fresh)
-        raise ServiceError(503, "upstream_unavailable")
+        raise ServiceError(503, "upstream_unavailable", _failure_payload(row))
 
     def _envelope(self, row: CacheRow, *, stale: bool) -> Dict[str, Any]:
         header = json.loads(row.header_json) if row.header_json else {}
-        return {
+        envelope = {
             "result": {"status_code": row.status_code, "header": header, "body": row.body},
             "fetched_at": row.fetched_at,
             "stale": stale,
             "last_attempt": row.last_attempt,
             "next_retry_at": row.next_retry_at,
         }
+        failure = _failure_payload(row)
+        if failure is not None:
+            envelope["failure"] = failure
+        return envelope
 
     def _refresh(
         self,
@@ -421,7 +455,10 @@ class QuotaCacheService:
                 fetched_at=attempted_at, expected_generation=expected_generation,
             )
         else:
-            self._record_failure(pool, resource_name, auth_index, account, attempted_at, resp_header, expected_generation)
+            self._record_failure(
+                pool, resource_name, auth_index, account, attempted_at, resp_header,
+                expected_generation, status=status, body=body,
+            )
 
     def _record_failure(
         self,
@@ -432,6 +469,9 @@ class QuotaCacheService:
         attempted_at: float,
         header: Dict[str, Any],
         expected_generation: Optional[int],
+        *,
+        status: Optional[int] = None,
+        body: str = "",
     ) -> None:
         self._bump("errors")
         existing = self._store.get(pool.name, resource_name, auth_index)
@@ -449,10 +489,12 @@ class QuotaCacheService:
             # matters.
             capped_exponent = min(failures - 1, 32)
             backoff = min(self._failure_backoff_seconds * (2 ** capped_exponent), self._failure_backoff_max_seconds)
+        failure_kind, failure_status_code = _classified_auth_failure(status, body)
         self._store.record_failure(
             pool.name, resource_name, auth_index, account.identity,
             attempted_at=attempted_at, next_retry_at=attempted_at + backoff, consecutive_failures=failures,
             expected_generation=expected_generation,
+            failure_kind=failure_kind, failure_status_code=failure_status_code,
         )
 
     def authorize(self, pool_name: str, authorization_header: Optional[str]) -> bool:
@@ -543,7 +585,10 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             envelope = self.service.handle(pool_name, resource_name, auth_index_values[0], require_fresh)
         except ServiceError as exc:
-            self._send_json(exc.http_status, {"error": exc.code})
+            payload: Dict[str, Any] = {"error": exc.code}
+            if exc.failure is not None:
+                payload["failure"] = exc.failure
+            self._send_json(exc.http_status, payload)
             return
         except Exception as exc:
             # Never log the exception message/traceback: either can embed

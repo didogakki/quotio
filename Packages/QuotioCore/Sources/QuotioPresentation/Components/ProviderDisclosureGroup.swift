@@ -23,6 +23,7 @@ struct ProviderDisclosureGroup: View {
     var onDownloadAccount: ((AccountRowData) -> Void)?
     var isAccountActive: ((AccountRowData) -> Bool)?
 
+    @Environment(MenuBarSettingsManager.self) private var settings
     @State private var isExpanded: Bool = true
 
     /// Check if all accounts in this group are auto-detected
@@ -44,11 +45,64 @@ struct ProviderDisclosureGroup: View {
         return false
     }
 
-    /// Accounts with the ones currently in use floated to the top,
-    /// keeping the existing order as the tie-breaker.
+    /// One scope the user can reorder accounts within: a maximal run of adjacent real
+    /// (non-aggregate) rows sharing the same origin — every local row of this provider,
+    /// or the real remote accounts sitting under one plan-aggregate row. Using adjacency
+    /// rather than a computed group id is what keeps a move inside the run the caller
+    /// already sorted: an aggregate row separates one plan from the next, so an account
+    /// can never be moved out from under the aggregate that summarizes it.
+    private struct AccountRun {
+        let rows: [AccountRowData]
+    }
+
+    /// `accounts` split into `AccountRun`s, with each aggregate row kept as a run of its
+    /// own so it always stays directly above the accounts it summarizes.
+    private var accountRuns: [AccountRun] {
+        var runs: [AccountRun] = []
+        var index = accounts.startIndex
+        while index < accounts.endIndex {
+            let account = accounts[index]
+            guard !account.source.isAggregate else {
+                runs.append(AccountRun(rows: [account]))
+                index = accounts.index(after: index)
+                continue
+            }
+            var end = index
+            while end < accounts.endIndex,
+                  !accounts[end].source.isAggregate,
+                  accounts[end].sourceConfigId == account.sourceConfigId {
+                end = accounts.index(after: end)
+            }
+            runs.append(AccountRun(rows: Array(accounts[index..<end])))
+            index = end
+        }
+        return runs
+    }
+
+    /// Accounts in their persisted per-group order (see `MenuBarPreferences.accountOrder`,
+    /// the same order the menu bar dropdown applies), with the ones currently in use
+    /// floated to the top and the existing order as the tie-breaker. Ranks are applied
+    /// run by run, never across the whole provider, so reordering one source's accounts
+    /// can't move them past another source's rows or past a plan-aggregate row.
     private var displayedAccounts: [AccountRowData] {
-        guard let isAccountActive else { return accounts }
-        return AccountSorting.prioritizingActive(accounts, isActive: isAccountActive)
+        let order = settings.accountOrder
+        let ordered = accountRuns.flatMap { run in
+            DisplayOrderRanking.sorted(run.rows, order: order, key: \.menuBarItem.id)
+        }
+        guard let isAccountActive else { return ordered }
+        return AccountSorting.prioritizingActive(ordered, isActive: isAccountActive)
+    }
+
+    /// The `MenuBarQuotaItem.id`s of every account the user could move this row past —
+    /// its own run, in the order it is displayed right now. Empty for an aggregate row
+    /// and for a lone account, which have nothing to reorder against.
+    private func accountSiblingIds(for account: AccountRowData) -> [String] {
+        guard !account.source.isAggregate else { return [] }
+        let order = settings.accountOrder
+        guard let run = accountRuns.first(where: { $0.rows.contains(account) }), run.rows.count > 1 else {
+            return []
+        }
+        return DisplayOrderRanking.sorted(run.rows, order: order, key: \.menuBarItem.id).map(\.menuBarItem.id)
     }
 
     /// Every remote-source group key currently visible under this provider — the scope
@@ -78,7 +132,8 @@ struct ProviderDisclosureGroup: View {
                         ? { onDownloadAccount?(account) }
                         : nil,
                     isActiveInIDE: isAccountActive?(account) ?? false,
-                    sourceGroupSiblingKeys: sourceGroupSiblingKeys
+                    sourceGroupSiblingKeys: sourceGroupSiblingKeys,
+                    accountSiblingIds: accountSiblingIds(for: account)
                 )
                 // A plan-aggregate row stays at the group's base indent, like a
                 // sub-header; the real remote accounts it summarizes sit one step

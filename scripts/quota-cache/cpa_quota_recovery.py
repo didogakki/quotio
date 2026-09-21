@@ -13,14 +13,6 @@ Design constraints (see README.md):
     raw upstream response body are kept in memory only and are NEVER logged.
   * Any uncertainty (missing fields, parse error, non-2xx, 401/403/429/5xx)
     results in NO reset.
-
-Optional quota-cache integration (see scripts/quota-cache/README.md): when a
-pool config sets "quota_cache_base_url", the usage probe for that pool reads
-through the shared local quota-cache service (with require_fresh=1, since a
-recovery decision must never act on stale data) instead of calling CPA's
-`/api-call` pass-through directly. This changes only where the usage reading
-comes from — every decision function below (`evaluate_claude`,
-`evaluate_codex`, debounce, backoff) is unchanged.
 """
 
 from __future__ import annotations
@@ -301,13 +293,6 @@ class ManagementClient:
         self._key = management_key
         self._timeout = timeout
 
-    @property
-    def management_key(self) -> str:
-        # Exposed only so an optional quota-cache read (see `probe_account`)
-        # can authenticate with the same secret this client already holds —
-        # never logged, never written anywhere.
-        return self._key
-
     def _request(self, method: str, path: str, payload: Optional[dict]) -> Tuple[int, Any]:
         url = f"{self._base_url}{path}"
         data = None
@@ -388,15 +373,16 @@ def is_candidate(entry: Dict[str, Any], check_all: bool) -> bool:
     provider = account_provider(entry)
     if provider not in SUPPORTED_PROVIDERS:
         return False
+    if entry.get("disabled") is True:
+        # Explicitly disabled credentials are an account-management decision,
+        # not a quota cooldown. Recovery must never reactivate them.
+        return False
     if check_all:
         return True
-    # Default: only accounts that are currently non-active / unavailable / cooling.
-    status = str(entry.get("status") or "").strip().lower()
-    if status and status != "active":
-        return True
+    # `status=error` can be model-scoped while the credential remains routable.
+    # Only CPA's aggregate unavailable/next-retry signals identify a real
+    # account-level cooldown eligible for reset-quota.
     if entry.get("unavailable") is True:
-        return True
-    if entry.get("disabled") is True:
         return True
     next_retry = parse_timestamp(entry.get("next_retry_after"))
     if next_retry is not None and next_retry > now_ts():
@@ -446,7 +432,12 @@ def evaluate_claude(body: str, grace_seconds: float, probe_ts: float) -> Decisio
     return Decision(Decision.RESET, "claude quota windows recovered")
 
 
-def evaluate_codex(body: str, grace_seconds: float, probe_ts: float) -> Decision:
+def evaluate_codex(
+    body: str,
+    grace_seconds: float,
+    probe_ts: float,
+    fetched_at: Optional[float] = None,
+) -> Decision:
     try:
         data = json.loads(body)
     except (json.JSONDecodeError, TypeError):
@@ -467,18 +458,20 @@ def evaluate_codex(body: str, grace_seconds: float, probe_ts: float) -> Decision
     # limit_reached is True: collect every reset time we can find and require
     # that all of them have elapsed (plus grace) before allowing a reset.
     reset_times: List[float] = []
+    relative_anchor = fetched_at if fetched_at is not None else probe_ts
 
     # primary/secondary windows may appear at the top level or nested under
     # rate_limit, depending on the upstream response shape.
     for source in (data, rate_limit):
-        primary = source.get("primary_window")
-        if isinstance(primary, dict):
-            ts = parse_timestamp(primary.get("reset_at"))
-            if ts is not None:
-                reset_times.append(ts)
-        secondary = source.get("secondary_window")
-        if isinstance(secondary, dict):
-            ts = parse_timestamp(secondary.get("reset_at"))
+        for name in ("primary_window", "secondary_window"):
+            window = source.get(name)
+            if not isinstance(window, dict):
+                continue
+            ts = parse_timestamp(window.get("reset_at"))
+            if ts is None:
+                reset_after = to_float(window.get("reset_after_seconds"))
+                if reset_after is not None and reset_after >= 0:
+                    ts = relative_anchor + reset_after
             if ts is not None:
                 reset_times.append(ts)
 
@@ -496,7 +489,7 @@ def evaluate_codex(body: str, grace_seconds: float, probe_ts: float) -> Decision
             reset_times.append(ts)
         resets_in = to_float(usage_limit_reached.get("resets_in_seconds"))
         if resets_in is not None:
-            reset_times.append(probe_ts + resets_in)
+            reset_times.append(relative_anchor + resets_in)
 
     if not reset_times:
         return Decision(Decision.NO_DATA, "codex limit reached with no known reset time")
@@ -513,50 +506,93 @@ def probe_account(
     auth_index: str,
     grace_seconds: float,
     cache_base_url: Optional[str] = None,
+    management_key: Optional[str] = None,
 ) -> Decision:
-    """Probe one account's upstream usage and decide whether to reset."""
+    """Read one account's usage and decide whether to reset.
+
+    When a cache URL is configured, recovery is fail-closed and never bypasses
+    the shared cache. `require_fresh=1` guarantees that stale last-known-good
+    data cannot reactivate an account.
+    """
     if provider == "claude":
         url = CLAUDE_USAGE_URL
         header = dict(CLAUDE_USAGE_HEADERS)
-        cache_resource = "claude-usage"
+        resource = "claude-usage"
     elif provider == "codex":
         url = CODEX_USAGE_URL
         header = {"Authorization": "Bearer $TOKEN$"}
-        cache_resource = "codex-usage"
+        resource = "codex-usage"
     else:
         return Decision(Decision.NO_DATA, f"unsupported provider {provider}")
 
+    fetched_at: Optional[float] = None
     if cache_base_url:
+        if not management_key:
+            return Decision(Decision.NO_DATA, "quota-cache management key missing")
         try:
             envelope = quota_cache_client.fetch(
-                cache_base_url, client.management_key, cache_resource, auth_index, require_fresh=True
+                cache_base_url,
+                management_key,
+                resource,
+                auth_index,
+                require_fresh=True,
+                timeout=client._timeout,
             )
         except quota_cache_client.QuotaCacheError as exc:
-            return Decision(Decision.NO_DATA, f"usage probe failed: {exc}")
+            if exc.is_auth_invalid:
+                # Authentication failure is a known, non-recoverable state for the
+                # reset stage. Do not count it as missing data and block the balance
+                # stage; balance will soft-quarantine it at weight 0.
+                return Decision(Decision.SKIP, "OAuth authentication invalid; awaiting re-login")
+            return Decision(Decision.NO_DATA, f"quota-cache probe failed: {exc}")
         result = envelope["result"]
         status = result.get("status_code")
         body = result.get("body") or ""
-        if not isinstance(status, int):
-            return Decision(Decision.NO_DATA, "usage probe failed: quota-cache result missing status_code")
+        fetched_at = to_float(envelope.get("fetched_at"))
     else:
         try:
             status, body = client.api_call(auth_index, "GET", url, header)
         except ManagementError as exc:
             return Decision(Decision.NO_DATA, f"usage probe failed: {exc}")
 
-    if status < 200 or status >= 300:
+    if not isinstance(status, int) or status < 200 or status >= 300:
         # 401/403/429/5xx and any other non-2xx -> cannot confirm recovery.
         return Decision(Decision.NO_DATA, f"usage endpoint returned HTTP {status}")
 
     probe_ts = now_ts()
     if provider == "claude":
         return evaluate_claude(body, grace_seconds, probe_ts)
-    return evaluate_codex(body, grace_seconds, probe_ts)
+    return evaluate_codex(body, grace_seconds, probe_ts, fetched_at=fetched_at)
 
 
 # ---------------------------------------------------------------------------
 # Per-account processing
 # ---------------------------------------------------------------------------
+
+
+def verify_reset_applied(
+    client: ManagementClient,
+    auth_index: str,
+    attempts: int = 4,
+    delay_seconds: float = 0.25,
+) -> bool:
+    """Confirm CPA cleared the aggregate account cooldown before balancing."""
+    for attempt in range(attempts):
+        try:
+            entries = client.list_auth_files()
+        except ManagementError:
+            entries = []
+        for entry in entries:
+            if str(entry.get("auth_index") or "").strip() != auth_index:
+                continue
+            if entry.get("unavailable") is not True:
+                return True
+            break
+        # reset-quota state propagation may be asynchronous. Retry both when
+        # the account is still unavailable and when it is temporarily absent.
+        if attempt + 1 < attempts:
+            time.sleep(delay_seconds)
+    return False
 
 
 def process_account(
@@ -567,6 +603,7 @@ def process_account(
     settings: Dict[str, Any],
     apply: bool,
     cache_base_url: Optional[str] = None,
+    management_key: Optional[str] = None,
 ) -> str:
     """Process a single candidate account. Returns the action taken."""
     auth_index = str(entry.get("auth_index") or "").strip()
@@ -585,13 +622,25 @@ def process_account(
     disabled_until = to_float(record.get("disabled_until"))
     if disabled_until is not None and now < disabled_until:
         LOG.info(
-            "[%s] %s %s: backing off until %s (consecutive_failures=%s)",
+            "[%s] %s %s: quota data still in failure backoff until %s "
+            "(consecutive_failures=%s); blocking chained balance",
             pool_name, provider, auth_index, iso(disabled_until),
             record.get("consecutive_failures"),
         )
-        return Decision.SKIP
+        # This backoff only exists because a previous probe returned NO_DATA.
+        # Treating it as an ordinary cooling SKIP would let the chained balance
+        # run without a confirmed-fresh recovery decision. Keep the stage
+        # fail-closed until the backoff expires and a fresh probe succeeds.
+        return Decision.NO_DATA
 
-    decision = probe_account(client, provider, auth_index, settings["grace_seconds"], cache_base_url)
+    decision = probe_account(
+        client,
+        provider,
+        auth_index,
+        settings["grace_seconds"],
+        cache_base_url=cache_base_url,
+        management_key=management_key,
+    )
 
     if decision.action == Decision.NO_DATA:
         failures = int(record.get("consecutive_failures") or 0) + 1
@@ -645,10 +694,16 @@ def process_account(
         LOG.error("[%s] %s %s: reset-quota call failed: %s", pool_name, provider, auth_index, exc)
         return Decision.NO_DATA
 
+    if not verify_reset_applied(client, auth_index):
+        record["last_decision"] = "reset_unverified"
+        state_entries[key] = record
+        LOG.error("[%s] %s %s: reset-quota was not verified; blocking chained balance", pool_name, provider, auth_index)
+        return Decision.NO_DATA
+
     record["last_reset_at"] = now
     record["last_decision"] = str(decision)
     state_entries[key] = record
-    LOG.info("[%s] %s %s: RESET quota (%s)", pool_name, provider, auth_index, decision.reason)
+    LOG.info("[%s] %s %s: RESET quota verified (%s)", pool_name, provider, auth_index, decision.reason)
     return Decision.RESET
 
 
@@ -663,7 +718,7 @@ def process_pool(
     settings: Dict[str, Any],
     apply: bool,
 ) -> Dict[str, int]:
-    counts = {"candidates": 0, "reset": 0, "skip": 0, "no_data": 0}
+    counts = {"candidates": 0, "reset": 0, "skip": 0, "no_data": 0, "errors": 0}
     pool_name = pool["name"].strip()
     secret_key = str(pool.get("secret_key") or settings["secret_key"]).strip() or DEFAULT_SECRET_KEY
 
@@ -671,15 +726,21 @@ def process_pool(
         management_key = read_management_key(pool["secrets_env"].strip(), secret_key)
     except ConfigError as exc:
         LOG.error("[%s] %s", pool_name, exc)
+        counts["errors"] += 1
         return counts
 
     client = ManagementClient(pool["base_url"].strip(), management_key, settings["request_timeout_seconds"])
     cache_base_url = str(pool.get("quota_cache_base_url") or "").strip() or None
+    if settings.get("require_cache") and not cache_base_url:
+        LOG.error("[%s] quota_cache_base_url is required for recovery", pool_name)
+        counts["errors"] += 1
+        return counts
 
     try:
         files = client.list_auth_files()
     except ManagementError as exc:
         LOG.error("[%s] failed to list auth files: %s", pool_name, exc)
+        counts["errors"] += 1
         return counts
 
     allowed_providers = pool.get("providers")
@@ -697,7 +758,16 @@ def process_pool(
         if not is_candidate(entry, settings["check_all_accounts"]):
             continue
         counts["candidates"] += 1
-        action = process_account(client, pool_name, entry, state_entries, settings, apply, cache_base_url)
+        action = process_account(
+            client,
+            pool_name,
+            entry,
+            state_entries,
+            settings,
+            apply,
+            cache_base_url=cache_base_url,
+            management_key=management_key,
+        )
         if action == Decision.RESET:
             counts["reset"] += 1
         elif action == Decision.NO_DATA:
@@ -706,8 +776,8 @@ def process_pool(
             counts["skip"] += 1
 
     LOG.info(
-        "[%s] candidates=%d reset=%d skip=%d no_data=%d",
-        pool_name, counts["candidates"], counts["reset"], counts["skip"], counts["no_data"],
+        "[%s] candidates=%d reset=%d skip=%d no_data=%d errors=%d",
+        pool_name, counts["candidates"], counts["reset"], counts["skip"], counts["no_data"], counts["errors"],
     )
     return counts
 
@@ -764,6 +834,16 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         action="append",
         help="Only process the given auth_index. May be repeated to select several accounts.",
     )
+    parser.add_argument(
+        "--fail-on-no-data",
+        action="store_true",
+        help="Exit non-zero when any recovery candidate lacks confirmed-fresh quota data.",
+    )
+    parser.add_argument(
+        "--require-cache",
+        action="store_true",
+        help="Fail instead of directly probing upstream when a pool lacks quota_cache_base_url.",
+    )
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging.")
     return parser.parse_args(argv)
 
@@ -819,6 +899,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 2
 
     settings = build_settings(cfg)
+    settings["require_cache"] = bool(args.require_cache)
     state_path = args.state or str(cfg.get("state_file") or DEFAULT_STATE_FILE)
 
     auth_filter = None
@@ -842,7 +923,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     state = load_state(state_path)
     entries = state["entries"]
 
-    totals = {"candidates": 0, "reset": 0, "skip": 0, "no_data": 0}
+    totals = {"candidates": 0, "reset": 0, "skip": 0, "no_data": 0, "errors": 0}
     for pool in pools:
         counts = process_pool(pool, entries, settings, apply)
         for key in totals:
@@ -855,9 +936,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     LOG.info(
-        "done: candidates=%d reset=%d skip=%d no_data=%d (apply=%s)",
-        totals["candidates"], totals["reset"], totals["skip"], totals["no_data"], apply,
+        "done: candidates=%d reset=%d skip=%d no_data=%d errors=%d (apply=%s)",
+        totals["candidates"], totals["reset"], totals["skip"], totals["no_data"], totals["errors"], apply,
     )
+    if args.fail_on_no_data and (totals["no_data"] or totals["errors"]):
+        LOG.error(
+            "recovery stage incomplete: no_data=%d errors=%d",
+            totals["no_data"],
+            totals["errors"],
+        )
+        return 1
     return 0
 
 

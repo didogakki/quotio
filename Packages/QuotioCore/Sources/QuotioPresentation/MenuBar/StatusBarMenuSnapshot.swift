@@ -118,7 +118,8 @@ public enum StatusBarMenuSnapshotMapper {
                 activeAntigravityEmail: activeAntigravityEmail,
                 remoteSourceNames: remoteSourceNames,
                 hiddenDropdownKeys: hiddenDropdownKeys,
-                sourceGroupOrder: menuBarPreferences.sourceGroupOrder
+                sourceGroupOrder: menuBarPreferences.sourceGroupOrder,
+                accountOrder: menuBarPreferences.accountOrder
             ).map { group in
                 StatusBarMenuAccountGroup(
                     origin: group.origin,
@@ -210,13 +211,19 @@ public enum StatusBarMenuSnapshotMapper {
     /// subgroups when the user has customized their order; a source with no persisted
     /// rank falls back to the pre-existing alphabetical-by-name sort, so an unranked
     /// source never jumps ahead of one the user explicitly placed.
+    ///
+    /// `accountOrder` (see `MenuBarPreferences.accountOrder`) does the same one level
+    /// down, ranking the accounts *within* each group by the order the user arranged on
+    /// the Accounts page; an account with no persisted rank keeps the pre-existing
+    /// alphabetical-by-email sort.
     nonisolated static func accountGroups(
         _ quotas: [String: ProviderQuota],
         provider: QuotaProvider,
         activeAntigravityEmail: String?,
         remoteSourceNames: [String: String],
         hiddenDropdownKeys: Set<String> = [],
-        sourceGroupOrder: [String] = []
+        sourceGroupOrder: [String] = [],
+        accountOrder: [String] = []
     ) -> [(origin: StatusBarMenuAccountOrigin, accounts: [(accountKey: String, email: String, data: ProviderQuota)])] {
         var localEntries: [(accountKey: String, email: String, data: ProviderQuota)] = []
         var remoteEntriesBySource: [String: [(accountKey: String, email: String, data: ProviderQuota)]] = [:]
@@ -243,9 +250,21 @@ public enum StatusBarMenuSnapshotMapper {
         }
 
         func ordered(
-            _ entries: [(accountKey: String, email: String, data: ProviderQuota)]
+            _ entries: [(accountKey: String, email: String, data: ProviderQuota)],
+            sourceId: String?
         ) -> [(accountKey: String, email: String, data: ProviderQuota)] {
-            let sorted = entries.sorted { $0.email < $1.email }
+            let sorted = DisplayOrderRanking.sorted(
+                entries,
+                order: accountOrder,
+                key: {
+                    MenuBarQuotaItem(
+                        provider: provider.rawValue,
+                        accountKey: $0.accountKey,
+                        sourceConfigId: sourceId
+                    ).id
+                },
+                isOrderedBefore: { $0.email < $1.email }
+            )
             guard provider == .antigravity else { return sorted }
             return AccountSorting.prioritizingActive(sorted) {
                 emailsMatch($0.email, activeAntigravityEmail)
@@ -254,7 +273,7 @@ public enum StatusBarMenuSnapshotMapper {
 
         var groups: [(origin: StatusBarMenuAccountOrigin, accounts: [(accountKey: String, email: String, data: ProviderQuota)])] = []
         if !localEntries.isEmpty {
-            groups.append((origin: .local, accounts: ordered(localEntries)))
+            groups.append((origin: .local, accounts: ordered(localEntries, sourceId: nil)))
         }
         for sourceId in remoteSourceOrder.sorted(by: { lhs, rhs in
             let lhsKey = RemoteQuotaSourceGroupIdentity.key(sourceId: lhs, provider: provider)
@@ -266,7 +285,10 @@ public enum StatusBarMenuSnapshotMapper {
         }) {
             guard let entries = remoteEntriesBySource[sourceId] else { continue }
             let sourceName = remoteSourceNames[sourceId] ?? sourceId
-            groups.append((origin: .remote(sourceId: sourceId, sourceName: sourceName), accounts: ordered(entries)))
+            groups.append((
+                origin: .remote(sourceId: sourceId, sourceName: sourceName),
+                accounts: ordered(entries, sourceId: sourceId)
+            ))
         }
         return groups
     }

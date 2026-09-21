@@ -226,6 +226,12 @@ public struct CodexResetCreditSummary: Codable, Equatable, Sendable {
     }
 }
 
+/// Non-sensitive account-level problem explicitly observed by a remote quota source.
+/// Optional so snapshots written before this field existed continue to decode normally.
+public enum RemoteQuotaAccountIssue: String, Codable, Equatable, Sendable {
+    case invalidOAuth
+}
+
 public struct ProviderQuota: Codable, Equatable, Sendable {
     public var models: [QuotaMetric]
     public var lastUpdated: Date
@@ -235,6 +241,11 @@ public struct ProviderQuota: Codable, Equatable, Sendable {
     public var analytics: QuotaAnalytics?
     public var accountDisplayName: String?
     public var codexResetCreditSummary: CodexResetCreditSummary?
+    /// A safe, typed account problem reported by the quota-cache. The cache never sends
+    /// the upstream error body, so persisting this on the last-known-good reading cannot
+    /// leak OAuth tokens or provider response text. Cleared only after a successful quota
+    /// reading for the same account identity; generic network failures leave it untouched.
+    public var remoteAccountIssue: RemoteQuotaAccountIssue?
     /// Set only for a remote (CLIProxyAPI) account the source currently reports as
     /// frozen — cooling after a rate limit, or otherwise flagged unavailable. Distinct
     /// from `isForbidden`, which means the account's own credential was rejected: this
@@ -267,6 +278,7 @@ public struct ProviderQuota: Codable, Equatable, Sendable {
         analytics: QuotaAnalytics? = nil,
         accountDisplayName: String? = nil,
         codexResetCreditSummary: CodexResetCreditSummary? = nil,
+        remoteAccountIssue: RemoteQuotaAccountIssue? = nil,
         isTemporarilyUnavailable: Bool? = nil,
         availabilityRecoveryDate: Date? = nil
     ) {
@@ -278,6 +290,7 @@ public struct ProviderQuota: Codable, Equatable, Sendable {
         self.analytics = analytics
         self.accountDisplayName = accountDisplayName
         self.codexResetCreditSummary = codexResetCreditSummary
+        self.remoteAccountIssue = remoteAccountIssue
         self.isTemporarilyUnavailable = isTemporarilyUnavailable
         self.availabilityRecoveryDate = availabilityRecoveryDate
     }

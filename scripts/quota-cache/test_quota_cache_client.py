@@ -56,6 +56,20 @@ class QuotaCacheClientTests(unittest.TestCase):
         quota_cache_client.fetch(self.base_url, "secret-plus", "claude-usage", "claude-a", require_fresh=True)
         self.assertEqual(self.cpa.call_count, 1)
 
+    def test_auth_invalid_failure_is_typed_without_exposing_raw_body(self):
+        self.cpa.responses["claude-a"] = (
+            401,
+            {},
+            '{"error":{"message":"Encountered invalidated oauth token for user, failing request"}}',
+        )
+        with self.assertRaises(quota_cache_client.QuotaCacheError) as ctx:
+            quota_cache_client.fetch(
+                self.base_url, "secret-plus", "claude-usage", "claude-a", require_fresh=True
+            )
+        self.assertTrue(ctx.exception.is_auth_invalid)
+        self.assertEqual(ctx.exception.failure_status_code, 401)
+        self.assertNotIn("invalidated oauth token", str(ctx.exception).lower())
+
 
 class RequireFreshValidationTests(unittest.TestCase):
     """Covers the client-side belt-and-suspenders validation added on top of the

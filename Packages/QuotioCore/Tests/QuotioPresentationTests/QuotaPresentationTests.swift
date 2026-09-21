@@ -50,6 +50,20 @@ final class ProviderQuotaAvailabilityStatusTests: XCTestCase {
         XCTAssertNil(quota.availabilityStatus)
     }
 
+    func testAvailabilityStatusIsAuthInvalidForClassifiedOAuthFailure() {
+        let quota = ProviderQuota(remoteAccountIssue: .invalidOAuth)
+        XCTAssertEqual(quota.availabilityStatus, .authInvalid)
+    }
+
+    func testAvailabilityStatusPrefersAuthInvalidOverOtherUnavailableStates() {
+        let quota = ProviderQuota(
+            isForbidden: true,
+            remoteAccountIssue: .invalidOAuth,
+            isTemporarilyUnavailable: true
+        )
+        XCTAssertEqual(quota.availabilityStatus, .authInvalid)
+    }
+
     func testAvailabilityStatusIsFrozenWhenForbidden() {
         let quota = ProviderQuota(isForbidden: true)
         XCTAssertEqual(quota.availabilityStatus, .frozen)

@@ -132,6 +132,20 @@ final class UserDefaultsPreferenceRepositoriesTests: XCTestCase {
         XCTAssertEqual(reloaded.sourceGroupOrder, ["business::codex", "plus::codex", "plus::claude"])
     }
 
+    /// Same contract as `sourceGroupOrder`, one level down: an install that predates
+    /// per-account ordering must decode as "no custom order", and a saved order must
+    /// round-trip by position, not membership.
+    func testAccountOrderDefaultsToEmptyAndRoundTripsExactOrder() {
+        let repository = UserDefaultsMenuBarPreferencesRepository(defaults: defaults)
+        XCTAssertTrue(repository.load().accountOrder.isEmpty)
+
+        var preferences = MenuBarPreferences()
+        preferences.accountOrder = ["codex|acct::plus::2", "codex|acct::plus::1"]
+        repository.save(preferences)
+
+        XCTAssertEqual(repository.load().accountOrder, ["codex|acct::plus::2", "codex|acct::plus::1"])
+    }
+
     /// Regression: raw storage must never truncate `selectedItems` to `menuBarMaxItems`
     /// on either `save` or `load` — only *effective* occupancy is capacity-limited, and
     /// the repository has no visibility into which legacy pool pins currently cover a

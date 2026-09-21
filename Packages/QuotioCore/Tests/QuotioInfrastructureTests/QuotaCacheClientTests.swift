@@ -67,6 +67,37 @@ final class QuotaCacheClientTests: XCTestCase {
     }
   }
 
+  func testFetchClassifiesSafeAuthInvalidFailureOn503() async {
+    let body = Data(#"{"error":"upstream_unavailable","failure":{"kind":"auth_invalid","status_code":401}}"#.utf8)
+    let client = QuotaCacheClient(session: RecordingQuotaHTTPSession(statusCode: 503, body: body))
+
+    do {
+      _ = try await client.fetch(
+        baseURL: "https://cache.example.com/quota-cache/v1/plus",
+        resource: "codex-usage", authIndex: "codex-a", managementKey: "admin-key"
+      )
+      XCTFail("expected authInvalid")
+    } catch QuotaCacheError.authInvalid(let statusCode) {
+      XCTAssertEqual(statusCode, 401)
+    } catch {
+      XCTFail("unexpected error: \(error)")
+    }
+  }
+
+  func testFetchDecodesAuthInvalidFailureAlongsideAStaleSuccessfulEnvelope() async throws {
+    let envelope = #"{"result":{"status_code":200,"header":{},"body":"{}"},"fetched_at":1700000000,"stale":true,"last_attempt":1700000500,"next_retry_at":1700000600,"failure":{"kind":"auth_invalid","status_code":401}}"#
+    let client = QuotaCacheClient(
+      session: RecordingQuotaHTTPSession(statusCode: 200, body: Data(envelope.utf8)))
+
+    let response = try await client.fetch(
+      baseURL: "https://cache.example.com/quota-cache/v1/plus",
+      resource: "codex-usage", authIndex: "codex-a", managementKey: "admin-key"
+    )
+
+    XCTAssertEqual(response.failure?.remoteAccountIssue, .invalidOAuth)
+    XCTAssertEqual(response.failure?.authInvalidStatusCode, 401)
+  }
+
   func testFetchThrowsInvalidResponseOnUnparsableEnvelope() async {
     let session = RecordingQuotaHTTPSession(statusCode: 200, body: Data("not json".utf8))
     let client = QuotaCacheClient(session: session)

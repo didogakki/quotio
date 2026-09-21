@@ -51,8 +51,8 @@ def _pool_config(cache_base_url=None):
     return pool
 
 
-class CacheEnabledAbortsRoundTests(unittest.TestCase):
-    def test_a_quota_cache_error_for_one_account_aborts_the_whole_round(self):
+class CacheEnabledIsolationTests(unittest.TestCase):
+    def test_cache_errors_freeze_accounts_without_aborting(self):
         client = FakeManagementClient([_entry("a"), _entry("b")])
         qr = FakeQR(client)
         pool = _pool_config(cache_base_url="http://127.0.0.1:8328/quota-cache/v1/plus")
@@ -61,10 +61,11 @@ class CacheEnabledAbortsRoundTests(unittest.TestCase):
             raise quota_cache_client.QuotaCacheError("upstream_unavailable")
 
         with patch.object(quota_cache_client, "fetch", side_effect=fake_fetch):
-            with self.assertRaises(RuntimeError):
-                collect_pool(qr, pool, {}, {}, timeout=5, now=1_700_000_000)
+            metrics = collect_pool(qr, pool, {}, {}, timeout=5, now=1_700_000_000)
+        self.assertEqual(metrics.failed_accounts, len(client.files))
+        self.assertEqual(metrics.accounts, [])
 
-    def test_an_unusable_cached_reading_aborts_the_whole_round_rather_than_excluding_the_account(self):
+    def test_invalid_reading_marks_pool_incomplete(self):
         client = FakeManagementClient([_entry("a")])
         qr = FakeQR(client)
         pool = _pool_config(cache_base_url="http://127.0.0.1:8328/quota-cache/v1/plus")
@@ -73,8 +74,9 @@ class CacheEnabledAbortsRoundTests(unittest.TestCase):
             return {"result": {"status_code": 200, "header": {}, "body": "{}"}, "fetched_at": 1_700_000_000, "stale": False}
 
         with patch.object(quota_cache_client, "fetch", side_effect=fake_fetch):
-            with self.assertRaises(RuntimeError):
-                collect_pool(qr, pool, {}, {}, timeout=5, now=1_700_000_000)
+            metrics = collect_pool(qr, pool, {}, {}, timeout=5, now=1_700_000_000)
+        self.assertEqual(metrics.failed_accounts, len(client.files))
+        self.assertEqual(metrics.accounts, [])
 
     def test_a_successful_cached_reading_for_every_account_produces_normal_metrics(self):
         client = FakeManagementClient([_entry("a")])

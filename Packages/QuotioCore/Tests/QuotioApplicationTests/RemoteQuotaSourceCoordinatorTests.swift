@@ -78,6 +78,56 @@ final class RemoteQuotaSourceCoordinatorTests: XCTestCase {
         XCTAssertEqual(state.failureCounts["s1"], 1, "a partial failure must still count toward the hide threshold")
     }
 
+    func testAuthInvalidIssuePersistsAcrossTransientFailureAndClearsOnlyOnSuccess() async {
+        let fetcher = StubFetcher()
+        let coordinator = makeCoordinator(fetcher: fetcher)
+        let source = RemoteQuotaSourceConfig(id: "s1", name: "Pool", baseURL: "https://a.test")
+        await coordinator.addSource(source, managementKey: "k")
+
+        await fetcher.enqueue(
+            .result(RemoteQuotaPoolFetchResult(
+                quotasByProviderAndAccount: [.codex: ["a": Self.quota(70)]],
+                outcome: .complete,
+                knownAccountKeys: [.codex: ["a"]],
+                accountIssues: [.codex: ["a": .invalidOAuth]],
+                accountIssueObservedKeys: [.codex: ["a"]]
+            )),
+            for: "s1"
+        )
+        await coordinator.refresh(sourceId: "s1", isAutomatic: true)
+        var state = await coordinator.state
+        XCTAssertEqual(state.poolQuotas["s1"]?[.codex]?["a"]?.remoteAccountIssue, .invalidOAuth)
+        XCTAssertEqual(state.failureCounts["s1"], 0, "an account quarantine is not a source failure")
+
+        // Generic quota failure: no auth observation, so the prior issue must remain.
+        await fetcher.enqueue(
+            .result(RemoteQuotaPoolFetchResult(
+                outcome: .allFailed,
+                knownAccountKeys: [.codex: ["a"]]
+            )),
+            for: "s1"
+        )
+        await coordinator.refresh(sourceId: "s1", isAutomatic: true)
+        state = await coordinator.state
+        XCTAssertEqual(state.poolQuotas["s1"]?[.codex]?["a"]?.remoteAccountIssue, .invalidOAuth)
+
+        // Successful usage reading is an explicit healthy observation and clears it.
+        await fetcher.enqueue(
+            .result(RemoteQuotaPoolFetchResult(
+                quotasByProviderAndAccount: [.codex: ["a": Self.quota(55)]],
+                outcome: .complete,
+                knownAccountKeys: [.codex: ["a"]],
+                accountIssueObservedKeys: [.codex: ["a"]]
+            )),
+            for: "s1"
+        )
+        await coordinator.refresh(sourceId: "s1", isAutomatic: true)
+        state = await coordinator.state
+        XCTAssertNil(state.poolQuotas["s1"]?[.codex]?["a"]?.remoteAccountIssue)
+        XCTAssertEqual(state.poolQuotas["s1"]?[.codex]?["a"]?.models.first?.percentage, 55)
+        XCTAssertEqual(state.failureCounts["s1"], 0)
+    }
+
     /// The counterpart to pruning: an account the source still lists but currently
     /// reports as frozen must keep both its row and its last-known-good reading. Being
     /// temporarily unusable is a state, never an absence — treating it as one is what

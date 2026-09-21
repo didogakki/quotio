@@ -97,7 +97,10 @@ public final class UserDefaultsMenuBarPreferencesRepository: MenuBarPreferencesR
             // Order (not membership), so unlike the two sets above this must stay an
             // array — `stringArray(forKey:)` preserves insertion order the same way
             // `set(_:forKey:)` below writes it.
-            sourceGroupOrder: defaults.stringArray(forKey: "menuBarSourceGroupOrder") ?? []
+            sourceGroupOrder: defaults.stringArray(forKey: "menuBarSourceGroupOrder") ?? [],
+            // Same contract as `sourceGroupOrder`, one level down (per account inside a
+            // group); an absent key means "no custom account order yet".
+            accountOrder: defaults.stringArray(forKey: "menuBarAccountOrder") ?? []
         )
     }
 
@@ -118,6 +121,7 @@ public final class UserDefaultsMenuBarPreferencesRepository: MenuBarPreferencesR
         defaults.set(preferences.deselectedPoolAccounts.sorted(), forKey: "menuBarDeselectedPoolAccounts")
         defaults.set(preferences.hiddenDropdownKeys.sorted(), forKey: "menuBarHiddenDropdownKeys")
         defaults.set(preferences.sourceGroupOrder, forKey: "menuBarSourceGroupOrder")
+        defaults.set(preferences.accountOrder, forKey: "menuBarAccountOrder")
         // Not truncated by `maximum` — see the matching note in `load()`.
         if let data = try? JSONEncoder().encode(preferences.selectedItems) {
             defaults.set(data, forKey: "menuBarSelectedQuotaItems")

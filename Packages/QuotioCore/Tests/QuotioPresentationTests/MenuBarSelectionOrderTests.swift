@@ -76,6 +76,41 @@ final class MenuBarSelectionOrderTests: XCTestCase {
         XCTAssertEqual(reloaded.statusBarSelectedItems.first, pin("pro"))
         XCTAssertEqual(reloaded.statusBarSelectedItems, [pin("pro"), pin("plus"), pin("team")])
     }
+
+    /// The first `moveAccount` in a scope must materialize every sibling it was given —
+    /// in the order they were displayed — so the moved account swaps with exactly one
+    /// neighbour and nothing else in that group shifts. The result must survive a
+    /// preferences reload, and must leave pins untouched.
+    func testMovingAnAccountUpMaterializesItsGroupOrderAndPersists() {
+        let repository = OrderPreferencesRepository()
+        let manager = MenuBarSettingsManager(repository: repository)
+        enablePins(manager)
+        let ids = ["a", "b", "c"].map { key in
+            MenuBarQuotaItem(
+                provider: QuotaProvider.codex.rawValue,
+                accountKey: RemoteQuotaAccountIdentity.storageKey(sourceId: "plus", accountKey: key),
+                sourceConfigId: "plus"
+            ).id
+        }
+
+        manager.moveAccount(itemId: ids[2], direction: .up, siblingIds: ids)
+
+        XCTAssertEqual(manager.accountOrder, [ids[0], ids[2], ids[1]])
+        XCTAssertEqual(manager.statusBarSelectedItems, [pin("pro"), pin("plus"), pin("team")])
+        XCTAssertEqual(MenuBarSettingsManager(repository: repository).accountOrder, manager.accountOrder)
+    }
+
+    /// Moving past either end is a no-op rather than a wrap-around.
+    func testMovingTheFirstAccountUpDoesNothing() {
+        let manager = MenuBarSettingsManager(repository: OrderPreferencesRepository())
+        let ids = ["a", "b"].map { key in
+            MenuBarQuotaItem(provider: QuotaProvider.claude.rawValue, accountKey: key).id
+        }
+
+        manager.moveAccount(itemId: ids[0], direction: .up, siblingIds: ids)
+
+        XCTAssertEqual(manager.accountOrder, ids)
+    }
 }
 
 /// Isolated storage shared only by the test's manager instances; never uses real preferences.

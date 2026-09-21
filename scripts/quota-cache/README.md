@@ -295,3 +295,19 @@ The existing integer weight bounds, update thresholds and rollback remain.
 `quota_cache_base_urls` in the balance config maps `plus` and `business` to
 loopback cache paths; this avoids editing or activating recovery config.
 All reads require fresh cache entries. Keep recovery timers disabled.
+
+
+### 均衡的账号级失败隔离
+
+`weekly_headroom_v1` / 缓存路径中，单账号查询错误、认证失败或无效窗口只冻结该账号的现有权重；不将未知额度视作 0，不修改账号启用状态。健康账号继续调权，异常池内仅重新分配健康账号原有权重总量（上下界同比缩放），不将部分数据重新归一为 100。健康账号预算原本为 0 时保持 0，避免凭空恢复；下一轮数据完整后恢复常规归一化。
+
+任一池存在未知账号时，New API 两渠道权重均保持不变；完整的另一个池仍可调 CPA 账号权重。所有账号查询失败时不写该池账号权重。确认耗尽的健康账号仍归零，零边界绕过防抖。每轮重试未知账号，并遵循共享缓存既有退避；恢复有效观测后自动重纳入。
+
+这是故障隔离，不是失效账号自动封禁：未知账号保留旧权重，仍可能接收请求，依赖 CPA 自身认证/冷却处理。整个管理账号列表无法获取、配置错误、写入失败仍保留原有中止/回滚机制。日志用哈希账号标识与异常类型，不记录原始响应或凭据。
+
+
+### 401 OAuth 失效软隔离与零保留策略
+
+当前生产均衡将 `reserve_percent` 设为 `0`，默认值也为 `0`：确认存在的周额度不再扣除固定 5 个百分点，周额度剩余 4% 时仍可参与均衡。
+
+缓存只持久化固定的安全失败分类。上游返回 401（或带明确 OAuth-token 失效标记的 403）时记录 `failure.kind=auth_invalid` 与状态码，不保存或返回原始错误正文。恢复阶段把它视为已知不可恢复状态而不是 `no_data`，因此不会阻断后续均衡；均衡阶段保持 auth 文件启用但把账号权重设为 0。Quotio 可显示该账号的 OAuth 失效状态。相同身份只有重新取得成功额度读数才会清除隔离；删除旧认证文件会删除旧缓存身份，重新登录产生的有效认证会在成功读取后自动重新加入均衡。

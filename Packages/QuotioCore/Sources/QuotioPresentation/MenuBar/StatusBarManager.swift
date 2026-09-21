@@ -26,7 +26,7 @@ public final class StatusBarManager: NSObject, NSMenuDelegate {
     private struct RenderSignature: Equatable {
         let configuration: Configuration
         let usesDarkColorScheme: Bool
-        let backingScaleFactor: CGFloat
+        let backingScaleFactors: [CGFloat]
     }
     
     private var statusItem: NSStatusItem?
@@ -37,6 +37,7 @@ public final class StatusBarManager: NSObject, NSMenuDelegate {
     private var configuration: Configuration?
     private var lastRenderSignature: RenderSignature?
     private var appearanceObservation: NSKeyValueObservation?
+    private var screenParametersObservation: (any NSObjectProtocol)?
     
     private var menuSnapshotProvider: (@MainActor () -> StatusBarMenuSnapshot)?
     private var commandDispatcher: StatusBarCommandDispatcher?
@@ -53,9 +54,15 @@ public final class StatusBarManager: NSObject, NSMenuDelegate {
         self.commandDispatcher = commandDispatcher
     }
     
-    /// Highest backing scale factor across all active screens to ensure sharp rendering in multi-monitor setups
-    private var targetBackingScaleFactor: CGFloat {
-        NSScreen.screens.map(\.backingScaleFactor).max() ?? 2.0
+    /// Every distinct backing scale factor currently in use across active screens, highest first.
+    /// The status bar image carries one representation per scale so AppKit can pick a pixel-exact
+    /// one for whichever display the menu bar is drawn on. A single max-scale bitmap would be
+    /// resampled down on a 1x display — e.g. a 4K panel running at its native resolution next to a
+    /// Retina one — which is what made the quota text look soft there.
+    private var targetBackingScaleFactors: [CGFloat] {
+        let scales = Set(NSScreen.screens.map(\.backingScaleFactor).filter { $0 > 0 })
+        guard !scales.isEmpty else { return [2.0] }
+        return scales.sorted(by: >)
     }
     
     public func updateStatusBar(
@@ -115,11 +122,11 @@ public final class StatusBarManager: NSObject, NSMenuDelegate {
 
         let usesDarkColorScheme = button.isHighlighted
             || button.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        let scale = targetBackingScaleFactor
+        let scales = targetBackingScaleFactors
         let signature = RenderSignature(
             configuration: configuration,
             usesDarkColorScheme: usesDarkColorScheme,
-            backingScaleFactor: scale
+            backingScaleFactors: scales
         )
         guard signature != lastRenderSignature else { return }
         
@@ -151,14 +158,29 @@ public final class StatusBarManager: NSObject, NSMenuDelegate {
         .environment(\.colorScheme, colorScheme)
         
         let renderer = ImageRenderer(content: quotaView)
-        renderer.scale = scale
         renderer.isOpaque = false
-        
-        if let cgImage = renderer.cgImage {
-            let width = CGFloat(cgImage.width) / scale
-            let height = CGFloat(cgImage.height) / scale
-            let size = NSSize(width: width, height: height)
-            let image = NSImage(cgImage: cgImage, size: size)
+
+        // Layout is scale-independent, so every pass produces the same point size; the
+        // highest scale comes first and defines it for all representations.
+        var representations: [NSImageRep] = []
+        var pointSize: NSSize?
+        for scale in scales {
+            renderer.scale = scale
+            guard let cgImage = renderer.cgImage else { continue }
+            let size = pointSize ?? NSSize(
+                width: CGFloat(cgImage.width) / scale,
+                height: CGFloat(cgImage.height) / scale
+            )
+            pointSize = size
+            let representation = NSBitmapImageRep(cgImage: cgImage)
+            representation.size = size
+            representations.append(representation)
+        }
+
+        if let pointSize, !representations.isEmpty {
+            let width = pointSize.width
+            let image = NSImage(size: pointSize)
+            representations.forEach(image.addRepresentation)
             if configuration.colorMode == .monochrome {
                 image.isTemplate = true
             }
@@ -182,6 +204,19 @@ public final class StatusBarManager: NSObject, NSMenuDelegate {
         guard let button = statusItem?.button else { return }
 
         appearanceObservation = button.observe(\.effectiveAppearance, options: [.new]) { [weak self] _, _ in
+            Task { @MainActor [weak self] in
+                self?.renderStatusBar()
+            }
+        }
+
+        // The set of backing scale factors baked into the rendered image depends on the
+        // attached screens, so a display being connected, removed or re-scaled has to
+        // invalidate it.
+        screenParametersObservation = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.renderStatusBar()
             }
@@ -291,6 +326,10 @@ public final class StatusBarManager: NSObject, NSMenuDelegate {
     
     func removeStatusItem() {
         appearanceObservation = nil
+        if let screenParametersObservation {
+            NotificationCenter.default.removeObserver(screenParametersObservation)
+        }
+        screenParametersObservation = nil
         if let item = statusItem {
             NSStatusBar.system.removeStatusItem(item)
             statusItem = nil

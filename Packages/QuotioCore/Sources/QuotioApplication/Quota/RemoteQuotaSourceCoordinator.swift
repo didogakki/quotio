@@ -322,6 +322,21 @@ public actor RemoteQuotaSourceCoordinator {
                     stamped[entry.key] = quota
                 }
             }
+            // Authentication state is intentionally stickier than a quota fetch result:
+            // only an explicit classified failure sets it and only a successful usage
+            // reading clears it. A transient cache/network error observes neither, so the
+            // previous issue remains visible instead of making a broken login look healthy.
+            for (provider, observedKeys) in result.accountIssueObservedKeys {
+                guard let byAccount = pools[provider] else { continue }
+                let issues = result.accountIssues[provider] ?? [:]
+                pools[provider] = byAccount.reduce(into: [String: ProviderQuota]()) { stamped, entry in
+                    var quota = entry.value
+                    if observedKeys.contains(entry.key) {
+                        quota.remoteAccountIssue = issues[entry.key]
+                    }
+                    stamped[entry.key] = quota
+                }
+            }
             state.poolQuotas[sourceId] = pools
             if let failureKey = result.failureLocalizationKey {
                 state.statuses[sourceId] = .error(failureKey)
