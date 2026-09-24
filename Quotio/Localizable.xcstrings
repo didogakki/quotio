@@ -9162,13 +9162,22 @@
         "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "权重 %d" } }
       }
     },
-    "menu.weight.channel" : {
+    "menu.weight.channelLabel" : {
       "extractionState" : "manual",
       "localizations" : {
-        "en" : { "stringUnit" : { "state" : "translated", "value" : "Channel weight %d" } },
-        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Poids du canal %d" } },
-        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Trọng số kênh %d" } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "渠道权重 %d" } }
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Channel weight" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Poids du canal" } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Trọng số kênh" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "渠道权重" } }
+      }
+    },
+    "menu.weight.distribution" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Account split: %@" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Répartition des comptes : %@" } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Phân bổ tài khoản: %@" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "账户分配：%@" } }
       }
     },
     "menubar.hideAccounts" : {

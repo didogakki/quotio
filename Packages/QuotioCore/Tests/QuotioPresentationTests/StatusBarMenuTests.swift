@@ -522,9 +522,18 @@ final class StatusBarMenuRendererTests: XCTestCase {
         ).buildMenu()
 
         XCTAssertEqual(unfilteredMenu.items.count, 11)
-        XCTAssertEqual(unfilteredMenu.items.filter(\.isSeparatorItem).count, 4)
+        XCTAssertEqual(unfilteredMenu.items.filter(Self.isDecorativeSeparatorItem).count, 4)
         XCTAssertEqual(filteredMenu.items.count, 7)
-        XCTAssertEqual(filteredMenu.items.filter(\.isSeparatorItem).count, 3)
+        XCTAssertEqual(filteredMenu.items.filter(Self.isDecorativeSeparatorItem).count, 3)
+    }
+
+    /// `StatusBarMenuRenderer.separatorItem()` replaced native `NSMenuItem.separator()`
+    /// with a custom-view, disabled item so its background matches every other row.
+    /// `isSeparatorItem` no longer sees it, so this identifies it the same way the
+    /// renderer builds it: a hosted `MenuSeparatorView` on a disabled item.
+    private static func isDecorativeSeparatorItem(_ item: NSMenuItem) -> Bool {
+        guard !item.isEnabled, let view = item.view else { return false }
+        return String(describing: type(of: view)).contains("MenuSeparatorView")
     }
 
     /// Filtering to one provider must still keep local and remote accounts grouped by

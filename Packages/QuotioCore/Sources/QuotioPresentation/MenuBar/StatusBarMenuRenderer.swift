@@ -37,12 +37,12 @@ final class StatusBarMenuRenderer {
 
         // 1. Header
         menu.addItem(buildHeaderItem())
-        menu.addItem(NSMenuItem.separator())
+        menu.addItem(separatorItem())
 
         // 2. Network info (Proxy + Tunnel) - Local Proxy Mode only
         if snapshot.isLocalProxyMode {
             menu.addItem(buildNetworkInfoItem())
-            menu.addItem(NSMenuItem.separator())
+            menu.addItem(separatorItem())
         }
 
         // 3. Provider picker and account groups
@@ -56,7 +56,7 @@ final class StatusBarMenuRenderer {
                 }
             )
             menu.addItem(viewItem(for: pickerView))
-            menu.addItem(NSMenuItem.separator())
+            menu.addItem(separatorItem())
 
             let visibleProviders = visibleProviders(from: providers)
             let showsProviderHeaders = selectedProvider(from: providers) == nil
@@ -83,31 +83,42 @@ final class StatusBarMenuRenderer {
                     // never read as one merged row.
                     let showsSourceSubheaders = providerSnapshot.groups.count > 1
                         || providerSnapshot.groups.first?.origin != .local
-                    for group in providerSnapshot.groups {
+                    // Channel color numbering (indigo/teal/pink/sky) restarts per
+                    // provider and only advances for multi-account groups — a
+                    // single-account group never consumes a color.
+                    let presentations = providerSnapshot.groups.map { MenuChannelWeightPresentation(accounts: $0.accounts) }
+                    let accents = MenuChannelWeightPresentation.channelAccents(
+                        forMultiAccountFlags: presentations.map(\.isMultiAccount)
+                    )
+                    for (groupIndex, group) in providerSnapshot.groups.enumerated() {
+                        let presentation = presentations[groupIndex]
+                        let accent = accents[groupIndex]
                         if showsSourceSubheaders {
-                            let channelWeight = QuotaPolicy.reconciledChannelWeight(
-                                from: group.accounts.compactMap(\.quota.routingWeight)
-                            )
                             menu.addItem(viewItem(for: MenuAccountGroupSubheader(
-                                origin: group.origin, channelWeight: channelWeight
+                                origin: group.origin,
+                                isMultiAccount: presentation.isMultiAccount,
+                                channelWeight: presentation.channelWeight,
+                                segments: presentation.segments,
+                                accent: accent,
+                                menuWidth: menuWidth
                             )))
                         }
                         for account in group.accounts {
-                            menu.addItem(buildAccountCardItem(account))
+                            menu.addItem(buildAccountCardItem(account, accountWeightAccent: accent))
                         }
                     }
                 }
 
                 // Separator between provider groups (not after the last one)
                 if index < visibleProviders.count - 1 {
-                    menu.addItem(NSMenuItem.separator())
+                    menu.addItem(separatorItem())
                 }
             }
 
-            menu.addItem(NSMenuItem.separator())
+            menu.addItem(separatorItem())
         } else {
             menu.addItem(buildEmptyStateItem())
-            menu.addItem(NSMenuItem.separator())
+            menu.addItem(separatorItem())
         }
         
         // 4. Action items
@@ -173,7 +184,10 @@ final class StatusBarMenuRenderer {
 
     // MARK: - Account Card Item (with submenu for Antigravity)
 
-    private func buildAccountCardItem(_ account: StatusBarMenuAccountSnapshot) -> NSMenuItem {
+    private func buildAccountCardItem(
+        _ account: StatusBarMenuAccountSnapshot,
+        accountWeightAccent: Color?
+    ) -> NSMenuItem {
         let provider = account.id.provider
         let cardView = MenuAccountCardView(
             accountKey: account.id.accountKey,
@@ -184,6 +198,7 @@ final class StatusBarMenuRenderer {
             isActiveInIDE: account.isActiveInIDE,
             isRefreshing: account.isRefreshing,
             canRefresh: !account.isRefreshBlocked && provider.supportsQuotaOnlyMode,
+            accountWeightAccent: accountWeightAccent,
             settings: snapshot.displaySettings,
             onRefresh: {
                 self.commands.dispatch(.refreshAccount(account.id))
@@ -266,11 +281,31 @@ final class StatusBarMenuRenderer {
         return menu
     }
     
+    /// Decorative divider between menu sections. A native `NSMenuItem.separator()`
+    /// draws through the menu's own translucent window material, so it stayed visibly
+    /// lighter than the near-opaque `MenuRowBackground` fill every other row sits on —
+    /// this renders the same fill behind a thin line instead, so the whole menu reads
+    /// as one consistent surface. Disabled and hidden from VoiceOver since it carries
+    /// no action, matching how a native separator is already unselectable.
+    private func separatorItem() -> NSMenuItem {
+        let item = viewItem(for: MenuSeparatorView())
+        item.isEnabled = false
+        return item
+    }
+
     private func viewItem<V: View>(for view: V, width: CGFloat? = nil) -> NSMenuItem {
         let effectiveWidth = width ?? menuWidth
-        let rootView = view
-            .frame(width: effectiveWidth)
-            .environment(\.locale, snapshot.language.locale)
+        // Native NSMenu draws its own window with a translucent material, which lets
+        // whatever sits behind it show through custom SwiftUI rows and hurts legibility.
+        // A near-opaque fill behind the row (fully opaque under Reduce Transparency)
+        // masks that without touching the row content's own opacity, so text and the
+        // hover highlight drawn on top of it stay crisp.
+        let locale = snapshot.language.locale
+        let rootView = MenuRowBackground {
+            view
+                .frame(width: effectiveWidth)
+                .environment(\.locale, locale)
+        }
         let hostingView = NSHostingView(rootView: rootView)
         hostingView.appearance = snapshot.appearanceMode.appKitAppearance
         hostingView.setFrameSize(hostingView.intrinsicContentSize)
@@ -282,6 +317,33 @@ final class StatusBarMenuRenderer {
 }
 
 // MARK: - SwiftUI Menu Components
+
+// MARK: Row Background
+
+private struct MenuRowBackground<Content: View>: View {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        content()
+            .background(Color(nsColor: .windowBackgroundColor).opacity(reduceTransparency ? 1.0 : 0.95))
+    }
+}
+
+// MARK: Separator Row
+
+/// Thin divider matching a native `NSMenuItem.separator()`'s line/inset, but hosted in
+/// `StatusBarMenuRenderer.separatorItem()` behind the same `MenuRowBackground` fill as
+/// every other row, so it no longer shows through the menu's translucent window material.
+private struct MenuSeparatorView: View {
+    var body: some View {
+        Rectangle()
+            .fill(Color.primary.opacity(0.1))
+            .frame(height: 1)
+            .padding(.vertical, 4)
+            .accessibilityHidden(true)
+    }
+}
 
 // MARK: Header View
 
@@ -348,14 +410,22 @@ private struct MenuProviderSectionHeader: View {
 
 /// Labels which source a group of account rows came from — "Local" or a configured
 /// remote quota source's own name — so accounts never read as an undifferentiated pile
-/// once more than one source is visible for the same provider.
+/// once more than one source is visible for the same provider. A multi-account group
+/// additionally shows its reconciled channel weight and a per-account weight
+/// distribution bar, both in the group's assigned channel color; a single-account group
+/// never shows either, since a lone account has no distribution to visualize.
 private struct MenuAccountGroupSubheader: View {
     let origin: StatusBarMenuAccountOrigin
-    /// This pool's channel weight, reconciled across the group's own accounts by
-    /// `QuotaPolicy.reconciledChannelWeight` — `nil` (never a placeholder 0) when no
-    /// account in this group carries a routing-weight reading, or the readings at the
-    /// latest timestamp disagree.
+    let isMultiAccount: Bool
     let channelWeight: Int?
+    let segments: [Int]
+    /// This group's assigned channel color — always non-`nil` when `isMultiAccount` is
+    /// `true` (assigned by the caller before the weight is known to be shown), unused
+    /// otherwise.
+    let accent: Color?
+    /// `StatusBarMenuRenderer.menuWidth`, passed down so the distribution bar derives its
+    /// content width from the single source of truth instead of duplicating it.
+    let menuWidth: CGFloat
 
     private var title: String {
         switch origin {
@@ -366,29 +436,137 @@ private struct MenuAccountGroupSubheader: View {
         }
     }
 
+    private var originIcon: some View {
+        Image(systemName: origin == .local ? "desktopcomputer" : "network")
+            .font(.system(size: 10, weight: .medium))
+            .foregroundStyle(.secondary)
+    }
+
+    /// `menuWidth` minus this subheader's own 14pt horizontal padding on each side — the
+    /// content width `WeightDistributionBar` lays its segments out against.
+    private var contentWidth: CGFloat {
+        menuWidth - Self.horizontalPadding * 2
+    }
+
+    private static let horizontalPadding: CGFloat = 14
+
     var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: origin == .local ? "desktopcomputer" : "network")
-                .font(.system(size: 9, weight: .medium))
-                .foregroundStyle(.tertiary)
-            // Source name in `.tertiary`, plus `· 渠道权重 N` in `.secondary` (one
-            // level up from the source name) when a reconciled channel weight is
-            // available — two adjacent `Text` views rather than one concatenated
-            // `Text`, so each segment's own color/style is unambiguous.
-            HStack(spacing: 0) {
-                Text(title)
-                    .font(.system(size: 9.5, weight: .medium, design: .rounded))
-                    .foregroundStyle(.tertiary)
-                if let channelWeight {
-                    Text(" · " + String(format: "menu.weight.channel".localized(), channelWeight))
-                        .font(.system(size: 9.5, weight: .medium, design: .rounded))
-                        .foregroundStyle(.secondary)
+        if isMultiAccount {
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    originIcon
+                    Text(title)
+                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        .foregroundStyle(Color.primary.opacity(0.85))
+                        .lineLimit(1)
+                    Spacer(minLength: 8)
+                    if let channelWeight, let accent {
+                        Text("menu.weight.channelLabel".localized())
+                            .font(.system(size: 10, weight: .medium, design: .rounded))
+                            .foregroundStyle(.secondary)
+                        Text(String(channelWeight))
+                            .font(.system(size: 14, weight: .bold, design: .monospaced))
+                            .foregroundStyle(accent)
+                    }
+                }
+                if !segments.isEmpty, let accent {
+                    WeightDistributionBar(segments: segments, accent: accent, contentWidth: contentWidth)
                 }
             }
-            .lineLimit(1)
+            .padding(.horizontal, Self.horizontalPadding)
+            .padding(.top, 6)
+            .padding(.bottom, 2)
+        } else {
+            HStack(spacing: 6) {
+                originIcon
+                Text(title)
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .foregroundStyle(Color.primary.opacity(0.85))
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, Self.horizontalPadding)
+            .padding(.top, 2)
         }
-        .padding(.horizontal, 14)
-        .padding(.top, 4)
+    }
+}
+
+/// Fixed-width bar showing each account's positive weight as one proportionally-sized
+/// segment, in the order the caller supplies (render order). Segment fill fades by
+/// position within a group's own channel color, so an account's rank within its pool
+/// is visible at a glance even before reading the numbers.
+struct WeightDistributionBar: View {
+    let segments: [Int]
+    let accent: Color
+    /// The width available to lay segments out against — derived by the caller from
+    /// `StatusBarMenuRenderer.menuWidth` minus its own horizontal padding, so this bar
+    /// never keeps its own copy of the menu width. The menu never resizes live, so this
+    /// is a fixed value rather than one read from a `GeometryReader`.
+    let contentWidth: CGFloat
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    private static let barHeight: CGFloat = 16
+    static let segmentSpacing: CGFloat = 2
+    /// Segments narrower than this hide their number but keep their fill — the digits
+    /// would otherwise overflow a sliver segment.
+    private static let minTextWidth: CGFloat = 18
+
+    /// Proportional width for each segment given its share of `segments`' total, with the
+    /// final segment absorbing rounding so the widths sum exactly to `contentWidth` minus
+    /// inter-segment spacing instead of drifting from it by a pixel or two. Pure so it can
+    /// be tested directly without instantiating a view.
+    static func widths(segments: [Int], contentWidth: CGFloat) -> [CGFloat] {
+        let total = segments.reduce(0, +)
+        guard total > 0 else { return [] }
+        let spacingTotal = segmentSpacing * CGFloat(max(segments.count - 1, 0))
+        let available = contentWidth - spacingTotal
+        var result = segments.map { available * CGFloat($0) / CGFloat(total) }
+        if let last = result.indices.last {
+            let consumed = result[..<last].reduce(0, +)
+            result[last] = available - consumed
+        }
+        return result
+    }
+
+    private var widths: [CGFloat] {
+        Self.widths(segments: segments, contentWidth: contentWidth)
+    }
+
+    var body: some View {
+        HStack(spacing: Self.segmentSpacing) {
+            ForEach(segments.indices, id: \.self) { index in
+                segment(index: index, weight: segments[index], width: widths[index])
+            }
+        }
+        .frame(height: Self.barHeight)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(distributionAccessibilityLabel)
+    }
+
+    private func segment(index: Int, weight: Int, width: CGFloat) -> some View {
+        let isDark = colorScheme == .dark
+        let opacity = isDark
+            ? max(0.4, 1 - 0.16 * Double(index))
+            : max(0.10, 0.22 - 0.03 * Double(index))
+        let textColor = isDark ? MenuBarPalette.segmentDarkText : accent
+
+        return RoundedRectangle(cornerRadius: 4)
+            .fill(accent.opacity(opacity))
+            .frame(width: max(width, 0), height: Self.barHeight)
+            .overlay(
+                Group {
+                    if width >= Self.minTextWidth {
+                        Text(String(weight))
+                            .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                            .foregroundStyle(textColor)
+                    }
+                }
+            )
+    }
+
+    private var distributionAccessibilityLabel: String {
+        let joined = segments.map(String.init).joined(separator: ", ")
+        return String(format: "menu.weight.distribution".localized(), joined)
     }
 }
 
@@ -666,6 +844,10 @@ private struct MenuAccountCardView: View {
     let isActiveInIDE: Bool
     let isRefreshing: Bool
     let canRefresh: Bool
+    /// This card's group's channel color, when its group is multi-account and this
+    /// card should show its own "权重 N" — `nil` hides the account weight entirely
+    /// (single-account group), independent of whether `data.routingWeight` exists.
+    let accountWeightAccent: Color?
     let settings: StatusBarMenuDisplaySettings
     let onRefresh: () -> Void
     let onUseAccount: (() -> Void)?
@@ -678,32 +860,33 @@ private struct MenuAccountCardView: View {
         email.masked(if: settings.hideSensitiveInfo)
     }
     
-    // Modern Tier Badge Config
-    private var tierConfig: (name: String, bgColor: Color, textColor: Color)? {
+    /// Tier/plan badge name — every tier now renders in the same neutral outlined
+    /// style (§4 of the A4 handoff), so this only needs the display name, not a
+    /// per-tier color.
+    private var tierName: String? {
         if let info = subscriptionInfo {
             let tierId = info.tierId.lowercased()
             let tierName = info.tierDisplayName.lowercased()
-            
+
             if tierId.contains("ultra") || tierName.contains("ultra") {
-                return ("Ultra", .orange.opacity(0.15), .orange)
+                return "Ultra"
             }
             if tierId.contains("pro") || tierName.contains("pro") {
-                return ("Pro", .blue.opacity(0.15), .blue)
+                return "Pro"
             }
             if tierId.contains("standard") || tierId.contains("free") ||
                tierName.contains("standard") || tierName.contains("free") {
-                return ("Free", .secondary.opacity(0.1), .secondary)
+                return "Free"
             }
-            return (info.tierDisplayName, .secondary.opacity(0.1), .secondary)
+            return info.tierDisplayName
         }
-        
+
         if provider == .codex, let planName = codexPlanDisplayName(data.planType) {
-            let config = planConfig(for: planName)
-            return (planName, config.bgColor, config.textColor)
+            return neutralPlanName(for: planName)
         }
 
         guard let planName = data.planDisplayName else { return nil }
-        return planConfig(for: planName)
+        return neutralPlanName(for: planName)
     }
 
     private func codexPlanDisplayName(_ raw: String?) -> String? {
@@ -741,32 +924,18 @@ private struct MenuAccountCardView: View {
         return display.isEmpty ? trimmed : display
     }
     
-    private func planConfig(for planName: String) -> (name: String, bgColor: Color, textColor: Color) {
+    private func neutralPlanName(for planName: String) -> String {
         let lowercased = planName.lowercased()
-        
-        if lowercased.contains("ultra") {
-            return ("Ultra", .orange.opacity(0.15), .orange)
-        }
-        if lowercased.contains("pro") {
-            return ("Pro", .blue.opacity(0.15), .blue)
-        }
-        if lowercased.contains("plus") {
-            return ("Plus", .blue.opacity(0.15), .blue)
-        }
-        if lowercased.contains("team") {
-            return ("Team", .orange.opacity(0.15), .orange)
-        }
-        if lowercased.contains("enterprise") {
-            return ("Enterprise", .red.opacity(0.15), .red)
-        }
-        if lowercased.contains("business") {
-            return ("Business", .red.opacity(0.15), .red)
-        }
-        if lowercased.contains("free") || lowercased.contains("standard") {
-            return ("Free", .secondary.opacity(0.1), .secondary)
-        }
-        
-        return (planName, .secondary.opacity(0.1), .secondary)
+
+        if lowercased.contains("ultra") { return "Ultra" }
+        if lowercased.contains("pro") { return "Pro" }
+        if lowercased.contains("plus") { return "Plus" }
+        if lowercased.contains("team") { return "Team" }
+        if lowercased.contains("enterprise") { return "Enterprise" }
+        if lowercased.contains("business") { return "Business" }
+        if lowercased.contains("free") || lowercased.contains("standard") { return "Free" }
+
+        return planName
     }
     
     private var isAntigravity: Bool {
@@ -833,11 +1002,11 @@ private struct MenuAccountCardView: View {
     private var availabilityMarker: (icon: String, label: String, color: Color)? {
         switch data.availabilityStatus {
         case .authInvalid:
-            return ("exclamationmark.triangle.fill", "quota.account.oauthInvalid".localized(), .red)
+            return ("exclamationmark.triangle.fill", "quota.account.oauthInvalid".localized(), MenuBarPalette.quotaDanger)
         case .frozen:
             return ("lock.fill", "quota.account.frozen".localized(), Self.frozenColor)
         case .cooling:
-            return ("clock.fill", "quota.account.cooling".localized(), .yellow)
+            return ("clock.fill", "quota.account.cooling".localized(), MenuBarPalette.quotaWarning)
         case .sessionExhausted, .weeklyExhausted, .sessionAndWeeklyExhausted:
             // Rendered by `exhaustionBadge` instead — a distinct hourglass/countdown
             // shape, not this icon+label capsule.
@@ -973,10 +1142,10 @@ private struct MenuAccountCardView: View {
                             .lineLimit(1)
                             .fixedSize(horizontal: true, vertical: false)
                     }
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(MenuBarPalette.quotaWarning)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 3)
-                    .background(Color.orange.opacity(0.15))
+                    .background(MenuBarPalette.quotaWarning.opacity(0.15))
                     .clipShape(Capsule())
                     .menuNativeTooltip(badge.tooltip)
                     .accessibilityElement(children: .ignore)
@@ -1000,14 +1169,19 @@ private struct MenuAccountCardView: View {
                 .clipShape(Capsule())
             }
 
-            // Tier Badge
-            if let config = tierConfig {
-                Text(config.name)
+            // Tier Badge — neutral outlined style for every tier/plan (§4), so the
+            // badge never competes with the green/amber/coral quota-state colors or a
+            // channel color.
+            if let tierName {
+                Text(tierName)
                     .font(.system(size: 10, weight: .semibold, design: .rounded))
-                    .foregroundStyle(config.textColor)
+                    .foregroundStyle(.secondary)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 3)
-                    .background(config.bgColor)
+                    .overlay(
+                        Capsule()
+                            .strokeBorder(Color.primary.opacity(0.16), lineWidth: 1)
+                    )
                     .clipShape(Capsule())
             }
             
@@ -1173,13 +1347,14 @@ private struct MenuAccountCardView: View {
     /// Account weight (when available) plus the "N分钟前" stamp, 8pt apart. `if let`
     /// (no `else`) around the weight label contributes no spacing when it is hidden —
     /// the same pattern `headerSection`'s own optional badges already rely on — so a
-    /// card with no routing-weight reading keeps today's unchanged footer layout.
+    /// single-account group (`accountWeightAccent == nil`) keeps today's unchanged
+    /// footer layout.
     private var footerTrailingGroup: some View {
         HStack(spacing: 8) {
-            if let accountWeightText {
+            if let accountWeightAccent, let accountWeightText {
                 Group {
                     if (data.routingWeight?.accountWeight ?? 0) > 0 {
-                        Text(accountWeightText).foregroundStyle(Color.blue)
+                        Text(accountWeightText).foregroundStyle(accountWeightAccent)
                     } else {
                         Text(accountWeightText).foregroundStyle(.tertiary)
                     }
@@ -1196,7 +1371,8 @@ private struct MenuAccountCardView: View {
     /// (hidden entirely, never a placeholder) when the cache has no weight for this
     /// account, the pool errored, or the source isn't cache-enabled. A genuine `0`
     /// reading still renders (in a dimmer color), since it's a real value, not a
-    /// missing one.
+    /// missing one. Gated on `accountWeightAccent` in `footerTrailingGroup` above, so a
+    /// single-account group never shows this even when the reading exists.
     private var accountWeightText: String? {
         guard let weight = data.routingWeight else { return nil }
         return String(format: "menu.weight.account".localized(), weight.accountWeight)
@@ -2097,13 +2273,13 @@ private func menuStatusColor(remainingPercent: Double, displayMode: QuotaDisplay
     let checkValue = displayMode == .used ? usedPercent : remainingPercent
 
     if displayMode == .used {
-        if checkValue < 70 { return .green }
-        if checkValue < 90 { return .yellow }
-        return .red
+        if checkValue < 70 { return MenuBarPalette.quotaNormal }
+        if checkValue < 90 { return MenuBarPalette.quotaWarning }
+        return MenuBarPalette.quotaDanger
     } else {
-        if checkValue > 50 { return .green }
-        if checkValue > 20 { return .orange }
-        return .red
+        if checkValue > 50 { return MenuBarPalette.quotaNormal }
+        if checkValue > 20 { return MenuBarPalette.quotaWarning }
+        return MenuBarPalette.quotaDanger
     }
 }
 
