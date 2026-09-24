@@ -85,7 +85,12 @@ final class StatusBarMenuRenderer {
                         || providerSnapshot.groups.first?.origin != .local
                     for group in providerSnapshot.groups {
                         if showsSourceSubheaders {
-                            menu.addItem(viewItem(for: MenuAccountGroupSubheader(origin: group.origin)))
+                            let channelWeight = QuotaPolicy.reconciledChannelWeight(
+                                from: group.accounts.compactMap(\.quota.routingWeight)
+                            )
+                            menu.addItem(viewItem(for: MenuAccountGroupSubheader(
+                                origin: group.origin, channelWeight: channelWeight
+                            )))
                         }
                         for account in group.accounts {
                             menu.addItem(buildAccountCardItem(account))
@@ -346,6 +351,11 @@ private struct MenuProviderSectionHeader: View {
 /// once more than one source is visible for the same provider.
 private struct MenuAccountGroupSubheader: View {
     let origin: StatusBarMenuAccountOrigin
+    /// This pool's channel weight, reconciled across the group's own accounts by
+    /// `QuotaPolicy.reconciledChannelWeight` — `nil` (never a placeholder 0) when no
+    /// account in this group carries a routing-weight reading, or the readings at the
+    /// latest timestamp disagree.
+    let channelWeight: Int?
 
     private var title: String {
         switch origin {
@@ -361,10 +371,21 @@ private struct MenuAccountGroupSubheader: View {
             Image(systemName: origin == .local ? "desktopcomputer" : "network")
                 .font(.system(size: 9, weight: .medium))
                 .foregroundStyle(.tertiary)
-            Text(title)
-                .font(.system(size: 9.5, weight: .medium, design: .rounded))
-                .foregroundStyle(.tertiary)
-                .lineLimit(1)
+            // Source name in `.tertiary`, plus `· 渠道权重 N` in `.secondary` (one
+            // level up from the source name) when a reconciled channel weight is
+            // available — two adjacent `Text` views rather than one concatenated
+            // `Text`, so each segment's own color/style is unambiguous.
+            HStack(spacing: 0) {
+                Text(title)
+                    .font(.system(size: 9.5, weight: .medium, design: .rounded))
+                    .foregroundStyle(.tertiary)
+                if let channelWeight {
+                    Text(" · " + String(format: "menu.weight.channel".localized(), channelWeight))
+                        .font(.system(size: 9.5, weight: .medium, design: .rounded))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .lineLimit(1)
         }
         .padding(.horizontal, 14)
         .padding(.top, 4)
@@ -802,7 +823,7 @@ private struct MenuAccountCardView: View {
     /// card's own `data` — never a separate card or badge.
     private var codexResetCreditsText: String? {
         guard provider == .codex else { return nil }
-        return data.codexResetCreditSummary?.formattedSummary
+        return data.codexResetCreditSummary?.compactFormattedSummary
     }
 
     private static let frozenColor = Color(red: 0.93, green: 0.35, blue: 0.13)
@@ -817,6 +838,10 @@ private struct MenuAccountCardView: View {
             return ("lock.fill", "quota.account.frozen".localized(), Self.frozenColor)
         case .cooling:
             return ("clock.fill", "quota.account.cooling".localized(), .yellow)
+        case .sessionExhausted, .weeklyExhausted, .sessionAndWeeklyExhausted:
+            // Rendered by `exhaustionBadge` instead — a distinct hourglass/countdown
+            // shape, not this icon+label capsule.
+            return nil
         case nil:
             return nil
         }
@@ -825,16 +850,45 @@ private struct MenuAccountCardView: View {
     /// "3h32m 后解封"/"3h48m 后恢复"-style estimate, or the explicit "time unknown"
     /// fallback when this account's last-known-good reading carries no future reset
     /// time to count down to (`data.formattedAvailabilityCountdown`) — never a
-    /// fabricated guess. `nil` for a normal, currently-usable account.
+    /// fabricated guess. `nil` for a normal, currently-usable account, and for the
+    /// exhausted-metric statuses, which get their own `exhaustionBadge` tooltip
+    /// instead of this frozen/cooling-only line.
     private var availabilityCountdownText: String? {
         guard let status = data.availabilityStatus else { return nil }
-        if status == .authInvalid { return nil }
+        guard status == .frozen || status == .cooling else { return nil }
         if let countdown = data.formattedAvailabilityCountdown {
             let key = status == .frozen ? "quota.account.frozenCountdown" : "quota.account.coolingCountdown"
             return String(format: key.localized(), countdown)
         }
         let key = status == .frozen ? "quota.account.frozenUnknown" : "quota.account.coolingUnknown"
         return key.localized()
+    }
+
+    /// Badge/tooltip/accessibility text for a CPA Codex account whose `codex-session`
+    /// and/or `codex-weekly` quota metric has reached 0% — hourglass + compact
+    /// countdown to whichever reset(s) still apply (the later of the two when both
+    /// windows are exhausted). Scoped to `provider == .codex`: the underlying
+    /// `codex-session`/`codex-weekly` metric names are Codex-only, but this guard
+    /// keeps the new badge from ever appearing on another provider's card even if
+    /// that ever changed. `nil` for every other status.
+    private var exhaustionBadge: (countdownText: String, tooltip: String, accessibilityText: String)? {
+        guard provider == .codex else { return nil }
+        let statusLabelKey: String
+        switch data.availabilityStatus {
+        case .sessionExhausted: statusLabelKey = "quota.account.sessionExhausted"
+        case .weeklyExhausted: statusLabelKey = "quota.account.weeklyExhausted"
+        case .sessionAndWeeklyExhausted: statusLabelKey = "quota.account.sessionAndWeeklyExhausted"
+        default: return nil
+        }
+        let statusLabel = statusLabelKey.localized()
+        let countdownText = data.formattedQuotaExhaustionCountdown ?? "—"
+        let tooltip: String
+        if let absolute = data.formattedQuotaExhaustionAbsolute {
+            tooltip = String(format: "quota.account.recoversAt".localized(), statusLabel, absolute)
+        } else {
+            tooltip = statusLabel + " · " + "quota.account.quotaResetUnknown".localized()
+        }
+        return (countdownText, tooltip, tooltip)
     }
 
     var body: some View {
@@ -900,7 +954,36 @@ private struct MenuAccountCardView: View {
             .buttonStyle(.plain)
             .disabled(!canRefresh)
             .help("action.refreshQuota".localized())
-            
+
+            // Exhausted-window countdown badge — same slot as the freeze/cooldown
+            // marker below (the two are mutually exclusive via `data.availabilityStatus`).
+            // Never wraps: the email above gives way first at narrow widths.
+            if let initialExhaustionBadge = exhaustionBadge {
+                // The countdown text/tooltip are derived from `Date()` at read time, but
+                // this view has no state of its own driving a re-render while the menu
+                // stays open — `TimelineView` re-reads `exhaustionBadge` every minute so
+                // the badge doesn't freeze at whatever value it first rendered with.
+                TimelineView(.periodic(from: .now, by: 60)) { _ in
+                    let badge = exhaustionBadge ?? initialExhaustionBadge
+                    HStack(spacing: 3) {
+                        Image(systemName: "hourglass.bottomhalf.filled")
+                            .font(.system(size: 9, weight: .semibold))
+                        Text(badge.countdownText)
+                            .font(.system(size: 10, weight: .semibold, design: .rounded))
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Color.orange.opacity(0.15))
+                    .clipShape(Capsule())
+                    .menuNativeTooltip(badge.tooltip)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(badge.accessibilityText)
+                }
+            }
+
             // Freeze/cooldown status marker — placed left of the tier badge, never
             // shown for a normal, currently-usable account.
             if let marker = availabilityMarker {
@@ -1061,7 +1144,7 @@ private struct MenuAccountCardView: View {
                     resetCreditsLabel(codexResetCreditsText)
                         .lineLimit(1)
                     Spacer(minLength: 12)
-                    lastUpdatedLabel
+                    footerTrailingGroup
                 }
 
                 VStack(alignment: .leading, spacing: 4) {
@@ -1069,14 +1152,14 @@ private struct MenuAccountCardView: View {
                         .lineLimit(2)
                     HStack(spacing: 0) {
                         Spacer(minLength: 0)
-                        lastUpdatedLabel
+                        footerTrailingGroup
                     }
                 }
             }
         } else {
             HStack(spacing: 0) {
                 Spacer(minLength: 0)
-                lastUpdatedLabel
+                footerTrailingGroup
             }
         }
     }
@@ -1085,6 +1168,38 @@ private struct MenuAccountCardView: View {
         Text(text)
             .font(.system(size: 10, design: .rounded))
             .foregroundStyle(.secondary)
+    }
+
+    /// Account weight (when available) plus the "N分钟前" stamp, 8pt apart. `if let`
+    /// (no `else`) around the weight label contributes no spacing when it is hidden —
+    /// the same pattern `headerSection`'s own optional badges already rely on — so a
+    /// card with no routing-weight reading keeps today's unchanged footer layout.
+    private var footerTrailingGroup: some View {
+        HStack(spacing: 8) {
+            if let accountWeightText {
+                Group {
+                    if (data.routingWeight?.accountWeight ?? 0) > 0 {
+                        Text(accountWeightText).foregroundStyle(Color.blue)
+                    } else {
+                        Text(accountWeightText).foregroundStyle(.tertiary)
+                    }
+                }
+                .font(.system(size: 10, weight: .semibold, design: .rounded))
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+            }
+            lastUpdatedLabel
+        }
+    }
+
+    /// `menu.weight.account` text for this card's own `data.routingWeight` — `nil`
+    /// (hidden entirely, never a placeholder) when the cache has no weight for this
+    /// account, the pool errored, or the source isn't cache-enabled. A genuine `0`
+    /// reading still renders (in a dimmer color), since it's a real value, not a
+    /// missing one.
+    private var accountWeightText: String? {
+        guard let weight = data.routingWeight else { return nil }
+        return String(format: "menu.weight.account".localized(), weight.accountWeight)
     }
 
     private var lastUpdatedLabel: some View {
@@ -1947,13 +2062,13 @@ private struct ModelBadgeData: Identifiable {
         }
     }
 
-    /// Full absolute reset datetime (fixed Asia/Tokyo, 24-hour) shown below the mini
-    /// panel's progress bar, alongside — never instead of — `formattedResetTime`'s
-    /// relative countdown. `nil` (never a fabricated date) when `resetTime` is
-    /// missing/unparseable.
+    /// Compact reset datetime (fixed Asia/Tokyo, no year/`JST` suffix — this dropdown
+    /// card is the only caller) shown below the mini panel's progress bar, alongside
+    /// — never instead of — `formattedResetTime`'s relative countdown. `nil` (never a
+    /// fabricated date) when `resetTime` is missing/unparseable.
     var formattedAbsoluteResetTime: String? {
         guard let resetTime else { return nil }
-        return QuotaDateFormatting.absoluteJST(resetTime)
+        return QuotaDateFormatting.compactJST(resetTime)
     }
 }
 
@@ -2166,9 +2281,10 @@ private struct CardGridLayout: View {
                             displayMode: displayMode
                         )
 
-                        // Full absolute reset datetime, always JST — allowed to wrap to
-                        // a second line at the dropdown's native narrow width rather
-                        // than truncate, so the exact date/time is never cut off.
+                        // Compact absolute reset datetime, always JST (no year/JST
+                        // suffix — this card is the dropdown-only exception) —
+                        // allowed to wrap to a second line at the dropdown's native
+                        // narrow width rather than truncate.
                         if let absoluteReset = model.formattedAbsoluteResetTime {
                             Text(absoluteReset)
                                 .font(.system(size: 8, design: .rounded))

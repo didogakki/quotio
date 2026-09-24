@@ -78,6 +78,50 @@ final class RemoteQuotaSourceCoordinatorTests: XCTestCase {
         XCTAssertEqual(state.failureCounts["s1"], 1, "a partial failure must still count toward the hide threshold")
     }
 
+    /// Regression: a routing-weight reading is this round's own signal, not a sticky
+    /// fact about the account. An account retained across a partial-failure round (its
+    /// own request failed, so the merge keeps its last-known-good quota) must not go on
+    /// showing a previous round's routing weight as if it were still current — it must
+    /// be cleared to `nil` until a fresh result reports one again, while every other
+    /// field on the retained quota (here, its usage percentage) stays untouched.
+    func testPartialFailureClearsRoutingWeightOnRetainedQuotaButKeepsEverythingElse() async {
+        let fetcher = StubFetcher()
+        let coordinator = makeCoordinator(fetcher: fetcher)
+        let source = RemoteQuotaSourceConfig(id: "s1", name: "Pool", baseURL: "https://a.test")
+        await coordinator.addSource(source, managementKey: "k")
+        let firstWeight = AccountRoutingWeight(
+            accountWeight: 40, channelWeight: 80, updatedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        var proWithWeight = Self.quota(70)
+        proWithWeight.routingWeight = firstWeight
+        await fetcher.enqueue(
+            .success([.codex: ["pro": proWithWeight, "team": Self.quota(20)]]),
+            for: "s1"
+        )
+        await coordinator.refresh(sourceId: "s1")
+
+        var state = await coordinator.state
+        XCTAssertEqual(state.poolQuotas["s1"]?[.codex]?["pro"]?.routingWeight, firstWeight)
+
+        // Second round: only "team" refreshes (a fresh result with no routing weight of
+        // its own); "pro"'s own request failed, so it keeps its last-known-good reading
+        // via the merge — but its stale routing weight from round one must be cleared.
+        await fetcher.enqueue(
+            .partial(quotasByProviderAndAccount: [.codex: ["team": Self.quota(25)]]),
+            for: "s1"
+        )
+        await coordinator.refresh(sourceId: "s1", isAutomatic: true)
+
+        state = await coordinator.state
+        XCTAssertNil(
+            state.poolQuotas["s1"]?[.codex]?["pro"]?.routingWeight,
+            "a routing weight from a round that didn't refresh this account must not linger")
+        XCTAssertEqual(
+            state.poolQuotas["s1"]?[.codex]?["pro"]?.models.first?.percentage, 70,
+            "clearing the stale routing weight must not touch the retained quota's own reading")
+        XCTAssertEqual(state.poolQuotas["s1"]?[.codex]?["team"]?.models.first?.percentage, 25)
+    }
+
     func testAuthInvalidIssuePersistsAcrossTransientFailureAndClearsOnlyOnSuccess() async {
         let fetcher = StubFetcher()
         let coordinator = makeCoordinator(fetcher: fetcher)

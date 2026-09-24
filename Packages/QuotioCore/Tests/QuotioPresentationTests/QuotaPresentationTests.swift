@@ -42,6 +42,16 @@ final class CodexResetCreditSummaryFormattingTests: XCTestCase {
         )
         XCTAssertEqual(summary.formattedSummary, expected)
     }
+
+    /// The menu-dropdown-only variant drops the year/`JST` suffix via `compactJST`,
+    /// unlike `formattedSummary`'s full `absoluteJST` date.
+    func testCompactFormattedSummaryUsesCompactJSTDate() {
+        let date = Date(timeIntervalSince1970: 1_789_975_320)
+        let summary = CodexResetCreditSummary(availableCount: 2, nearestExpiryAt: date)
+
+        let expected = String(format: "providers.codex.resetCredits".localizedStatic(), 2, "09-21 16:22")
+        XCTAssertEqual(summary.compactFormattedSummary, expected)
+    }
 }
 
 final class ProviderQuotaAvailabilityStatusTests: XCTestCase {
@@ -84,6 +94,105 @@ final class ProviderQuotaAvailabilityStatusTests: XCTestCase {
     func testAvailabilityStatusIsNilWhenTemporarilyUnavailableIsExplicitlyFalse() {
         let quota = ProviderQuota(isTemporarilyUnavailable: false)
         XCTAssertNil(quota.availabilityStatus)
+    }
+
+    // MARK: - Codex session/weekly exhaustion
+
+    func testAvailabilityStatusIsSessionExhaustedWhenCodexSessionMetricIsZero() {
+        let quota = ProviderQuota(models: [
+            QuotaMetric(name: "codex-session", percentage: 0, resetTime: ""),
+            QuotaMetric(name: "codex-weekly", percentage: 40, resetTime: ""),
+        ])
+        XCTAssertEqual(quota.availabilityStatus, .sessionExhausted)
+    }
+
+    func testAvailabilityStatusIsWeeklyExhaustedWhenCodexWeeklyMetricIsZero() {
+        let quota = ProviderQuota(models: [
+            QuotaMetric(name: "codex-session", percentage: 40, resetTime: ""),
+            QuotaMetric(name: "codex-weekly", percentage: 0, resetTime: ""),
+        ])
+        XCTAssertEqual(quota.availabilityStatus, .weeklyExhausted)
+    }
+
+    func testAvailabilityStatusIsSessionAndWeeklyExhaustedWhenBothMetricsAreZero() {
+        let quota = ProviderQuota(models: [
+            QuotaMetric(name: "codex-session", percentage: 0, resetTime: ""),
+            QuotaMetric(name: "codex-weekly", percentage: 0, resetTime: ""),
+        ])
+        XCTAssertEqual(quota.availabilityStatus, .sessionAndWeeklyExhausted)
+    }
+
+    /// A Claude account's own analogous "five-hour-session" metric must never trigger
+    /// the Codex-only exhausted status — the metric-name match is deliberately narrow.
+    func testAvailabilityStatusIgnoresNonCodexMetricNamesWhenExhausted() {
+        let quota = ProviderQuota(models: [QuotaMetric(name: "five-hour-session", percentage: 0, resetTime: "")])
+        XCTAssertNil(quota.availabilityStatus)
+    }
+
+    /// A rejected credential or a cooling account is the more severe condition, so it
+    /// must win over an exhausted metric reading.
+    func testAvailabilityStatusPrefersFrozenAndCoolingOverExhausted() {
+        let frozenAndExhausted = ProviderQuota(
+            models: [QuotaMetric(name: "codex-session", percentage: 0, resetTime: "")],
+            isForbidden: true
+        )
+        XCTAssertEqual(frozenAndExhausted.availabilityStatus, .frozen)
+
+        let coolingAndExhausted = ProviderQuota(
+            models: [QuotaMetric(name: "codex-weekly", percentage: 0, resetTime: "")],
+            isTemporarilyUnavailable: true
+        )
+        XCTAssertEqual(coolingAndExhausted.availabilityStatus, .cooling)
+    }
+}
+
+final class ProviderQuotaExhaustionCountdownTests: XCTestCase {
+    func testRecoveryDateUsesTheExhaustedMetricsOwnResetTime() {
+        let resetTime = ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: 2_000))
+        let quota = ProviderQuota(models: [QuotaMetric(name: "codex-session", percentage: 0, resetTime: resetTime)])
+
+        XCTAssertEqual(quota.quotaExhaustionRecoveryDate, Date(timeIntervalSince1970: 2_000))
+    }
+
+    /// When both windows are exhausted, the account only reads as usable again once
+    /// neither reset has passed — so the badge must count down to the *later* of the
+    /// two resets, never the earlier one.
+    func testRecoveryDateIsTheLaterResetWhenBothWindowsAreExhausted() {
+        let earlier = ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: 1_000))
+        let later = ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: 5_000))
+        let quota = ProviderQuota(models: [
+            QuotaMetric(name: "codex-session", percentage: 0, resetTime: earlier),
+            QuotaMetric(name: "codex-weekly", percentage: 0, resetTime: later),
+        ])
+
+        XCTAssertEqual(quota.quotaExhaustionRecoveryDate, Date(timeIntervalSince1970: 5_000))
+    }
+
+    /// Never a fabricated fallback: an exhausted metric with no parseable `resetTime`
+    /// leaves the recovery date/countdown/absolute text all `nil`.
+    func testRecoveryDateIsNilWhenTheExhaustedMetricsResetTimeIsUnparseable() {
+        let quota = ProviderQuota(models: [QuotaMetric(name: "codex-session", percentage: 0, resetTime: "")])
+
+        XCTAssertNil(quota.quotaExhaustionRecoveryDate)
+        XCTAssertNil(quota.formattedQuotaExhaustionCountdown)
+        XCTAssertNil(quota.formattedQuotaExhaustionAbsolute)
+    }
+
+    /// Both windows exhausted, but only one reset is parseable: this must never fall
+    /// back to the one date it *could* parse — that would report the account as
+    /// available again the moment that single window resets, while the other exhausted
+    /// window (whose real reset is simply unknown) is silently ignored. Both must
+    /// resolve before either is trusted.
+    func testRecoveryDateIsNilWhenOnlyOneOfBothExhaustedWindowsResetTimeIsParseable() {
+        let parseable = ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: 5_000))
+        let quota = ProviderQuota(models: [
+            QuotaMetric(name: "codex-session", percentage: 0, resetTime: ""),
+            QuotaMetric(name: "codex-weekly", percentage: 0, resetTime: parseable),
+        ])
+
+        XCTAssertNil(quota.quotaExhaustionRecoveryDate)
+        XCTAssertNil(quota.formattedQuotaExhaustionCountdown)
+        XCTAssertNil(quota.formattedQuotaExhaustionAbsolute)
     }
 }
 

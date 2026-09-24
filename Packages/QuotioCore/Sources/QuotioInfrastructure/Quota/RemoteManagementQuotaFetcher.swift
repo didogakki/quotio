@@ -319,6 +319,10 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
         var fetchedAt: Date?
         var remoteAccountIssue: RemoteQuotaAccountIssue?
         var canClearAccountIssue: Bool
+        /// Only ever set on the quota-cache path (see `performQuotaCall`) — the
+        /// direct `/api-call` pass-through has no cache layer to compute a routing
+        /// weight from, so it always leaves this `nil`.
+        var routingWeights: AccountRoutingWeight? = nil
     }
 
     private func fetchQuota(
@@ -410,6 +414,7 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
                 quota.analytics = CodexResetCreditInventoryFetcher.merge(resetCredits.analytics, into: quota.analytics)
                 quota.codexResetCreditSummary = resetCredits.summary
             }
+            quota.routingWeight = call.routingWeights
             return QuotaFetchAttempt(
                 quota: quota, headerRecoveryDate: headerRecoveryDate, remoteAccountIssue: call.remoteAccountIssue,
                 accountIssueWasObserved: call.remoteAccountIssue != nil || call.canClearAccountIssue
@@ -496,7 +501,14 @@ public struct RemoteManagementQuotaFetcher: RemoteQuotaSourceFetching {
                     result: response.result,
                     fetchedAt: Date(timeIntervalSince1970: response.fetchedAt),
                     remoteAccountIssue: response.failure?.remoteAccountIssue,
-                    canClearAccountIssue: !response.stale && 200...299 ~= response.result.statusCode
+                    canClearAccountIssue: !response.stale && 200...299 ~= response.result.statusCode,
+                    routingWeights: response.routingWeights.map {
+                        AccountRoutingWeight(
+                            accountWeight: $0.account,
+                            channelWeight: $0.channel,
+                            updatedAt: Date(timeIntervalSince1970: $0.updatedAt)
+                        )
+                    }
                 )
             } catch QuotaCacheError.authInvalid(_) {
                 return QuotaCallResult(

@@ -51,4 +51,23 @@ final class QuotaDateFormattingTests: XCTestCase {
         let in12m = now.addingTimeInterval(12 * 60)
         XCTAssertEqual(QuotaDateFormatting.relativeCompact(to: in12m, from: now), "12m")
     }
+
+    /// Drops the year and `JST` suffix that `absoluteJST` carries — the dropdown-only
+    /// compact companion.
+    func testCompactJSTFormatsWithoutYearOrSuffix() {
+        // 2026-09-21T07:22:00Z == 2026-09-21 16:22 JST (UTC+9).
+        let date = Date(timeIntervalSince1970: 1_789_975_320)
+        XCTAssertEqual(QuotaDateFormatting.compactJST(date), "09-21 16:22")
+    }
+
+    func testCompactJSTFromISO8601StringParsesStandardAndFractionalForms() {
+        XCTAssertEqual(QuotaDateFormatting.compactJST("2026-09-21T07:22:00Z"), "09-21 16:22")
+        XCTAssertEqual(QuotaDateFormatting.compactJST("2026-09-21T07:22:00.500Z"), "09-21 16:22")
+    }
+
+    /// Never fabricate a date for missing/unparseable input.
+    func testCompactJSTReturnsNilForEmptyOrInvalidInput() {
+        XCTAssertNil(QuotaDateFormatting.compactJST(""))
+        XCTAssertNil(QuotaDateFormatting.compactJST("not-a-date"))
+    }
 }

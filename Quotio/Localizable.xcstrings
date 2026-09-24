@@ -9153,6 +9153,24 @@
         }
       }
     },
+    "menu.weight.account" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Weight %d" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Poids %d" } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Trọng số %d" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "权重 %d" } }
+      }
+    },
+    "menu.weight.channel" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Channel weight %d" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Poids du canal %d" } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Trọng số kênh %d" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "渠道权重 %d" } }
+      }
+    },
     "menubar.hideAccounts" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -13038,6 +13056,51 @@
             "value" : "解封时间未知"
           }
         }
+      }
+    },
+    "quota.account.recoversAt" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "%1$@ · resets %2$@" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "%1$@ · réinitialisation %2$@" } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "%1$@ · đặt lại lúc %2$@" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "%1$@ · %2$@ 恢复" } }
+      }
+    },
+    "quota.account.sessionExhausted" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Session quota exhausted" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Quota de session épuisé" } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Đã hết hạn ngạch phiên" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "会话额度已用尽" } }
+      }
+    },
+    "quota.account.weeklyExhausted" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Weekly quota exhausted" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Quota hebdomadaire épuisé" } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Đã hết hạn ngạch hàng tuần" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "周额度已用尽" } }
+      }
+    },
+    "quota.account.sessionAndWeeklyExhausted" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Session and weekly quota exhausted" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Quotas de session et hebdomadaire épuisés" } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Đã hết hạn ngạch phiên và hàng tuần" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "会话和周额度已用尽" } }
+      }
+    },
+    "quota.account.quotaResetUnknown" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Reset time unknown" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Heure de réinitialisation inconnue" } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Không rõ thời gian đặt lại" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "重置时间未知" } }
       }
     },
     "quota.accounts" : {

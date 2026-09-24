@@ -268,9 +268,28 @@ public actor RemoteQuotaSourceCoordinator {
             // still refreshes normally, it just doesn't blank out reset-credit data it
             // simply failed to re-fetch this one time.
             var pools = state.poolQuotas[sourceId] ?? [:]
+            var freshAccountKeysByProvider: [QuotaProvider: Set<String>] = [:]
             for (provider, accountQuotas) in freshQuotas {
+                freshAccountKeysByProvider[provider] = Set(accountQuotas.keys)
                 pools[provider, default: [:]].merge(accountQuotas) { old, new in
                     QuotaPolicy.mergingCodexResetCredits(old: old, new: new)
+                }
+            }
+            // A routing-weight reading is this round's own signal, not a sticky fact
+            // about the account — an account retained above because its own request
+            // failed this round (so it isn't in `freshAccountKeysByProvider`) keeps its
+            // last-known-good quota, but must not go on showing a previous round's
+            // routing weight as if it were still current. Clearing it here (rather than
+            // in the merge closure) also covers the account's very first round in
+            // `pools`, which the merge closure above never even runs for.
+            for provider in Array(pools.keys) {
+                let freshKeys = freshAccountKeysByProvider[provider] ?? []
+                pools[provider] = pools[provider]?.reduce(into: [String: ProviderQuota]()) { stamped, entry in
+                    var quota = entry.value
+                    if !freshKeys.contains(entry.key) {
+                        quota.routingWeight = nil
+                    }
+                    stamped[entry.key] = quota
                 }
             }
             // A frozen account that produced no reading of its own gets an identity-only

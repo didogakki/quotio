@@ -243,24 +243,88 @@ public extension QuotaMetric {
 /// Whether an account currently reads as unusable, for the menu bar's status marker.
 /// `frozen` (the account's own credential was rejected) is distinct from `cooling` (a
 /// remote source's own listing reports the account temporarily unavailable, e.g. a
-/// rate-limit cooldown) — see `ProviderQuota.availabilityStatus`.
+/// rate-limit cooldown) — see `ProviderQuota.availabilityStatus`. The `*Exhausted`
+/// cases are a separate, lower-priority condition: a CPA Codex account's own
+/// `codex-session`/`codex-weekly` quota metric has reached 0%, derived fresh from
+/// `models` every time rather than a persisted server signal.
 public enum QuotaAccountAvailabilityStatus: Equatable, Sendable {
     case authInvalid
     case frozen
     case cooling
+    case sessionExhausted
+    case weeklyExhausted
+    case sessionAndWeeklyExhausted
 }
 
 public extension ProviderQuota {
+    private static let codexSessionMetricName = "codex-session"
+    private static let codexWeeklyMetricName = "codex-weekly"
+
+    private var isCodexSessionExhausted: Bool {
+        models.first(where: { $0.name == Self.codexSessionMetricName })?.percentage == 0
+    }
+
+    private var isCodexWeeklyExhausted: Bool {
+        models.first(where: { $0.name == Self.codexWeeklyMetricName })?.percentage == 0
+    }
+
     /// `frozen` when `isForbidden` (the account's own credential was rejected),
     /// `cooling` when a remote source reports it `isTemporarilyUnavailable` (cooling
-    /// after a rate limit, or otherwise flagged unavailable), `nil` for a normal,
-    /// currently-usable account. `frozen` takes priority when both are set, since a
-    /// rejected credential is the more severe condition.
+    /// after a rate limit, or otherwise flagged unavailable), one of the `*Exhausted`
+    /// cases when a CPA Codex account's own session/weekly quota metric has reached
+    /// 0%, `nil` for a normal, currently-usable account. `frozen`/`cooling` always
+    /// take priority over an exhausted metric reading, since a rejected/cooling
+    /// credential is the more severe condition.
     var availabilityStatus: QuotaAccountAvailabilityStatus? {
         if remoteAccountIssue == .invalidOAuth { return .authInvalid }
         if isForbidden { return .frozen }
         if isTemporarilyUnavailable == true { return .cooling }
-        return nil
+        switch (isCodexSessionExhausted, isCodexWeeklyExhausted) {
+        case (true, true): return .sessionAndWeeklyExhausted
+        case (true, false): return .sessionExhausted
+        case (false, true): return .weeklyExhausted
+        case (false, false): return nil
+        }
+    }
+
+    /// The still-resolvable `codex-session`/`codex-weekly` reset date(s) this
+    /// account's exhausted-window badge should count down to — the later of the two
+    /// when both windows are exhausted, so the account only reads as usable again
+    /// once neither window is still exhausted. `nil` only when the relevant metric's
+    /// `resetTime` is missing/unparseable, never a fabricated fallback.
+    var quotaExhaustionRecoveryDate: Date? {
+        func resetDate(named name: String) -> Date? {
+            guard let metric = models.first(where: { $0.name == name }) else { return nil }
+            return QuotaDateFormatting.parseISO8601(metric.resetTime)
+        }
+        switch availabilityStatus {
+        case .sessionExhausted:
+            return resetDate(named: Self.codexSessionMetricName)
+        case .weeklyExhausted:
+            return resetDate(named: Self.codexWeeklyMetricName)
+        case .sessionAndWeeklyExhausted:
+            guard let sessionDate = resetDate(named: Self.codexSessionMetricName),
+                  let weeklyDate = resetDate(named: Self.codexWeeklyMetricName) else {
+                return nil
+            }
+            return max(sessionDate, weeklyDate)
+        default:
+            return nil
+        }
+    }
+
+    /// Compact "3d0h" countdown to `quotaExhaustionRecoveryDate`, matching the
+    /// reset-time style already shown next to each quota meter in this same menu.
+    /// `nil` only when no real reset date could be resolved.
+    var formattedQuotaExhaustionCountdown: String? {
+        quotaExhaustionRecoveryDate.map { QuotaDateFormatting.relativeCompact(to: $0) }
+    }
+
+    /// Full absolute reset datetime, fixed Asia/Tokyo/24-hour — the auxiliary detail
+    /// shown in the exhausted-window badge's tooltip, never instead of the countdown.
+    /// `nil` under the same condition as `formattedQuotaExhaustionCountdown`.
+    var formattedQuotaExhaustionAbsolute: String? {
+        quotaExhaustionRecoveryDate.map(QuotaDateFormatting.absoluteJST)
     }
 
     /// `availabilityRecoveryDate` when it is still in the future, `nil` otherwise —
@@ -343,6 +407,20 @@ public extension CodexResetCreditSummary {
             return "providers.codex.resetCredits.none".localizedStatic()
         }
         let dateText = nearestExpiryAt.map { QuotaDateFormatting.absoluteJST($0) }
+            ?? "providers.codex.resetCredits.noExpiry".localizedStatic()
+        return String(format: "providers.codex.resetCredits".localizedStatic(), availableCount, dateText)
+    }
+
+    /// Menu-dropdown-only compact variant of `formattedSummary` — same "N reset
+    /// credits · next expiry ..." shape, but the expiry date drops the year/`JST`
+    /// suffix via `QuotaDateFormatting.compactJST`, matching every other reset date
+    /// shown inside the dropdown card. Every other surface keeps using
+    /// `formattedSummary`'s full `absoluteJST` date.
+    var compactFormattedSummary: String {
+        guard availableCount > 0 else {
+            return "providers.codex.resetCredits.none".localizedStatic()
+        }
+        let dateText = nearestExpiryAt.map { QuotaDateFormatting.compactJST($0) }
             ?? "providers.codex.resetCredits.noExpiry".localizedStatic()
         return String(format: "providers.codex.resetCredits".localizedStatic(), availableCount, dateText)
     }

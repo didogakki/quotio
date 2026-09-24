@@ -196,6 +196,55 @@ final class RemoteManagementQuotaFetcherCacheTests: XCTestCase {
     XCTAssertNil(result.quotasByProviderAndAccount[.claude]?["claude-a"]?.planType)
   }
 
+  /// `routing_weights` on a cache-enabled Codex `codex-usage` envelope attaches to the
+  /// resulting `ProviderQuota.routingWeight` — the same round-trip that already fetches
+  /// usage, never a separate request/timer.
+  func testCacheEnabledCodexSourceAttachesOptionalRoutingWeightFromTheSameEnvelope() async throws {
+    let files = [
+      ManagedAuthFile(
+        id: "1", name: "codex-a.json", provider: "codex", status: "ready", disabled: false,
+        unavailable: false, authIndex: "codex-a")
+    ]
+    let api = CacheTestProxyManagementAPI(authFiles: files, urlResponses: [:])
+    let envelope = #"{"result":{"status_code":200,"header":{},"body":"{\"plan_type\":\"plus\",\"rate_limit\":{\"primary_window\":{\"used_percent\":25,\"limit_window_seconds\":18000}}}"},"fetched_at":1700000000,"stale":false,"last_attempt":1700000000,"next_retry_at":null,"routing_weights":{"account":33,"channel":75,"updated_at":1700000500}}"#
+    let fetcher = RemoteManagementQuotaFetcher(
+      apiFactory: CacheTestProxyManagementAPIFactory(api: api),
+      cacheClient: QuotaCacheClient(session: CacheTestHTTPSession(statusCode: 200, body: Data(envelope.utf8)))
+    )
+    let source = RemoteQuotaSourceConfig(
+      name: "Pool", baseURL: "https://proxy.test", quotaCacheBaseURL: "https://proxy.test/quota-cache/v1/plus")
+
+    let result = try await fetcher.fetchPool(source, managementKey: "k")
+
+    let routingWeight = result.quotasByProviderAndAccount[.codex]?["codex-a"]?.routingWeight
+    XCTAssertEqual(routingWeight?.accountWeight, 33)
+    XCTAssertEqual(routingWeight?.channelWeight, 75)
+    XCTAssertEqual(routingWeight?.updatedAt, Date(timeIntervalSince1970: 1_700_000_500))
+  }
+
+  /// A cache build that doesn't compute weights at all (no `routing_weights` key)
+  /// must never break the usage reading — the field is purely additive.
+  func testCacheEnabledCodexSourceLeavesRoutingWeightNilWhenAbsentFromTheEnvelope() async throws {
+    let files = [
+      ManagedAuthFile(
+        id: "1", name: "codex-a.json", provider: "codex", status: "ready", disabled: false,
+        unavailable: false, authIndex: "codex-a")
+    ]
+    let api = CacheTestProxyManagementAPI(authFiles: files, urlResponses: [:])
+    let envelope = #"{"result":{"status_code":200,"header":{},"body":"{\"plan_type\":\"plus\",\"rate_limit\":{\"primary_window\":{\"used_percent\":25,\"limit_window_seconds\":18000}}}"},"fetched_at":1700000000,"stale":false,"last_attempt":1700000000,"next_retry_at":null}"#
+    let fetcher = RemoteManagementQuotaFetcher(
+      apiFactory: CacheTestProxyManagementAPIFactory(api: api),
+      cacheClient: QuotaCacheClient(session: CacheTestHTTPSession(statusCode: 200, body: Data(envelope.utf8)))
+    )
+    let source = RemoteQuotaSourceConfig(
+      name: "Pool", baseURL: "https://proxy.test", quotaCacheBaseURL: "https://proxy.test/quota-cache/v1/plus")
+
+    let result = try await fetcher.fetchPool(source, managementKey: "k")
+
+    XCTAssertEqual(result.quotasByProviderAndAccount[.codex]?["codex-a"]?.models.first?.percentage, 75)
+    XCTAssertNil(result.quotasByProviderAndAccount[.codex]?["codex-a"]?.routingWeight)
+  }
+
   func testCrossOriginHTTPSCacheBaseURLIsNeverCalledAndNeverLeaksTheManagementKey() async throws {
     let files = [
       ManagedAuthFile(

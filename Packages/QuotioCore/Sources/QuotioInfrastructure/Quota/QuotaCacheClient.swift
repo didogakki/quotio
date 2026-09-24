@@ -119,12 +119,68 @@ public struct QuotaCacheResponse: Decodable, Sendable {
     public let lastAttempt: Double
     public let nextRetryAt: Double?
     public let failure: QuotaCacheFailure?
+    /// Optional CPA pool routing-weight reading, carried alongside this same
+    /// `codex-usage` envelope rather than a separate request — absent entirely (never
+    /// decoded as a synthetic zero) on a cache build that doesn't compute weights, or
+    /// when this account/pool has none.
+    public let routingWeights: QuotaCacheRoutingWeights?
 
     enum CodingKeys: String, CodingKey {
         case result, stale, failure
         case fetchedAt = "fetched_at"
         case lastAttempt = "last_attempt"
         case nextRetryAt = "next_retry_at"
+        case routingWeights = "routing_weights"
+    }
+
+    /// Decodes `routingWeights` tolerantly: a malformed `routing_weights` payload
+    /// (wrong types, or values `QuotaCacheRoutingWeights` itself rejects) never fails
+    /// this whole response's decode — it only means this optional reading comes back
+    /// `nil`, exactly like a cache build that omits it entirely. Every other field is
+    /// the real quota data and must still fail loudly if it doesn't decode.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        result = try container.decode(ProxyAPICallResult.self, forKey: .result)
+        fetchedAt = try container.decode(Double.self, forKey: .fetchedAt)
+        stale = try container.decode(Bool.self, forKey: .stale)
+        lastAttempt = try container.decode(Double.self, forKey: .lastAttempt)
+        nextRetryAt = try container.decodeIfPresent(Double.self, forKey: .nextRetryAt)
+        failure = try container.decodeIfPresent(QuotaCacheFailure.self, forKey: .failure)
+        routingWeights = (try? container.decodeIfPresent(QuotaCacheRoutingWeights.self, forKey: .routingWeights)) ?? nil
+    }
+}
+
+/// Raw wire shape of `QuotaCacheResponse.routingWeights` — `updatedAt` is Unix
+/// seconds, matching `fetched_at`/`last_attempt` on the same envelope. Mapped to the
+/// Domain `AccountRoutingWeight` by `RemoteManagementQuotaFetcher`, which is the
+/// layer that owns converting this raw timestamp into a `Date`.
+public struct QuotaCacheRoutingWeights: Decodable, Sendable {
+    public let account: Int
+    public let channel: Int
+    public let updatedAt: Double
+
+    enum CodingKeys: String, CodingKey {
+        case account, channel
+        case updatedAt = "updated_at"
+    }
+
+    /// Rejects a reading the cache should never actually send: a negative weight, or a
+    /// non-finite/non-positive `updated_at`. Throwing here (rather than clamping) is
+    /// what lets `QuotaCacheResponse`'s tolerant decode turn this into `nil` instead of
+    /// silently keeping a nonsensical weight/timestamp.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let account = try container.decode(Int.self, forKey: .account)
+        let channel = try container.decode(Int.self, forKey: .channel)
+        let updatedAt = try container.decode(Double.self, forKey: .updatedAt)
+        guard account >= 0, channel >= 0, updatedAt.isFinite, updatedAt > 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .updatedAt, in: container, debugDescription: "Invalid routing weights reading"
+            )
+        }
+        self.account = account
+        self.channel = channel
+        self.updatedAt = updatedAt
     }
 }
 

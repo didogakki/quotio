@@ -50,6 +50,80 @@ final class QuotaCacheClientTests: XCTestCase {
     XCTAssertEqual(response.nextRetryAt, 1_700_000_600)
   }
 
+  /// `routing_weights` is optional and additive — absent on this envelope, and on
+  /// every other existing fixture in this file, must decode as `nil`, never crash the
+  /// existing decode path.
+  func testFetchDecodesEnvelopeWithoutRoutingWeightsAsNil() async throws {
+    let envelope = """
+      {"result":{"status_code":200,"header":{},"body":"{}"},"fetched_at":1700000000,"stale":false,"last_attempt":1700000000,"next_retry_at":null}
+      """
+    let session = RecordingQuotaHTTPSession(statusCode: 200, body: Data(envelope.utf8))
+    let client = QuotaCacheClient(session: session)
+
+    let response = try await client.fetch(
+      baseURL: "https://cache.example.com/quota-cache/v1/plus",
+      resource: "codex-usage", authIndex: "codex-a", managementKey: "admin-key"
+    )
+
+    XCTAssertNil(response.routingWeights)
+  }
+
+  /// `routing_weights` rides along on the same `codex-usage` envelope this account's
+  /// usage reading already came from — no separate request/field for `stale`/`error`.
+  func testFetchDecodesOptionalRoutingWeightsAlongsideTheUsageEnvelope() async throws {
+    let envelope = """
+      {"result":{"status_code":200,"header":{},"body":"{}"},"fetched_at":1700000000,"stale":false,"last_attempt":1700000000,"next_retry_at":null,"routing_weights":{"account":33,"channel":75,"updated_at":1700000500}}
+      """
+    let session = RecordingQuotaHTTPSession(statusCode: 200, body: Data(envelope.utf8))
+    let client = QuotaCacheClient(session: session)
+
+    let response = try await client.fetch(
+      baseURL: "https://cache.example.com/quota-cache/v1/plus",
+      resource: "codex-usage", authIndex: "codex-a", managementKey: "admin-key"
+    )
+
+    XCTAssertEqual(response.routingWeights?.account, 33)
+    XCTAssertEqual(response.routingWeights?.channel, 75)
+    XCTAssertEqual(response.routingWeights?.updatedAt, 1_700_000_500)
+  }
+
+  /// A malformed `routing_weights` payload (negative weight here) must never fail the
+  /// whole envelope decode — the quota reading in `result` is still real and must not
+  /// be lost just because this optional, additive metadata came back nonsensical.
+  func testFetchDecodesEnvelopeWithMalformedRoutingWeightsAsNilWithoutLosingQuota() async throws {
+    let envelope = """
+      {"result":{"status_code":200,"header":{},"body":"{\\"ok\\":true}"},"fetched_at":1700000000,"stale":false,"last_attempt":1700000000,"next_retry_at":null,"routing_weights":{"account":-1,"channel":75,"updated_at":1700000500}}
+      """
+    let session = RecordingQuotaHTTPSession(statusCode: 200, body: Data(envelope.utf8))
+    let client = QuotaCacheClient(session: session)
+
+    let response = try await client.fetch(
+      baseURL: "https://cache.example.com/quota-cache/v1/plus",
+      resource: "codex-usage", authIndex: "codex-a", managementKey: "admin-key"
+    )
+
+    XCTAssertNil(response.routingWeights)
+    XCTAssertEqual(response.result.statusCode, 200)
+    XCTAssertEqual(response.result.body, "{\"ok\":true}")
+  }
+
+  /// Same as above for a `updated_at` that isn't a sensible timestamp (non-finite, or
+  /// not positive) — also tolerated as `nil`, never a decode failure.
+  func testFetchDecodesEnvelopeWithNonFiniteRoutingWeightsUpdatedAtAsNil() async throws {
+    let envelope = """
+      {"result":{"status_code":200,"header":{},"body":"{}"},"fetched_at":1700000000,"stale":false,"last_attempt":1700000000,"next_retry_at":null,"routing_weights":{"account":10,"channel":20,"updated_at":0}}
+      """
+    let session = RecordingQuotaHTTPSession(statusCode: 200, body: Data(envelope.utf8))
+    let client = QuotaCacheClient(session: session)
+
+    let response = try await client.fetch(
+      baseURL: "https://cache.example.com/quota-cache/v1/plus",
+      resource: "codex-usage", authIndex: "codex-a", managementKey: "admin-key"
+    )
+
+    XCTAssertNil(response.routingWeights)
+  }
+
   func testFetchThrowsHTTPErrorOnNon200OuterStatus() async {
     let session = RecordingQuotaHTTPSession(statusCode: 503, body: Data())
     let client = QuotaCacheClient(session: session)

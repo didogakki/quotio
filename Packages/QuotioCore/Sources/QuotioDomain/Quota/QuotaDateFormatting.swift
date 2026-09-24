@@ -25,6 +25,26 @@ public enum QuotaDateFormatting {
         return "\(formatter.string(from: date)) JST"
     }
 
+    /// `nil` when `value` is empty or fails to parse as ISO-8601 — never a fabricated
+    /// date.
+    public static func compactJST(_ value: String) -> String? {
+        guard !value.isEmpty, let date = parseISO8601Date(value) else { return nil }
+        return compactJST(date)
+    }
+
+    /// `MM-dd HH:mm`, always `Asia/Tokyo` — the dropdown-only compact companion to
+    /// `absoluteJST`, dropping the year and `JST` suffix that would otherwise crowd
+    /// the menu bar's narrow card layout. Every other caller (account page, tooltips,
+    /// token expiry) keeps using `absoluteJST` so the full, unambiguous date stays
+    /// available there.
+    public static func compactJST(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "Asia/Tokyo")
+        formatter.dateFormat = "MM-dd HH:mm"
+        return formatter.string(from: date)
+    }
+
     /// Parses `value` as ISO-8601 (with or without fractional seconds), the same
     /// tolerant parsing `absoluteJST(_:String)` uses internally — exposed so callers
     /// that need the `Date` itself (not just its JST label) share one parsing rule

@@ -232,6 +232,26 @@ public enum RemoteQuotaAccountIssue: String, Codable, Equatable, Sendable {
     case invalidOAuth
 }
 
+/// One CPA pool's account/channel routing-weight reading, as optionally reported
+/// alongside a Codex account's own quota-cache response (`routing_weights` on the
+/// existing per-account `codex-usage` fetch — never a separate endpoint/request).
+/// `accountWeight` is the account's own raw weight within its pool, never normalized
+/// to a percentage; `channelWeight` is the weight of the New API channel currently
+/// serving that pool at `updatedAt`. Absent entirely (never a synthetic zero) when the
+/// cache has no weights configured, the pool layer errored, or the source isn't cache-
+/// enabled.
+public struct AccountRoutingWeight: Codable, Equatable, Sendable {
+    public let accountWeight: Int
+    public let channelWeight: Int
+    public let updatedAt: Date
+
+    public init(accountWeight: Int, channelWeight: Int, updatedAt: Date) {
+        self.accountWeight = accountWeight
+        self.channelWeight = channelWeight
+        self.updatedAt = updatedAt
+    }
+}
+
 public struct ProviderQuota: Codable, Equatable, Sendable {
     public var models: [QuotaMetric]
     public var lastUpdated: Date
@@ -268,6 +288,11 @@ public struct ProviderQuota: Codable, Equatable, Sendable {
     /// `RemoteQuotaSourceCoordinator.refresh`), so a round with no fresh signal clears a
     /// stale value rather than leaving it in place.
     public var availabilityRecoveryDate: Date?
+    /// This Codex account's CPA pool routing-weight reading, carried alongside the
+    /// same quota-cache response the account's usage reading already came from —
+    /// `nil` (never a synthetic zero) when the cache has no weights configured, the
+    /// pool layer reported an error, or the source isn't cache-enabled at all.
+    public var routingWeight: AccountRoutingWeight?
 
     public init(
         models: [QuotaMetric] = [],
@@ -280,7 +305,8 @@ public struct ProviderQuota: Codable, Equatable, Sendable {
         codexResetCreditSummary: CodexResetCreditSummary? = nil,
         remoteAccountIssue: RemoteQuotaAccountIssue? = nil,
         isTemporarilyUnavailable: Bool? = nil,
-        availabilityRecoveryDate: Date? = nil
+        availabilityRecoveryDate: Date? = nil,
+        routingWeight: AccountRoutingWeight? = nil
     ) {
         self.models = models
         self.lastUpdated = lastUpdated
@@ -293,6 +319,7 @@ public struct ProviderQuota: Codable, Equatable, Sendable {
         self.remoteAccountIssue = remoteAccountIssue
         self.isTemporarilyUnavailable = isTemporarilyUnavailable
         self.availabilityRecoveryDate = availabilityRecoveryDate
+        self.routingWeight = routingWeight
     }
 }
 
@@ -597,6 +624,20 @@ public enum QuotaPolicy {
             isForbidden: false,
             planType: contributing.first(where: { $0.planType != nil })?.planType
         )
+    }
+
+    /// Reconciles possibly-differing channel-weight readings from the several
+    /// accounts of one remote pool (each account's own quota-cache response can carry
+    /// its own `AccountRoutingWeight.channelWeight` reading, taken at its own request
+    /// time) into the single value shown on that pool's subheader. The reading with
+    /// the latest `updatedAt` wins; when the latest `updatedAt` is shared by readings
+    /// that disagree on the value, the conflict is unresolvable and this hides the
+    /// channel weight entirely rather than guessing which one is current.
+    public static func reconciledChannelWeight(from weights: [AccountRoutingWeight]) -> Int? {
+        guard let latest = weights.map(\.updatedAt).max() else { return nil }
+        let atLatest = weights.filter { $0.updatedAt == latest }
+        let values = Set(atLatest.map(\.channelWeight))
+        return values.count == 1 ? values.first : nil
     }
 
     private static func aggregatePercentages(_ percentages: [Double], mode: ModelAggregationMode) -> Double {

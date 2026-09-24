@@ -416,4 +416,37 @@ final class QuotaModelsTests: XCTestCase {
         )
         XCTAssertEqual(result.models.first { $0.name == "codex-weekly" }?.percentage, 40)
     }
+
+    // MARK: - QuotaPolicy.reconciledChannelWeight
+
+    func testReconciledChannelWeightPicksTheLatestReadingWhenValuesAgree() {
+        let older = AccountRoutingWeight(accountWeight: 33, channelWeight: 75, updatedAt: Date(timeIntervalSince1970: 1_000))
+        let newer = AccountRoutingWeight(accountWeight: 31, channelWeight: 75, updatedAt: Date(timeIntervalSince1970: 2_000))
+
+        XCTAssertEqual(QuotaPolicy.reconciledChannelWeight(from: [older, newer]), 75)
+    }
+
+    /// Two accounts of the same pool reporting *different* channel weights at the
+    /// exact same latest timestamp is an unresolvable conflict — never guess which one
+    /// is current.
+    func testReconciledChannelWeightHidesOnSameTimestampConflict() {
+        let sameMoment = Date(timeIntervalSince1970: 1_000)
+        let a = AccountRoutingWeight(accountWeight: 33, channelWeight: 75, updatedAt: sameMoment)
+        let b = AccountRoutingWeight(accountWeight: 31, channelWeight: 25, updatedAt: sameMoment)
+
+        XCTAssertNil(QuotaPolicy.reconciledChannelWeight(from: [a, b]))
+    }
+
+    /// A stale reading behind the latest one must never override it, even when its
+    /// own value disagrees.
+    func testReconciledChannelWeightIgnoresAStaleDisagreeingReading() {
+        let stale = AccountRoutingWeight(accountWeight: 0, channelWeight: 25, updatedAt: Date(timeIntervalSince1970: 500))
+        let latest = AccountRoutingWeight(accountWeight: 34, channelWeight: 75, updatedAt: Date(timeIntervalSince1970: 1_000))
+
+        XCTAssertEqual(QuotaPolicy.reconciledChannelWeight(from: [stale, latest]), 75)
+    }
+
+    func testReconciledChannelWeightIsNilWithNoReadingsAtAll() {
+        XCTAssertNil(QuotaPolicy.reconciledChannelWeight(from: []))
+    }
 }
