@@ -30,6 +30,8 @@
 
 Quotio is a native macOS application for managing **CLIProxyAPI** - a local proxy server that powers your AI coding agents. It helps you manage multiple AI accounts, track quotas, and configure CLI tools in one place.
 
+> **Development fork:** The customized code is maintained at [didogakki/quotio](https://github.com/didogakki/quotio/tree/codex/custom-on-0.31) on branch `codex/custom-on-0.31`. This README’s installation and release links refer to the [upstream project](https://github.com/nguyenphutrong/quotio); see [中文 Git 仓库说明](README.zh.md#git-仓库与分支) for source checkout instructions.
+
 ## ✨ Features
 
 - **🔌 Multi-Provider Support**: Connect accounts from Claude, OpenAI Codex, Qwen, Vertex AI, iFlow, Antigravity, Kiro, Trae, and GitHub Copilot via OAuth or API keys.

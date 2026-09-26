@@ -32,6 +32,8 @@
 
 Quotio 是一款原生 macOS 应用，用于管理 **CLIProxyAPI** ——为你的 AI 编程代理提供动力的本地代理服务器。它帮助你在一个地方管理多个 AI 账号、跟踪配额并配置 CLI 工具。
 
+> **开发分支说明**：本仓库的定制代码位于 [didogakki/quotio 的 `codex/custom-on-0.31` 分支](https://github.com/didogakki/quotio/tree/codex/custom-on-0.31)；下方 Homebrew 与 Releases 链接仍指向[上游项目](https://github.com/nguyenphutrong/quotio)，并非此定制分支的发布包。
+
 ## ✨ 功能特性
 
 - **🔌 多提供商支持**：通过 OAuth 或 API Key 连接 Claude、OpenAI Codex、Qwen、Vertex AI、iFlow、Antigravity、Kiro、Trae 和 GitHub Copilot 账号。
@@ -94,11 +96,13 @@ brew install --cask quotio
 
 ### 从源码构建
 
-1. **克隆仓库：**
+1. **克隆定制分支：**
    ```bash
-   git clone https://github.com/nguyenphutrong/quotio.git
-   cd Quotio
+   git clone --branch codex/custom-on-0.31 https://github.com/didogakki/quotio.git
+   cd quotio
    ```
+
+   如需上游原版，请改用 `git clone https://github.com/nguyenphutrong/quotio.git`。
 
 2. **在 Xcode 中打开：**
    ```bash
@@ -110,6 +114,12 @@ brew install --cask quotio
    - 按下 `Cmd + R` 构建并运行
 
 > 应用首次启动时会自动下载 `CLIProxyAPI` 二进制文件。
+
+## Git 仓库与分支
+
+- **上游仓库**：[nguyenphutrong/quotio](https://github.com/nguyenphutrong/quotio)，提供官方版本、Homebrew 安装及 Releases。
+- **定制仓库**：[didogakki/quotio](https://github.com/didogakki/quotio)，本仓库的开发成果推送至 `codex/custom-on-0.31` 分支；不要将它误认为上游的 `master` 或官方发布版。
+- 在本地检出定制分支后，使用 `git pull origin codex/custom-on-0.31` 获取最新提交；`origin` 在此指向克隆时使用的定制仓库。
 
 ## 📖 使用方法
 
