@@ -39,6 +39,18 @@ final class QuotaModelsTests: XCTestCase {
         XCTAssertNil(quota.codexResetCreditSummary)
     }
 
+    /// A `ProviderQuota` cached before `codexLimitReached` existed (no such key at all
+    /// in the JSON) must decode as `nil` ("unknown provenance") — never a synthetic
+    /// `false`, which would wrongly claim a successful Codex response proved the limit
+    /// was not reached.
+    func testProviderQuotaDecodesWithoutCodexLimitReachedKey() throws {
+        let data = Data(#"{"models":[],"lastUpdated":0,"isForbidden":true}"#.utf8)
+
+        let quota = try JSONDecoder().decode(ProviderQuota.self, from: data)
+
+        XCTAssertNil(quota.codexLimitReached)
+    }
+
     func testCodexResetCreditSummaryRoundTripsThroughCodableSchema() throws {
         let summary = CodexResetCreditSummary(
             availableCount: 2,

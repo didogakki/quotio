@@ -13103,6 +13103,15 @@
         "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "会话和周额度已用尽" } }
       }
     },
+    "quota.account.limitReached" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Limit reached" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Limite atteinte" } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Đã đạt giới hạn" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "已达限额" } }
+      }
+    },
     "quota.account.quotaResetUnknown" : {
       "extractionState" : "manual",
       "localizations" : {

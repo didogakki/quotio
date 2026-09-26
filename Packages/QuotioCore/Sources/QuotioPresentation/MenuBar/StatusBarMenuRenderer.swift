@@ -987,27 +987,34 @@ private struct MenuAccountCardView: View {
     
     /// "N reset credits · next expiry yyyy-MM-dd HH:mm JST" for a CPA Codex account
     /// whose most recent fetch reported reset-credit data — `nil` (never a fabricated
-    /// "0") when that data hasn't been fetched successfully yet. Per-account only,
-    /// reusing the same `ProviderQuota.codexResetCreditSummary` already carried by this
-    /// card's own `data` — never a separate card or badge.
+    /// "0") when that data hasn't been fetched successfully yet, or when it reports a
+    /// genuine zero (`menuCompactSummary` hides the "no reset credits available" line
+    /// in the menu specifically). Per-account only, reusing the same
+    /// `ProviderQuota.codexResetCreditSummary` already carried by this card's own
+    /// `data` — never a separate card or badge.
     private var codexResetCreditsText: String? {
         guard provider == .codex else { return nil }
-        return data.codexResetCreditSummary?.compactFormattedSummary
+        return data.codexResetCreditSummary?.menuCompactSummary
     }
 
     private static let frozenColor = Color(red: 0.93, green: 0.35, blue: 0.13)
 
     /// Icon/label/color for the freeze/cooldown status marker shown left of the tier
-    /// badge — `nil` for a normal, currently-usable account (`data.availabilityStatus`).
+    /// badge — `nil` for a normal, currently-usable account. Reads
+    /// `data.menuAvailabilityStatus`, not `data.availabilityStatus`, so a Codex
+    /// account whose limit is known-reached AND whose own session/weekly metric is
+    /// truly exhausted renders the `exhaustionBadge` hourglass below instead of this
+    /// frozen lock — see `menuAvailabilityStatus`'s own doc comment for why that
+    /// override is menu-only.
     private var availabilityMarker: (icon: String, label: String, color: Color)? {
-        switch data.availabilityStatus {
+        switch data.menuAvailabilityStatus {
         case .authInvalid:
             return ("exclamationmark.triangle.fill", "quota.account.oauthInvalid".localized(), MenuBarPalette.quotaDanger)
         case .frozen:
             return ("lock.fill", "quota.account.frozen".localized(), Self.frozenColor)
         case .cooling:
             return ("clock.fill", "quota.account.cooling".localized(), MenuBarPalette.quotaWarning)
-        case .sessionExhausted, .weeklyExhausted, .sessionAndWeeklyExhausted:
+        case .sessionExhausted, .weeklyExhausted, .sessionAndWeeklyExhausted, .limitReachedUnknownWindow:
             // Rendered by `exhaustionBadge` instead — a distinct hourglass/countdown
             // shape, not this icon+label capsule.
             return nil
@@ -1016,37 +1023,48 @@ private struct MenuAccountCardView: View {
         }
     }
 
-    /// "3h32m 后解封"/"3h48m 后恢复"-style estimate, or the explicit "time unknown"
-    /// fallback when this account's last-known-good reading carries no future reset
-    /// time to count down to (`data.formattedAvailabilityCountdown`) — never a
-    /// fabricated guess. `nil` for a normal, currently-usable account, and for the
-    /// exhausted-metric statuses, which get their own `exhaustionBadge` tooltip
-    /// instead of this frozen/cooling-only line.
+    /// "3h32m 后解封"/"3h48m 后恢复"-style estimate, or — for `.cooling` only — the
+    /// explicit "time unknown" fallback when this account's last-known-good reading
+    /// carries no future reset time to count down to
+    /// (`data.formattedAvailabilityCountdown`) — never a fabricated guess. `nil` for a
+    /// normal, currently-usable account, for the exhausted-metric statuses (which get
+    /// their own `exhaustionBadge` tooltip instead of this frozen/cooling-only line),
+    /// and for `.frozen` with no known countdown (`data.showsAvailabilityCountdownLine`
+    /// is `false`) — see that property's doc comment for why the line is hidden rather
+    /// than shown with an "unfreeze time unknown" fallback. Reads
+    /// `data.menuAvailabilityStatus` so the reached-and-exhausted Codex override in
+    /// `availabilityMarker` stays in sync with this line.
     private var availabilityCountdownText: String? {
-        guard let status = data.availabilityStatus else { return nil }
+        guard let status = data.menuAvailabilityStatus, data.showsAvailabilityCountdownLine else { return nil }
         guard status == .frozen || status == .cooling else { return nil }
         if let countdown = data.formattedAvailabilityCountdown {
             let key = status == .frozen ? "quota.account.frozenCountdown" : "quota.account.coolingCountdown"
             return String(format: key.localized(), countdown)
         }
-        let key = status == .frozen ? "quota.account.frozenUnknown" : "quota.account.coolingUnknown"
-        return key.localized()
+        return "quota.account.coolingUnknown".localized()
     }
 
     /// Badge/tooltip/accessibility text for a CPA Codex account whose `codex-session`
     /// and/or `codex-weekly` quota metric has reached 0% — hourglass + compact
     /// countdown to whichever reset(s) still apply (the later of the two when both
-    /// windows are exhausted). Scoped to `provider == .codex`: the underlying
-    /// `codex-session`/`codex-weekly` metric names are Codex-only, but this guard
-    /// keeps the new badge from ever appearing on another provider's card even if
+    /// windows are exhausted). Also covers `.limitReachedUnknownWindow`: the limit is
+    /// known-reached but neither metric is at exactly 0%, so this renders the same
+    /// hourglass shape with a generic "limit reached" label and no fabricated
+    /// countdown/reset time — `data.quotaExhaustionRecoveryDate` is `nil` for that
+    /// status, so `countdownText`/`tooltip` below fall through to their own "unknown"
+    /// text exactly as they already do when a real exhausted metric has no resolvable
+    /// reset. Scoped to `provider == .codex`: the underlying `codex-session`/
+    /// `codex-weekly` metric names and `codexLimitReached` are Codex-only, but this
+    /// guard keeps the badge from ever appearing on another provider's card even if
     /// that ever changed. `nil` for every other status.
     private var exhaustionBadge: (countdownText: String, tooltip: String, accessibilityText: String)? {
         guard provider == .codex else { return nil }
         let statusLabelKey: String
-        switch data.availabilityStatus {
+        switch data.menuAvailabilityStatus {
         case .sessionExhausted: statusLabelKey = "quota.account.sessionExhausted"
         case .weeklyExhausted: statusLabelKey = "quota.account.weeklyExhausted"
         case .sessionAndWeeklyExhausted: statusLabelKey = "quota.account.sessionAndWeeklyExhausted"
+        case .limitReachedUnknownWindow: statusLabelKey = "quota.account.limitReached"
         default: return nil
         }
         let statusLabel = statusLabelKey.localized()
@@ -1125,7 +1143,7 @@ private struct MenuAccountCardView: View {
             .help("action.refreshQuota".localized())
 
             // Exhausted-window countdown badge — same slot as the freeze/cooldown
-            // marker below (the two are mutually exclusive via `data.availabilityStatus`).
+            // marker below (the two are mutually exclusive via `data.menuAvailabilityStatus`).
             // Never wraps: the email above gives way first at narrow widths.
             if let initialExhaustionBadge = exhaustionBadge {
                 // The countdown text/tooltip are derived from `Date()` at read time, but

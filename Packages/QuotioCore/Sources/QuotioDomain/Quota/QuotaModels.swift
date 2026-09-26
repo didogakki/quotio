@@ -293,6 +293,17 @@ public struct ProviderQuota: Codable, Equatable, Sendable {
     /// `nil` (never a synthetic zero) when the cache has no weights configured, the
     /// pool layer reported an error, or the source isn't cache-enabled at all.
     public var routingWeight: AccountRoutingWeight?
+    /// This Codex account's own `rate_limit.limit_reached` flag, taken directly from
+    /// its most recent *successful* Codex quota response (`CodexQuotaFetcher.mapUsage`,
+    /// shared by both the local and remote/CPA Codex fetch paths). Distinct from
+    /// `isForbidden`, which already folds this same flag into a provider-agnostic
+    /// "credential rejected" signal used by aggregate math and every other surface —
+    /// this field exists only so the menu dropdown can tell "Codex reported the limit
+    /// reached" apart from "this account's credential was rejected for some other
+    /// reason". `nil` means "no successful Codex response has reported this yet",
+    /// including every reading written by a build predating this field; never set from
+    /// a failed fetch, a cache/error path, or a non-Codex provider.
+    public var codexLimitReached: Bool?
 
     public init(
         models: [QuotaMetric] = [],
@@ -306,7 +317,8 @@ public struct ProviderQuota: Codable, Equatable, Sendable {
         remoteAccountIssue: RemoteQuotaAccountIssue? = nil,
         isTemporarilyUnavailable: Bool? = nil,
         availabilityRecoveryDate: Date? = nil,
-        routingWeight: AccountRoutingWeight? = nil
+        routingWeight: AccountRoutingWeight? = nil,
+        codexLimitReached: Bool? = nil
     ) {
         self.models = models
         self.lastUpdated = lastUpdated
@@ -320,6 +332,7 @@ public struct ProviderQuota: Codable, Equatable, Sendable {
         self.isTemporarilyUnavailable = isTemporarilyUnavailable
         self.availabilityRecoveryDate = availabilityRecoveryDate
         self.routingWeight = routingWeight
+        self.codexLimitReached = codexLimitReached
     }
 }
 

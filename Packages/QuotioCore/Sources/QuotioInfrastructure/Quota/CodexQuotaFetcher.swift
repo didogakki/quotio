@@ -347,7 +347,8 @@ public actor CodexQuotaFetcher: QuotaFetching {
     return ProviderQuota(
       models: metrics, lastUpdated: now, isForbidden: response.rateLimit?.reached ?? false,
       planType: response.plan ?? planFallback,
-      analytics: analytics(from: json))
+      analytics: analytics(from: json),
+      codexLimitReached: response.rateLimit?.reached)
   }
 
   private func fetchQuota(

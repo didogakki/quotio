@@ -67,6 +67,29 @@ final class RemoteManagementQuotaFetcherTests: XCTestCase {
     }
   }
 
+  /// `codexLimitReached` provenance must survive this remote/CPA path exactly like the
+  /// local Codex fetcher, since both call the same `CodexQuotaFetcher.mapUsage` — the
+  /// "also used by remote fetch" call site that function's own doc comment describes.
+  func testFetchPoolPropagatesCodexLimitReachedProvenanceFromCPAResponse() async throws {
+    let files = [
+      ManagedAuthFile(
+        id: "1", name: "codex-b.json", provider: "codex", status: "ready", disabled: false,
+        unavailable: false, accountType: "plus", account: "acct-b", authIndex: "codex-b")
+    ]
+    let codexBody =
+      #"{"plan_type":"plus","rate_limit":{"limit_reached":true,"primary_window":{"used_percent":100,"limit_window_seconds":604800}}}"#
+    let api = StubProxyManagementAPI(authFiles: files, responses: ["codex-b": (200, codexBody)])
+    let fetcher = RemoteManagementQuotaFetcher(
+      apiFactory: StubProxyManagementAPIFactory(api: api),
+      now: { Date(timeIntervalSince1970: 1_800_000_000) }
+    )
+    let source = RemoteQuotaSourceConfig(id: "src-1", name: "Plus Pool", baseURL: "https://proxy.test:8317")
+
+    let result = try await fetcher.fetchPool(source, managementKey: "admin-key")
+
+    XCTAssertEqual(result.quotasByProviderAndAccount[.codex]?["codex-b"]?.codexLimitReached, true)
+  }
+
   /// An account carrying the server's aggregated `unavailable` flag is still a real
   /// account. It must stay in `knownAccountKeys`, which is exactly what the coordinator
   /// prunes against, instead of being mistaken for one that was deleted; only an

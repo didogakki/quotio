@@ -243,3 +243,271 @@ final class ProviderQuotaAvailabilityCountdownTests: XCTestCase {
         XCTAssertNotNil(quota.formattedAvailabilityAbsolute)
     }
 }
+
+/// `menuAvailabilityStatus` is the menu-dropdown-only override of `availabilityStatus`
+/// for a Codex account whose limit-reached provenance is known. It must never change
+/// `availabilityStatus` itself (aggregate math, the main window, and the pinned status
+/// bar all keep reading the unmodified `frozen`/`cooling` signal).
+final class ProviderQuotaMenuAvailabilityStatusTests: XCTestCase {
+    /// OAuth-invalid must win even over a known-reached, truly-zero-metric account —
+    /// a rejected credential is unrelated to which quota window happens to be spent.
+    func testMenuStatusPrefersAuthInvalidOverReachedAndZeroMetric() {
+        let quota = ProviderQuota(
+            models: [QuotaMetric(name: "codex-weekly", percentage: 0, resetTime: "")],
+            isForbidden: true,
+            remoteAccountIssue: .invalidOAuth,
+            codexLimitReached: true
+        )
+        XCTAssertEqual(quota.menuAvailabilityStatus, .authInvalid)
+    }
+
+    /// The core bug this field fixes: a known-reached Codex account whose own weekly
+    /// metric is truly (not rounded) zero must present as exhausted, not frozen.
+    func testMenuStatusOverridesFrozenWhenLimitReachedIsKnownAndWeeklyMetricIsZero() {
+        let quota = ProviderQuota(
+            models: [QuotaMetric(name: "codex-weekly", percentage: 0, resetTime: "")],
+            isForbidden: true,
+            codexLimitReached: true
+        )
+        XCTAssertEqual(quota.availabilityStatus, .frozen, "the shared base status must stay frozen")
+        XCTAssertEqual(quota.menuAvailabilityStatus, .weeklyExhausted)
+    }
+
+    func testMenuStatusOverridesFrozenWhenLimitReachedIsKnownAndSessionMetricIsZero() {
+        let quota = ProviderQuota(
+            models: [QuotaMetric(name: "codex-session", percentage: 0, resetTime: "")],
+            isForbidden: true,
+            codexLimitReached: true
+        )
+        XCTAssertEqual(quota.menuAvailabilityStatus, .sessionExhausted)
+    }
+
+    func testMenuStatusOverridesFrozenWhenLimitReachedIsKnownAndBothMetricsAreZero() {
+        let quota = ProviderQuota(
+            models: [
+                QuotaMetric(name: "codex-session", percentage: 0, resetTime: ""),
+                QuotaMetric(name: "codex-weekly", percentage: 0, resetTime: ""),
+            ],
+            isForbidden: true,
+            codexLimitReached: true
+        )
+        XCTAssertEqual(quota.menuAvailabilityStatus, .sessionAndWeeklyExhausted)
+    }
+
+    /// The override also applies to a cooling (rather than frozen) reading — the design
+    /// explicitly calls out "generic cooling" as something the known-reached-and-zero
+    /// signal must override, not just a rejected credential.
+    func testMenuStatusOverridesCoolingWhenLimitReachedIsKnownAndMetricIsZero() {
+        let quota = ProviderQuota(
+            models: [QuotaMetric(name: "codex-weekly", percentage: 0, resetTime: "")],
+            isTemporarilyUnavailable: true,
+            codexLimitReached: true
+        )
+        XCTAssertEqual(quota.availabilityStatus, .cooling)
+        XCTAssertEqual(quota.menuAvailabilityStatus, .weeklyExhausted)
+    }
+
+    /// A cooling account with a strictly-zero weekly metric must present as exhausted
+    /// even when `codexLimitReached` is unknown (`nil`) rather than positively `true` —
+    /// unlike the forbidden/frozen case, cooling carries no credential-rejection risk to
+    /// protect, so the real zero-metric signal always wins over the generic cooling flag.
+    func testMenuStatusOverridesCoolingWhenWeeklyMetricIsZeroEvenWithUnknownLimitReachedProvenance() {
+        let quota = ProviderQuota(
+            models: [QuotaMetric(name: "codex-weekly", percentage: 0, resetTime: "")],
+            isTemporarilyUnavailable: true,
+            codexLimitReached: nil
+        )
+        XCTAssertEqual(quota.availabilityStatus, .cooling)
+        XCTAssertEqual(quota.menuAvailabilityStatus, .weeklyExhausted)
+    }
+
+    /// Same as above but with `codexLimitReached` explicitly `false`, and the session
+    /// metric (rather than weekly) at zero.
+    func testMenuStatusOverridesCoolingWhenSessionMetricIsZeroAndLimitReachedIsExplicitlyFalse() {
+        let quota = ProviderQuota(
+            models: [QuotaMetric(name: "codex-session", percentage: 0, resetTime: "")],
+            isTemporarilyUnavailable: true,
+            codexLimitReached: false
+        )
+        XCTAssertEqual(quota.availabilityStatus, .cooling)
+        XCTAssertEqual(quota.menuAvailabilityStatus, .sessionExhausted)
+    }
+
+    /// Both windows zero while cooling, with no limit-reached provenance at all.
+    func testMenuStatusOverridesCoolingWhenBothMetricsAreZeroAndLimitReachedIsUnknown() {
+        let quota = ProviderQuota(
+            models: [
+                QuotaMetric(name: "codex-session", percentage: 0, resetTime: ""),
+                QuotaMetric(name: "codex-weekly", percentage: 0, resetTime: ""),
+            ],
+            isTemporarilyUnavailable: true
+        )
+        XCTAssertEqual(quota.availabilityStatus, .cooling)
+        XCTAssertEqual(quota.menuAvailabilityStatus, .sessionAndWeeklyExhausted)
+    }
+
+    /// A cooling account with no metric at exactly zero must remain the plain `.cooling`
+    /// reading, not fall through to a frozen/limit-reached case it has no provenance for.
+    func testMenuStatusStaysCoolingWhenNoMetricIsExactlyZero() {
+        let quota = ProviderQuota(
+            models: [QuotaMetric(name: "codex-weekly", percentage: 5, resetTime: "")],
+            isTemporarilyUnavailable: true
+        )
+        XCTAssertEqual(quota.menuAvailabilityStatus, .cooling)
+    }
+
+    /// An unproven legacy `isForbidden` reading (no Codex-limit provenance at all,
+    /// e.g. a snapshot written before `codexLimitReached` existed) must stay frozen
+    /// even if a metric happens to read zero — never silently cleared without a
+    /// successful refresh that actually proves the reached-and-zero case.
+    func testMenuStatusKeepsLegacyForbiddenFrozenWhenProvenanceIsUnknown() {
+        let quota = ProviderQuota(
+            models: [QuotaMetric(name: "codex-weekly", percentage: 0, resetTime: "")],
+            isForbidden: true,
+            codexLimitReached: nil
+        )
+        XCTAssertEqual(quota.menuAvailabilityStatus, .frozen)
+    }
+
+    /// `limit_reached: true` without either metric at exactly zero (still mid-usage,
+    /// or a rounding artifact rather than a true zero) is a generic limit-reached
+    /// reading with an unknown countdown — it must never be misreported as `.frozen`
+    /// (that would call a spent quota window a rejected credential) nor as a weekly/
+    /// session exhaustion it cannot actually back with a real reset time. The shared
+    /// `availabilityStatus` must still read `.frozen` unchanged, since this override is
+    /// menu-only.
+    func testMenuStatusIsGenericLimitReachedWhenLimitReachedIsKnownButNoMetricIsExactlyZero() {
+        let quota = ProviderQuota(
+            models: [
+                QuotaMetric(name: "codex-session", percentage: 10, resetTime: ""),
+                QuotaMetric(name: "codex-weekly", percentage: 1, resetTime: ""),
+            ],
+            isForbidden: true,
+            codexLimitReached: true
+        )
+        XCTAssertEqual(quota.availabilityStatus, .frozen, "the shared base status must stay frozen")
+        XCTAssertEqual(quota.menuAvailabilityStatus, .limitReachedUnknownWindow)
+    }
+
+    /// Same generic reading applies when the account carries no `codex-session`/
+    /// `codex-weekly` metrics at all — e.g. a Codex response that reported the reached
+    /// limit through some other field. There is still no metric at exactly 0% to
+    /// justify one of the specific exhausted cases.
+    func testMenuStatusIsGenericLimitReachedWhenLimitReachedIsKnownAndMetricsAreMissing() {
+        let quota = ProviderQuota(isForbidden: true, codexLimitReached: true)
+        XCTAssertEqual(quota.menuAvailabilityStatus, .limitReachedUnknownWindow)
+    }
+
+    /// The generic reached status must never fabricate a recovery date/countdown: there
+    /// is no exhausted metric to derive one from, unlike the `.sessionExhausted`/
+    /// `.weeklyExhausted`/`.sessionAndWeeklyExhausted` cases.
+    func testMenuStatusGenericLimitReachedNeverFabricatesARecoveryDate() {
+        let quota = ProviderQuota(
+            models: [
+                QuotaMetric(name: "codex-session", percentage: 10, resetTime: ""),
+                QuotaMetric(name: "codex-weekly", percentage: 1, resetTime: ""),
+            ],
+            isForbidden: true,
+            codexLimitReached: true
+        )
+        XCTAssertNil(quota.quotaExhaustionRecoveryDate)
+        XCTAssertNil(quota.formattedQuotaExhaustionCountdown)
+        XCTAssertNil(quota.formattedQuotaExhaustionAbsolute)
+    }
+
+    /// The override must never fabricate a countdown either: a reached-and-zero
+    /// account whose own metric carries no parseable `resetTime` still reports an
+    /// unknown recovery date, exactly like the pre-existing exhaustion-countdown
+    /// contract, even though it reached this status via the frozen-override path.
+    func testMenuStatusOverrideRecoveryDateIsNilWithoutAParseableResetTime() {
+        let quota = ProviderQuota(
+            models: [QuotaMetric(name: "codex-weekly", percentage: 0, resetTime: "")],
+            isForbidden: true,
+            codexLimitReached: true
+        )
+        XCTAssertNil(quota.quotaExhaustionRecoveryDate)
+        XCTAssertNil(quota.formattedQuotaExhaustionCountdown)
+        XCTAssertNil(quota.formattedQuotaExhaustionAbsolute)
+    }
+
+    /// The override's recovery date reads the exhausted metric's own `resetTime`,
+    /// never `availabilityRecoveryDate` — even though the base status arrived here via
+    /// `isForbidden`, which does carry an (unrelated) `availabilityRecoveryDate` here.
+    func testMenuStatusOverrideRecoveryDateUsesTheMetricsOwnResetTimeNotAvailabilityRecoveryDate() {
+        let resetTime = ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: 9_000))
+        let unrelatedRecovery = Date(timeIntervalSince1970: 1_000)
+        let quota = ProviderQuota(
+            models: [QuotaMetric(name: "codex-weekly", percentage: 0, resetTime: resetTime)],
+            isForbidden: true,
+            availabilityRecoveryDate: unrelatedRecovery,
+            codexLimitReached: true
+        )
+        XCTAssertEqual(quota.quotaExhaustionRecoveryDate, Date(timeIntervalSince1970: 9_000))
+    }
+}
+
+/// Whether the menu's frozen/cooling countdown line renders at all — the "解封时间未知"
+/// text must disappear entirely for an unknown-countdown frozen account, while an
+/// unknown-countdown cooling account keeps its own explicit fallback line unchanged.
+final class ProviderQuotaShowsAvailabilityCountdownLineTests: XCTestCase {
+    func testHidesLineWhenFrozenWithNoKnownCountdown() {
+        let quota = ProviderQuota(isForbidden: true)
+        XCTAssertNil(quota.formattedAvailabilityCountdown)
+        XCTAssertFalse(quota.showsAvailabilityCountdownLine)
+    }
+
+    func testShowsLineWhenFrozenWithAKnownCountdown() {
+        let soon = Date().addingTimeInterval(3600)
+        let quota = ProviderQuota(isForbidden: true, availabilityRecoveryDate: soon)
+        XCTAssertTrue(quota.showsAvailabilityCountdownLine)
+    }
+
+    /// Unchanged behavior: cooling with no known countdown still shows its line, which
+    /// falls back to the "cooling unknown" text rather than being hidden.
+    func testShowsLineWhenCoolingWithNoKnownCountdown() {
+        let quota = ProviderQuota(isTemporarilyUnavailable: true)
+        XCTAssertNil(quota.formattedAvailabilityCountdown)
+        XCTAssertTrue(quota.showsAvailabilityCountdownLine)
+    }
+
+    func testHidesLineForANormalAccount() {
+        let quota = ProviderQuota()
+        XCTAssertFalse(quota.showsAvailabilityCountdownLine)
+    }
+
+    /// The exhausted-window statuses render their own `exhaustionBadge` instead of
+    /// this frozen/cooling-only line.
+    func testHidesLineWhenStatusIsExhausted() {
+        let quota = ProviderQuota(models: [QuotaMetric(name: "codex-weekly", percentage: 0, resetTime: "")])
+        XCTAssertEqual(quota.menuAvailabilityStatus, .weeklyExhausted)
+        XCTAssertFalse(quota.showsAvailabilityCountdownLine)
+    }
+
+    /// The generic limit-reached status also renders its own `exhaustionBadge`
+    /// (with a "—" unknown countdown) instead of this frozen/cooling-only line, so the
+    /// two never render at the same time.
+    func testHidesLineWhenStatusIsGenericLimitReached() {
+        let quota = ProviderQuota(isForbidden: true, codexLimitReached: true)
+        XCTAssertEqual(quota.menuAvailabilityStatus, .limitReachedUnknownWindow)
+        XCTAssertFalse(quota.showsAvailabilityCountdownLine)
+    }
+}
+
+/// `menuCompactSummary` is the menu-only reading of a Codex account's reset-credit
+/// summary: it hides a genuine zero reading entirely rather than showing "没有可用的
+/// 重置卡" as a permanent footer line, while leaving `formattedSummary`/
+/// `compactFormattedSummary` themselves fully intact for any other surface.
+@MainActor
+final class CodexResetCreditSummaryMenuCompactSummaryTests: XCTestCase {
+    func testMenuCompactSummaryIsNilForAZeroReading() {
+        let summary = CodexResetCreditSummary(availableCount: 0, nearestExpiryAt: nil)
+        XCTAssertNil(summary.menuCompactSummary)
+        XCTAssertNotNil(summary.compactFormattedSummary, "the underlying formatter's own zero-case text must stay intact")
+    }
+
+    func testMenuCompactSummaryMatchesCompactFormattedSummaryForAPositiveReading() {
+        let date = Date(timeIntervalSince1970: 1_789_975_320)
+        let summary = CodexResetCreditSummary(availableCount: 2, nearestExpiryAt: date)
+        XCTAssertEqual(summary.menuCompactSummary, summary.compactFormattedSummary)
+    }
+}

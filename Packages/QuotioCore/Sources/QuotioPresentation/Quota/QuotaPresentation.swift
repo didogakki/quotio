@@ -254,6 +254,13 @@ public enum QuotaAccountAvailabilityStatus: Equatable, Sendable {
     case sessionExhausted
     case weeklyExhausted
     case sessionAndWeeklyExhausted
+    /// Menu-dropdown-only: a Codex account's own `rate_limit.limit_reached` is known
+    /// (`codexLimitReached == true`) but neither `codex-session` nor `codex-weekly`
+    /// reads at exactly 0%, so the specific exhausted-window cases don't apply either.
+    /// Never inferred as `.frozen` (that would misrepresent a spent quota window as a
+    /// rejected credential) nor as one of the `*Exhausted` cases (there is no metric
+    /// actually at 0% to point a countdown at) — see `menuAvailabilityStatus`.
+    case limitReachedUnknownWindow
 }
 
 public extension ProviderQuota {
@@ -287,17 +294,69 @@ public extension ProviderQuota {
         }
     }
 
+    /// Menu-dropdown-only reading of `availabilityStatus`. A Codex account's own
+    /// `rate_limit.limit_reached` (`codexLimitReached`) folds into `isForbidden` —
+    /// and so into `.frozen` above — for every surface, including aggregate math and
+    /// the main account window, because that generic signal must keep meaning
+    /// "treat this credential as unusable" everywhere. But when the *known* (not
+    /// `nil`/unproven) Codex response that reported the reached limit also shows the
+    /// account's own `codex-session`/`codex-weekly` metric at strictly 0%, the menu
+    /// dropdown alone should present that as the exhausted-window hourglass instead
+    /// of the frozen lock — the account isn't credential-rejected, its quota window
+    /// is just spent, and its own `resetTime` gives a real countdown a generic
+    /// "frozen" reading never could. `authInvalid` always wins first, matching
+    /// `availabilityStatus`. A `base` of `.cooling` (a remote source flagged the
+    /// account temporarily unavailable) similarly steps aside for a known-zero
+    /// `codex-session`/`codex-weekly` metric even when `codexLimitReached` is
+    /// `nil`/`false` — a real 0% window is a stronger, more specific signal than the
+    /// generic cooling flag, and showing the exhausted hourglass with its own
+    /// `resetTime` countdown is strictly more informative. A `base` of `.frozen` with
+    /// `nil`/unproven `codexLimitReached` (including every legacy `isForbidden`
+    /// reading from before this field existed) stays frozen untouched — an unproven
+    /// forbidden must remain frozen until a successful refresh proves otherwise,
+    /// never silently clear itself into an exhausted reading. When the limit is
+    /// known-reached but neither metric happens to read exactly 0% (a still-in-flight
+    /// fetch, or a metric that reports the reached limit some other way), this falls
+    /// to `.limitReachedUnknownWindow` rather than `base` — reporting this menu-only
+    /// reading as `.frozen` would misrepresent a spent quota window as a rejected
+    /// credential, and there is no metric actually at 0% to justify one of the
+    /// specific `*Exhausted` cases either.
+    var menuAvailabilityStatus: QuotaAccountAvailabilityStatus? {
+        let base = availabilityStatus
+        guard base != .authInvalid else { return base }
+        if codexLimitReached == true {
+            switch (isCodexSessionExhausted, isCodexWeeklyExhausted) {
+            case (true, true): return .sessionAndWeeklyExhausted
+            case (true, false): return .sessionExhausted
+            case (false, true): return .weeklyExhausted
+            case (false, false): return .limitReachedUnknownWindow
+            }
+        }
+        if base == .cooling {
+            switch (isCodexSessionExhausted, isCodexWeeklyExhausted) {
+            case (true, true): return .sessionAndWeeklyExhausted
+            case (true, false): return .sessionExhausted
+            case (false, true): return .weeklyExhausted
+            case (false, false): return base
+            }
+        }
+        return base
+    }
+
     /// The still-resolvable `codex-session`/`codex-weekly` reset date(s) this
     /// account's exhausted-window badge should count down to — the later of the two
     /// when both windows are exhausted, so the account only reads as usable again
     /// once neither window is still exhausted. `nil` only when the relevant metric's
-    /// `resetTime` is missing/unparseable, never a fabricated fallback.
+    /// `resetTime` is missing/unparseable, never a fabricated fallback. Reads
+    /// `menuAvailabilityStatus` (not `availabilityStatus`) so a reached-and-exhausted
+    /// Codex account gets this real countdown even though its base status is still
+    /// `.frozen`.
     var quotaExhaustionRecoveryDate: Date? {
         func resetDate(named name: String) -> Date? {
             guard let metric = models.first(where: { $0.name == name }) else { return nil }
             return QuotaDateFormatting.parseISO8601(metric.resetTime)
         }
-        switch availabilityStatus {
+        switch menuAvailabilityStatus {
         case .sessionExhausted:
             return resetDate(named: Self.codexSessionMetricName)
         case .weeklyExhausted:
@@ -350,6 +409,21 @@ public extension ProviderQuota {
     /// `nil` under the same condition.
     var formattedAvailabilityAbsolute: String? {
         upcomingAvailabilityRecoveryDate.map(QuotaDateFormatting.absoluteJST)
+    }
+
+    /// Whether the menu's frozen/cooling countdown line should render at all.
+    /// `false` only for `.frozen` with no known countdown: unlike cooling, a
+    /// frozen account has no real recovery signal to promise, so the line is
+    /// hidden entirely rather than showing an "unfreeze time unknown" line with
+    /// nothing underneath it. `.cooling` always shows the line, falling back to
+    /// its own explicit "time unknown" text when it has no countdown either —
+    /// that fallback is unchanged by this property.
+    var showsAvailabilityCountdownLine: Bool {
+        switch menuAvailabilityStatus {
+        case .frozen: return formattedAvailabilityCountdown != nil
+        case .cooling: return true
+        default: return false
+        }
     }
 }
 
@@ -423,6 +497,18 @@ public extension CodexResetCreditSummary {
         let dateText = nearestExpiryAt.map { QuotaDateFormatting.compactJST($0) }
             ?? "providers.codex.resetCredits.noExpiry".localizedStatic()
         return String(format: "providers.codex.resetCredits".localizedStatic(), availableCount, dateText)
+    }
+
+    /// Menu-dropdown-only reading of `compactFormattedSummary`: a genuine zero
+    /// reading is hidden entirely (`nil`) rather than rendered as its own explicit
+    /// "no reset credits available" footer line — the menu shows this line per
+    /// account, so a permanent "0 credits" row on every exhausted Codex account
+    /// would be pure noise there. `formattedSummary`/`compactFormattedSummary`
+    /// themselves are untouched for any other surface that still wants the
+    /// explicit zero-case text.
+    var menuCompactSummary: String? {
+        guard availableCount > 0 else { return nil }
+        return compactFormattedSummary
     }
 }
 

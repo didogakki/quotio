@@ -257,6 +257,27 @@ final class ClaudeCodexQuotaFetcherTests: XCTestCase {
     XCTAssertTrue(ambiguous.isEmpty)
   }
 
+  /// `codexLimitReached` mirrors `rate_limit.limit_reached` verbatim — including its
+  /// absence as `nil` — from any successful Codex response, independent of the
+  /// separate `isForbidden` mapping that `mapUsage` also derives from the same field
+  /// for every other surface (aggregate math, main window, pinned status bar).
+  func testCodexMapsLimitReachedToTheNewProvenanceFieldWithoutChangingIsForbidden() throws {
+    let reached = try CodexQuotaFetcher.mapUsage(
+      Data(#"{"rate_limit":{"limit_reached":true,"primary_window":{"used_percent":100,"limit_window_seconds":604800}}}"#.utf8))
+    XCTAssertEqual(reached.codexLimitReached, true)
+    XCTAssertTrue(reached.isForbidden)
+
+    let notReached = try CodexQuotaFetcher.mapUsage(
+      Data(#"{"rate_limit":{"limit_reached":false,"primary_window":{"used_percent":10,"limit_window_seconds":604800}}}"#.utf8))
+    XCTAssertEqual(notReached.codexLimitReached, false)
+    XCTAssertFalse(notReached.isForbidden)
+
+    let missingKey = try CodexQuotaFetcher.mapUsage(
+      Data(#"{"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":604800}}}"#.utf8))
+    XCTAssertNil(missingKey.codexLimitReached)
+    XCTAssertFalse(missingKey.isForbidden)
+  }
+
   func testCodexSessionOnlyWindowDoesNotFabricateWeeklyQuota() throws {
     let quota = try CodexQuotaFetcher.mapUsage(Data(#"""
       {
